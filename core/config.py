@@ -7,8 +7,10 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# DuckDB file path. Overridable via env (e.g., local dev uses ./core.duckdb).
-DEFAULT_DB_PATH = "/root/core/core.duckdb"
+# DuckDB file path. Overridable via env. Filename must NOT match any schema name
+# inside the DB (DuckDB binds the file as the default catalog), so we use
+# warehouse.duckdb and keep `core` as the canonical schema name inside it.
+DEFAULT_DB_PATH = "/root/core/warehouse.duckdb"
 DB_PATH = Path(os.environ.get("CORE_DB_PATH", DEFAULT_DB_PATH))
 
 # Backup location. Nightly cp lands here. Droplet only.
