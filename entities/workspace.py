@@ -97,47 +97,56 @@ def run_workspace_ingest(ctx: RunContext) -> PhaseResult:
     # Workspaces that exist in core but did NOT appear this run get is_active=False
     # (we leave the row in place; we never delete from canonical).
 
-    # Insert/update from the latest raw row per workspace_id in this run.
-    ctx.db.execute(
-        """
-        WITH latest AS (
-          SELECT workspace_id,
-                 -- Pick a deterministic slug per workspace. Prefer the slug whose
-                 -- name matches the API display name when normalized (e.g. Funding 4
-                 -- maps to renaissance-koi-and-destroy if both keys hit). Otherwise
-                 -- pick the alphabetically first slug for stability.
-                 first(slug ORDER BY slug)         AS slug,
-                 any_value(name)                   AS name,
-                 any_value(plan)                   AS plan
-          FROM raw_instantly_workspace
-          WHERE _run_id = ?
-          GROUP BY workspace_id
-        )
-        INSERT INTO core.workspace
-          (workspace_id, slug, name, plan, is_active, first_seen_at, last_seen_at, resolved_at)
-        SELECT workspace_id, slug, name, plan, TRUE, ?, ?, ?
-        FROM latest
-        WHERE workspace_id NOT IN (SELECT workspace_id FROM core.workspace)
-        """,
-        [ctx.run_id, now, now, now],
-    )
-
-    # Materialize the per-run latest snapshot into a temp view so the UPDATE
-    # is a simple correlated lookup. Avoids DuckDB's prepared-statement type
-    # inference confusing `_run_id` (VARCHAR) with the TIMESTAMPTZ placeholders.
+    # Pick the canonical slug per workspace_id.
+    # Rule: prefer the slug that ALSO appears as raw_pipeline_campaigns.workspace_id
+    # so downstream joins land cleanly. Fall back to alphabetical for stability.
+    # Pipeline-supabase still uses the historical slug (e.g. "koi-and-destroy") even
+    # after Instantly UI was renamed to "Funding 4"; preferring it keeps the join
+    # working without an alias table.
+    # If raw_pipeline_campaigns is empty (pipeline_mirror hasn't run yet), the
+    # COALESCE falls through and we keep alphabetical.
     ctx.db.execute("DROP TABLE IF EXISTS _run_latest_ws")
     ctx.db.execute(
         """
         CREATE TEMP TABLE _run_latest_ws AS
-        SELECT workspace_id,
-               first(slug ORDER BY slug)  AS slug,
-               any_value(name)            AS name,
-               any_value(plan)            AS plan
-        FROM raw_instantly_workspace
-        WHERE _run_id = ?
+        WITH per_run AS (
+          SELECT workspace_id, slug, name, plan
+          FROM raw_instantly_workspace
+          WHERE _run_id = ?
+        ),
+        pipeline_slugs AS (
+          SELECT DISTINCT workspace_id AS slug FROM raw_pipeline_campaigns
+        ),
+        ranked AS (
+          SELECT
+            p.workspace_id,
+            p.slug,
+            p.name,
+            p.plan,
+            CASE WHEN ps.slug IS NOT NULL THEN 0 ELSE 1 END AS pref_rank
+          FROM per_run p
+          LEFT JOIN pipeline_slugs ps ON ps.slug = p.slug
+        )
+        SELECT
+          workspace_id,
+          first(slug ORDER BY pref_rank, slug) AS slug,
+          any_value(name)                       AS name,
+          any_value(plan)                       AS plan
+        FROM ranked
         GROUP BY workspace_id
         """,
         [ctx.run_id],
+    )
+
+    ctx.db.execute(
+        """
+        INSERT INTO core.workspace
+          (workspace_id, slug, name, plan, is_active, first_seen_at, last_seen_at, resolved_at)
+        SELECT workspace_id, slug, name, plan, TRUE, ?, ?, ?
+        FROM _run_latest_ws
+        WHERE workspace_id NOT IN (SELECT workspace_id FROM core.workspace)
+        """,
+        [now, now, now],
     )
 
     ctx.db.execute(
