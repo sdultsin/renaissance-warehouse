@@ -117,10 +117,9 @@ def _run_comms_mirror(ctx: "RunContext") -> PhaseResult:
 
     # Ensure postgres_scanner is available + attach the comms pg database.
     conn.execute("INSTALL postgres; LOAD postgres;")
-    conn.execute(
-        "ATTACH ? AS pg (TYPE postgres, READ_ONLY)",
-        [pg_url],
-    )
+    # DuckDB cannot parameterize ATTACH — interpolate the URL literally (it comes
+    # from our own .env, not user input; same pattern as pipeline_mirror.py).
+    conn.execute(f"ATTACH '{pg_url}' AS pg (TYPE postgres, READ_ONLY)")
     try:
         total = 0
         for source_schema, pg_table, raw_table in _TABLES:
@@ -141,7 +140,7 @@ def _run_comms_mirror(ctx: "RunContext") -> PhaseResult:
         except Exception:
             pass
         raise
-    return PhaseResult(name="comms_mirror", rows_written=total, ok=True)
+    return PhaseResult(rows_in=total, rows_out=total, notes={"tables": len(_TABLES)})
 
 
 def register(registry) -> None:
