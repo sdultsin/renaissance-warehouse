@@ -2,10 +2,12 @@
 -- Applied at version 4 by scripts/setup_db.py.
 --
 -- Each raw_pipeline_* table lives in the default (main) schema, not `core`.
--- Every row carries _loaded_at (when the mirror wrote it) and _run_id (which
--- orchestrator run produced it). The mirror DELETEs by _run_id, then INSERTs the
--- fresh batch, so re-running the phase within a run is idempotent. Prior runs
--- are preserved for historical comparison.
+-- Every row carries a surrogate _key, _loaded_at (when the mirror wrote it),
+-- and _run_id (which orchestrator run last touched it). Since spec 15 these
+-- tables are sync-mode mirrors, not append snapshots: immutable event tables
+-- insert once, copy tables insert content-hashed versions, and dimension/daily
+-- tables upsert by _key. Missing upstream rows are never deleted
+-- (freeze-on-delete).
 --
 -- Type conventions:
 --   text                       -> VARCHAR
@@ -20,6 +22,7 @@
 
 -- public.campaigns (full mirror)
 CREATE TABLE IF NOT EXISTS raw_pipeline_campaigns (
+  _key                   VARCHAR NOT NULL,
   campaign_id            VARCHAR,
   workspace_id           VARCHAR,
   workspace_name         VARCHAR,
@@ -50,6 +53,7 @@ CREATE TABLE IF NOT EXISTS raw_pipeline_campaigns (
 
 -- public.campaign_data (full mirror, per campaign × step × variant)
 CREATE TABLE IF NOT EXISTS raw_pipeline_campaign_data (
+  _key                       VARCHAR NOT NULL,
   campaign_id                VARCHAR,
   campaign_name              VARCHAR,
   workspace_id               VARCHAR,
@@ -93,12 +97,14 @@ CREATE TABLE IF NOT EXISTS raw_pipeline_campaign_data (
   leads_bounced              INTEGER,
   leads_unsubscribed         INTEGER,
   lead_sequence_started      INTEGER,
+  content_hash               VARCHAR,
   _loaded_at                 TIMESTAMPTZ NOT NULL,
   _run_id                    VARCHAR NOT NULL
 );
 
 -- public.campaign_daily_metrics (last 90 days)
 CREATE TABLE IF NOT EXISTS raw_pipeline_campaign_daily_metrics (
+  _key                     VARCHAR NOT NULL,
   campaign_id              VARCHAR,
   date                     DATE,
   sent                     INTEGER,
@@ -123,6 +129,7 @@ CREATE TABLE IF NOT EXISTS raw_pipeline_campaign_daily_metrics (
 
 -- public.meetings_booked_raw (full)
 CREATE TABLE IF NOT EXISTS raw_pipeline_meetings_booked_raw (
+  _key                VARCHAR NOT NULL,
   id                  BIGINT,
   channel_id          VARCHAR,
   channel_name        VARCHAR,
@@ -146,6 +153,7 @@ CREATE TABLE IF NOT EXISTS raw_pipeline_meetings_booked_raw (
 
 -- public.reply_data (last 90 days, filter on reply_timestamp)
 CREATE TABLE IF NOT EXISTS raw_pipeline_reply_data (
+  _key            VARCHAR NOT NULL,
   id              BIGINT,
   campaign_id     VARCHAR,
   lead_email      VARCHAR,
@@ -162,8 +170,45 @@ CREATE TABLE IF NOT EXISTS raw_pipeline_reply_data (
   _run_id         VARCHAR NOT NULL
 );
 
+-- public.reply_intent_classifications (canonical row-level reply intent bridge)
+CREATE TABLE IF NOT EXISTS raw_pipeline_reply_intent_classifications (
+  _key                  VARCHAR NOT NULL,
+  source_table          VARCHAR,
+  source_id             VARCHAR,
+  workspace_id          VARCHAR,
+  campaign_id           VARCHAR,
+  lead_email            VARCHAR,
+  sender_email          VARCHAR,
+  recipient_email       VARCHAR,
+  reply_timestamp       TIMESTAMPTZ,
+  intent                VARCHAR,
+  intent_source         VARCHAR,
+  is_auto_reply         BOOLEAN,
+  auto_reply_source     VARCHAR,
+  auto_reply_confidence DECIMAL(18, 6),
+  classifier_version    VARCHAR,
+  classified_at         TIMESTAMPTZ,
+  _loaded_at            TIMESTAMPTZ NOT NULL,
+  _run_id               VARCHAR NOT NULL
+);
+
+-- public.reply_auto_reconciliation (aggregate vs row-level auto coverage)
+CREATE TABLE IF NOT EXISTS raw_pipeline_reply_auto_reconciliation (
+  _key                  VARCHAR NOT NULL,
+  date                  DATE,
+  campaign_id           VARCHAR,
+  aggregate_unique_auto INTEGER,
+  row_level_auto        INTEGER,
+  coverage_pct          DECIMAL(18, 6),
+  source_notes          VARCHAR,
+  checked_at            TIMESTAMPTZ,
+  _loaded_at            TIMESTAMPTZ NOT NULL,
+  _run_id               VARCHAR NOT NULL
+);
+
 -- public.lead_events (last 90 days, filter on event_timestamp)
 CREATE TABLE IF NOT EXISTS raw_pipeline_lead_events (
+  _key            VARCHAR NOT NULL,
   id              BIGINT,
   lead_email      VARCHAR,
   campaign_id     VARCHAR,
@@ -178,6 +223,7 @@ CREATE TABLE IF NOT EXISTS raw_pipeline_lead_events (
 
 -- public.variant_copy (full)
 CREATE TABLE IF NOT EXISTS raw_pipeline_variant_copy (
+  _key                 VARCHAR NOT NULL,
   campaign_id          VARCHAR,
   step                 INTEGER,
   variant              VARCHAR,
@@ -189,12 +235,14 @@ CREATE TABLE IF NOT EXISTS raw_pipeline_variant_copy (
   v_disabled           BOOLEAN,
   body_unspintaxed     VARCHAR,
   subject_unspintaxed  VARCHAR,
+  content_hash         VARCHAR,
   _loaded_at           TIMESTAMPTZ NOT NULL,
   _run_id              VARCHAR NOT NULL
 );
 
 -- public.bounce_suppression (full)
 CREATE TABLE IF NOT EXISTS raw_pipeline_bounce_suppression (
+  _key              VARCHAR NOT NULL,
   id                BIGINT,
   email             VARCHAR,
   domain            VARCHAR,
@@ -212,12 +260,31 @@ CREATE TABLE IF NOT EXISTS raw_pipeline_bounce_suppression (
   _run_id           VARCHAR NOT NULL
 );
 
--- Indexes on (_run_id) for fast idempotent delete and per-run filtering.
-CREATE INDEX IF NOT EXISTS ix_raw_pipeline_campaigns_run                 ON raw_pipeline_campaigns               (_run_id);
-CREATE INDEX IF NOT EXISTS ix_raw_pipeline_campaign_data_run             ON raw_pipeline_campaign_data           (_run_id);
-CREATE INDEX IF NOT EXISTS ix_raw_pipeline_campaign_daily_metrics_run    ON raw_pipeline_campaign_daily_metrics  (_run_id);
-CREATE INDEX IF NOT EXISTS ix_raw_pipeline_meetings_booked_raw_run       ON raw_pipeline_meetings_booked_raw     (_run_id);
-CREATE INDEX IF NOT EXISTS ix_raw_pipeline_reply_data_run                ON raw_pipeline_reply_data              (_run_id);
-CREATE INDEX IF NOT EXISTS ix_raw_pipeline_lead_events_run               ON raw_pipeline_lead_events             (_run_id);
-CREATE INDEX IF NOT EXISTS ix_raw_pipeline_variant_copy_run              ON raw_pipeline_variant_copy            (_run_id);
-CREATE INDEX IF NOT EXISTS ix_raw_pipeline_bounce_suppression_run        ON raw_pipeline_bounce_suppression      (_run_id);
+-- Unique _key indexes back ON CONFLICT (_key) in entities/pipeline_mirror.py.
+CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_campaigns_key                 ON raw_pipeline_campaigns               (_key);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_campaign_data_key             ON raw_pipeline_campaign_data           (_key);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_campaign_daily_metrics_key    ON raw_pipeline_campaign_daily_metrics  (_key);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_meetings_booked_raw_key       ON raw_pipeline_meetings_booked_raw     (_key);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_reply_data_key                ON raw_pipeline_reply_data              (_key);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_reply_intent_key              ON raw_pipeline_reply_intent_classifications (_key);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_reply_auto_recon_key          ON raw_pipeline_reply_auto_reconciliation (_key);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_lead_events_key               ON raw_pipeline_lead_events             (_key);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_variant_copy_key              ON raw_pipeline_variant_copy            (_key);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_bounce_suppression_key        ON raw_pipeline_bounce_suppression      (_key);
+
+-- Helper indexes for common joins and watermarks.
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_campaigns_campaign                  ON raw_pipeline_campaigns               (campaign_id);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_campaign_data_campaign              ON raw_pipeline_campaign_data           (campaign_id);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_campaign_daily_metrics_campaign     ON raw_pipeline_campaign_daily_metrics  (campaign_id);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_meetings_booked_raw_campaign        ON raw_pipeline_meetings_booked_raw     (campaign_id);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_reply_data_campaign                 ON raw_pipeline_reply_data              (campaign_id);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_reply_intent_campaign               ON raw_pipeline_reply_intent_classifications (campaign_id);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_reply_auto_recon_campaign           ON raw_pipeline_reply_auto_reconciliation (campaign_id);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_lead_events_campaign                ON raw_pipeline_lead_events             (campaign_id);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_variant_copy_campaign               ON raw_pipeline_variant_copy            (campaign_id);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_reply_intent_ts               ON raw_pipeline_reply_intent_classifications (reply_timestamp);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_reply_intent_campaign_ts      ON raw_pipeline_reply_intent_classifications (campaign_id, reply_timestamp);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_meetings_booked_raw_posted_at ON raw_pipeline_meetings_booked_raw     (posted_at);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_reply_data_reply_ts           ON raw_pipeline_reply_data              (reply_timestamp);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_lead_events_event_ts          ON raw_pipeline_lead_events             (event_timestamp);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_bounce_suppression_last_seen  ON raw_pipeline_bounce_suppression      (last_seen_at);
