@@ -30,6 +30,14 @@ ORCHESTRATOR_ARGS="${ORCHESTRATOR_ARGS:-}"
 EXIT_CODE=${PIPESTATUS[0]}
 
 if [[ "$EXIT_CODE" -eq 0 ]]; then
+    echo "refreshing campaign-performance dashboard data" | tee -a "$LOG_FILE"
+    "$SCRIPT_DIR/refresh_campaign_performance.sh" 2>&1 | tee -a "$LOG_FILE"
+    REFRESH_CODE=${PIPESTATUS[0]}
+    if [[ "$REFRESH_CODE" -ne 0 ]]; then
+        echo "campaign_performance_refresh_exit=$REFRESH_CODE" | tee -a "$LOG_FILE"
+        exit "$REFRESH_CODE"
+    fi
+
     echo "publishing lens serving copy" | tee -a "$LOG_FILE"
     "$SCRIPT_DIR/publish_serving.sh" 2>&1 | tee -a "$LOG_FILE"
     PUBLISH_CODE=${PIPESTATUS[0]}
