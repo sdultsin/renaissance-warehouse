@@ -31,6 +31,7 @@ ENV_FILE_CANDIDATES = [
 PHASE_ORDER = [
     "pipeline_mirror",   # 03:30 — slim mirror from pipeline-supabase
     "comms_mirror",      # 03:45 — comms-orchestration snapshot
+    "sendivo",           # 03:50 — Sendivo SMS send-side (delivery metrics, campaigns, billing)
     "outreachify",       # 03:45 — Outreachify Supabase snapshot
     "instantly",         # 04:00 — workspaces, campaigns, accounts, tags, lead membership
     "sheets",            # 04:15 — Domain Tech Sheet, blacklist sheet

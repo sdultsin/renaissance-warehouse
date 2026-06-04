@@ -76,7 +76,9 @@ def run_workspace_ingest(ctx: RunContext) -> PhaseResult:
                     ctx.run_id,
                     workspace_id,
                     slug,
-                    payload.get("name"),
+                    # Sanitize: Instantly UI names can carry stray whitespace
+                    # (e.g. "Funding UK\t"). Strip so canonical names stay clean.
+                    (payload.get("name") or "").strip() or None,
                     payload.get("plan_id"),
                     None,  # trial_active not exposed by API
                     payload.get("owner"),  # owner UUID is closest analogue to org id here

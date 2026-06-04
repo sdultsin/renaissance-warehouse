@@ -108,6 +108,12 @@ def main(argv: list[str] | None = None) -> int:
         help="Run only this phase (default: all phases)",
     )
     parser.add_argument(
+        "--ingest",
+        type=str,
+        default=None,
+        help="Within the selected phase(s), run only this named ingest (e.g. recipient_domain)",
+    )
+    parser.add_argument(
         "--db",
         type=str,
         default=None,
@@ -148,6 +154,8 @@ def main(argv: list[str] | None = None) -> int:
     total_failed = 0
     for phase_name in phases_to_run:
         regs = registry.by_phase(phase_name)
+        if args.ingest:
+            regs = [r for r in regs if r.ingest_name == args.ingest]
         total_failed += run_phase(regs, ctx, phase_name, args.dry_run)
 
     final_status = "success" if total_failed == 0 else "partial"

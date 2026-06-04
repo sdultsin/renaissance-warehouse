@@ -104,6 +104,26 @@ class InstantlyClient:
         """
         return self._get(f"/campaigns/{campaign_id}")
 
+    def campaign_analytics(self, campaign_id: str | None = None) -> list[dict]:
+        """`GET /campaigns/analytics` — campaign-GRAIN performance, one object per
+        campaign. This is the ONLY source whose `emails_sent_count` /
+        `reply_count_unique` / `total_opportunities` match the Instantly UI; the
+        daily-metrics fact table's `unique_*` columns are per-day-distinct and
+        cannot be summed (a lead unique on two days counts twice). See
+        sql/ddl/32_campaign_analytics.sql.
+
+        Omit `campaign_id` to get every campaign in the workspace in one call
+        (the endpoint returns a bare JSON array, not a paginated `items` wrapper).
+        """
+        params = {"id": campaign_id} if campaign_id else None
+        payload = self._get("/campaigns/analytics", params=params)
+        if isinstance(payload, list):
+            return payload
+        # Defensive: some deployments wrap arrays in {items:[...]}.
+        if isinstance(payload, dict):
+            return payload.get("items") or []
+        return []
+
     def list_tags(self, workspace_id: str | None = None) -> Iterator[dict]:
         """`GET /custom-tags` — workspace-level tag catalog.
 

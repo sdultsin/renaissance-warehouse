@@ -49,6 +49,8 @@ logger = logging.getLogger(__name__)
 _TABLES: list[tuple[str, str, str]] = [
     ("comms", "brand", "raw_comms_brand"),
     ("comms", "conversation", "raw_comms_conversation"),
+    # message: SMS inbound+outbound (content=body, ai_decision_id, direction). Joined to
+    # conversation for prospect phone/email; feeds derived.reply_intent (Workstream I).
     ("comms", "message", "raw_comms_message"),
     ("comms", "suppression", "raw_comms_suppression"),
     ("comms", "escalation", "raw_comms_escalation"),
