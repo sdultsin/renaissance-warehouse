@@ -57,9 +57,13 @@ def run_sms_logs(ctx: RunContext) -> PhaseResult:
     conn.execute(_DDL)
 
     per: dict[str, dict] = {}
+    failures: dict[str, str] = {}
     rows_out = 0
     with SendivoClient(api_key) as cli:
         for day in _target_days(today):
+          # Per-day isolation: a flaky-endpoint failure on one day must NOT raise — that would
+          # mark the whole ingest failed and block nightly.sh's dashboard/serving publish.
+          try:
             # key -> [n_messages, segments, cost]
             agg: dict[tuple, list] = defaultdict(lambda: [0, 0, 0.0])
 
@@ -108,5 +112,11 @@ def run_sms_logs(ctx: RunContext) -> PhaseResult:
             per[day] = {"pages": last_page, "api_total": total, "groups": len(recs), "msgs": msgs}
             rows_out += len(recs)
             logger.info("sms_logs %s: %s", day, per[day])
+          except Exception as exc:  # noqa: BLE001 — never let one flaky day fail the whole nightly
+            failures[day] = str(exc)[:200]
+            logger.warning("sms_logs %s FAILED (skipped, non-fatal): %s", day, exc)
 
-    return PhaseResult(rows_in=rows_out, rows_out=rows_out, notes=per)
+    notes = dict(per)
+    if failures:
+        notes["_failed_days"] = failures
+    return PhaseResult(rows_in=rows_out, rows_out=rows_out, notes=notes)
