@@ -11,6 +11,14 @@
 *.jsonl
 data/
 
+# PII — partner feedback & reply verbatims hold real lead emails. Never push
+# (public repo; same identity-risk rule as the domain list). Local/droplet only.
+*.xlsx
+
+# Seed data — vendor/cost/partner reference data + sheet snapshots. Out-of-band,
+# local/droplet only; never committed to the public repo.
+seed_data/
+
 # Python
 __pycache__/
 *.pyc

@@ -42,7 +42,22 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError:
             logger.warning("Skipping %s — filename does not start with version int", sql_file.name)
             continue
-        applied = db_module.apply_ddl_file(conn, sql_file, version=version)
+        try:
+            applied = db_module.apply_ddl_file(conn, sql_file, version=version)
+        except Exception as exc:  # noqa: BLE001
+            # Some DDL files load an optional, out-of-band external seed file
+            # (e.g. cost reference data). If that seed file is absent (a fresh
+            # clone without the operator's local seed data), skip the seed
+            # rather than aborting the whole schema init.
+            msg = str(exc)
+            if "No files found that match the pattern" in msg or "IO Error" in msg:
+                logger.warning(
+                    "Skipping %s — optional external seed not present (%s)",
+                    sql_file.name,
+                    msg.splitlines()[0],
+                )
+                continue
+            raise
         logger.info("%s %s (version=%d)", "applied" if applied else "already-applied", sql_file.name, version)
 
     conn.close()

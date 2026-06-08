@@ -28,9 +28,18 @@ Tables mirrored:
   comms.phone_enrichment   -> raw_comms_phone_enrichment
   comms.instantly_message  -> raw_comms_instantly_message
   audit.ai_decision_log    -> raw_comms_ai_decision_log
+  comms.close_sync         -> raw_comms_close_sync        (WS-E gap-close, 2026-06-08)
+  comms.gbc_application    -> raw_comms_gbc_application    (WS-E gap-close, 2026-06-08)
+  comms.app_link_check     -> raw_comms_app_link_check     (WS-E gap-close, 2026-06-08)
 
-Explicitly NOT mirrored (per Sam): comms.close_sync, comms.gbc_application,
-comms.webhook_receipt, comms.app_link_check, config.* tables.
+Explicitly NOT mirrored: comms.webhook_receipt and config.* tables.
+  * comms.webhook_receipt (~6.18M rows) is a raw pre-processing webhook log —
+    intentionally excluded as noise (no analytic value; the processed signal
+    already lands in the other mirrored tables). Do NOT add it here.
+
+WS-E (Spec 16 §WS-E, 2026-06-08) closed the close_sync / gbc_application /
+app_link_check gap. Their DDL is additive-only in sql/ddl/47_comms_mirror_gaps.sql
+(the v1 tables in 16_comms_mirror.sql are untouched — additive invariant §3).
 """
 
 from __future__ import annotations
@@ -57,7 +66,15 @@ _TABLES: list[tuple[str, str, str]] = [
     ("comms", "call_opportunity", "raw_comms_call_opportunity"),
     ("comms", "phone_enrichment", "raw_comms_phone_enrichment"),
     ("comms", "instantly_message", "raw_comms_instantly_message"),
+    # editable $/credit rate table — dollarizes phone-enrichment spend (feeds
+    # derived.enrichment_cost). Small + stable; full-refresh like the rest.
+    ("comms", "enrichment_vendor_pricing", "raw_comms_enrichment_vendor_pricing"),
     ("audit", "ai_decision_log", "raw_comms_ai_decision_log"),
+    # ── WS-E gap-close (Spec 16, 2026-06-08): the three remaining analytic tables.
+    # DDL in sql/ddl/47_comms_mirror_gaps.sql. webhook_receipt stays OUT (noise).
+    ("comms", "close_sync", "raw_comms_close_sync"),
+    ("comms", "gbc_application", "raw_comms_gbc_application"),
+    ("comms", "app_link_check", "raw_comms_app_link_check"),
 ]
 
 # Columns that must be CAST to VARCHAR for postgres_scanner -> DuckDB. Covers
@@ -73,6 +90,10 @@ _CAST_TO_VARCHAR: dict[str, set[str]] = {
     "raw_comms_instantly_message": {"to_emails", "raw_payload"},
     # enums on ai_decision_log
     "raw_comms_ai_decision_log": {"state_before", "state_after"},
+    # ── WS-E gap-close: jsonb columns on the three new tables (2026-06-08).
+    "raw_comms_close_sync": {"request_payload", "response_payload"},
+    "raw_comms_gbc_application": {"raw_payload", "suppression_log"},
+    "raw_comms_app_link_check": {"raw_response"},
 }
 
 

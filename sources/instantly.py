@@ -124,6 +124,57 @@ class InstantlyClient:
             return payload.get("items") or []
         return []
 
+    def received_emails(
+        self,
+        since: str | None = None,
+        workspace_id: str | None = None,
+    ) -> Iterator[dict]:
+        """`GET /emails?email_type=received` (paginated) — inbound prospect replies.
+
+        This is the DIRECT-Instantly source for what pipeline-supabase's
+        `reply_data` table holds (cold-email replies). It lets the warehouse pull
+        replies itself instead of mirroring n8n's reply_data table — the n8n
+        webhook collector is the only producer of pipeline-supabase.public.reply_data
+        and is not owned by us (see deliverables/2026-03-23-data-landscape-audit.md
+        "reply_data Population").
+
+        Each item carries the fields raw_instantly_email needs:
+          id, campaign_id, lead, subject, body{html/text}, from_address_email,
+          eaccount, step, timestamp_email, ue_type, thread_id, message_id.
+
+        `since` (ISO8601) is a best-effort lower bound passed as the API's
+        `i_status`-free time window if supported; we ALSO filter client-side on
+        timestamp_email so an unsupported param can never widen the pull.
+        The key already scopes the workspace; `workspace_id` is informational.
+        """
+        params: dict = {"email_type": "received"}
+        # The endpoint sorts newest-first; we stop paginating once we cross `since`.
+        from datetime import datetime, timezone
+
+        cutoff = None
+        if since:
+            try:
+                cutoff = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                if cutoff.tzinfo is None:
+                    cutoff = cutoff.replace(tzinfo=timezone.utc)
+            except ValueError:
+                cutoff = None
+
+        for item in self._paginate("/emails", params=params, limit=100):
+            if cutoff is not None:
+                ts = item.get("timestamp_email") or item.get("timestamp_created")
+                if ts:
+                    try:
+                        t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                        if t.tzinfo is None:
+                            t = t.replace(tzinfo=timezone.utc)
+                        if t < cutoff:
+                            # Newest-first ordering: everything after this is older.
+                            return
+                    except ValueError:
+                        pass
+            yield item
+
     def list_tags(self, workspace_id: str | None = None) -> Iterator[dict]:
         """`GET /custom-tags` — workspace-level tag catalog.
 

@@ -5,7 +5,7 @@ REFERENCE data only -- on any conflict with Instantly, Instantly wins.
 
 WHY CSV-STAGED (read this before changing the design)
 -----------------------------------------------------
-The droplet runtime (renaissance-worker) has NO Google Sheets credentials and
+The droplet runtime has NO Google Sheets credentials and
 NO MCP bridge. The only place the sheets are reachable is an interactive Claude
 session with the session-connected `google-sheets` MCP. So the ingest is split:
 
@@ -42,32 +42,20 @@ from typing import Iterable
 # Default staging dir on the droplet. Override with SHEETS_STAGING_DIR.
 DEFAULT_STAGING_DIR = "/root/core/sheets_staging"
 
-DOMAIN_TECH_SHEET_ID = "REDACTED"
-BLACKLIST_SHEET_ID = "REDACTED"
+# Spreadsheet IDs are read from the environment (not committed). Only needed if the
+# sheets sync is resumed; empty by default.
+DOMAIN_TECH_SHEET_ID = os.environ.get("DOMAIN_TECH_SHEET_ID", "")
+BLACKLIST_SHEET_ID = os.environ.get("BLACKLIST_SHEET_ID", "")
 
 # (table_name, spreadsheet_id, tab_name, csv_filename)
 #
-# Tab names below were confirmed against the LIVE sheets 2026-05-30. The original
-# spec's blacklist tab "Master Blacklist" DOES NOT EXIST; the blacklist sheet's
-# real tabs are Summary / All Domains / All Blocklisted Domains /
-# Unflagged Blocklisted Domains / All Outlook Domains (MailIn). We snapshot the
-# two operationally useful ones: "All Domains" (full per-domain inventory w/
-# infra, workspaces, tags, blocklist flag, sent/replies) and "All Blocklisted
-# Domains" (the actual blacklist tracking, one row per blocklisted domain).
-SHEET_TABS = [
-    ("raw_sheets_domain_tech_main",
-     DOMAIN_TECH_SHEET_ID, "MAIN", "domain_tech__MAIN.csv"),
-    ("raw_sheets_domain_tech_domains",
-     DOMAIN_TECH_SHEET_ID, "Domains", "domain_tech__Domains.csv"),
-    ("raw_sheets_domain_tech_domains_table",
-     DOMAIN_TECH_SHEET_ID, "Domains(Table)", "domain_tech__Domains_Table.csv"),
-    ("raw_sheets_domain_tech_admin_renaissance",
-     DOMAIN_TECH_SHEET_ID, "ADMIN - Renaissance", "domain_tech__ADMIN_Renaissance.csv"),
-    ("raw_sheets_blacklist_all_domains",
-     BLACKLIST_SHEET_ID, "All Domains", "blacklist__All_Domains.csv"),
-    ("raw_sheets_blacklist_blocklisted",
-     BLACKLIST_SHEET_ID, "All Blocklisted Domains", "blacklist__All_Blocklisted_Domains.csv"),
-]
+# RETIRED: this backfill-only reference data is no longer synced. The tab registry is
+# intentionally empty so the CONSUME step (entities/sheets_mirror.py) is a no-op -- it
+# iterates SHEET_TABS, so an empty list means "nothing to snapshot". The raw_sheets_*
+# table definitions and the final snapshot data are PRESERVED (not dropped); the table
+# constants and write_tab_csv() are kept for reference/restore. To resume syncing, add
+# entries of the form (table_name, <sheet-id-const>, tab_name, csv_filename) below.
+SHEET_TABS = []
 
 
 def staging_dir() -> str:

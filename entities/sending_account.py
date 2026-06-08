@@ -8,9 +8,9 @@ Classification / lifecycle derivation rules (spec 06), constrained by what a sin
 account_truth snapshot can actually tell us:
 
   esp            <- infra_type   (Google->google, Outlook->outlook, OTD->otd, else NULL)
-  infra_provider <- provider_code (1=OTD -> 'OTD'; vendor brand for Outlook/Google
-                    inboxes — MailIn/Reseller/vendorD/vendorC/vendorE — is NOT in
-                    account_truth, needs domain/tag resolution -> NULL for now (GAP)).
+  infra_provider <- provider_code (1=OTD -> 'OTD'; the specific vendor brand for
+                    other Outlook/Google inboxes is NOT in account_truth, needs
+                    domain/tag resolution -> NULL for now (GAP)).
   lifecycle_state:
      Missing Current Inventory -> retired
      Paused / Connection Error -> paused

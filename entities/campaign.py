@@ -37,7 +37,7 @@ logger = logging.getLogger("entities.campaign")
 
 
 # ---------------------------------------------------------------------
-# Regex resolution rules. Lifted verbatim from spec 03.
+# Regex resolution rules for campaign-manager / offer / is_mca classification.
 # ---------------------------------------------------------------------
 _RE_MCA = re.compile(r"\b(isaac|mca|cheap leads)\b", re.IGNORECASE)
 

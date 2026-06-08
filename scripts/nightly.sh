@@ -25,9 +25,24 @@ fi
 PYTHON="${PYTHON:-python3}"
 ORCHESTRATOR_ARGS="${ORCHESTRATOR_ARGS:-}"
 
+# Apply any new versioned DDL before the run so new tables/views (sync_registry,
+# infra-capacity views, campaign_daily, ...) always materialize. Idempotent
+# (version-tracked); runs before the orchestrator opens its connection.
+echo "applying versioned DDL (setup_db)" | tee -a "$LOG_FILE"
+"$PYTHON" scripts/setup_db.py 2>&1 | tee -a "$LOG_FILE" \
+    || echo "WARN setup_db_failed (continuing)" | tee -a "$LOG_FILE"
+
+# The orchestrator returns 1 on a PARTIAL run (some peripheral ingest failed —
+# e.g. pipeline-supabase intermittently refusing connections during retirement).
+# Under `set -e` a non-zero pipeline aborts the script BEFORE EXIT_CODE is captured,
+# which silently skipped compaction + all dashboard/serving publishes (root cause of
+# the 06-03 serving freeze). Disable -e just around the orchestrator so the partial-
+# handling logic below actually runs. (2026-06-08 F2 fix.)
+set +e
 # shellcheck disable=SC2086
 "$PYTHON" -m core.orchestrator $ORCHESTRATOR_ARGS 2>&1 | tee -a "$LOG_FILE"
 EXIT_CODE=${PIPESTATUS[0]}
+set -e
 
 # Publish dashboards on success (0) OR partial (1). A partial run means every
 # phase executed and the warehouse tables were rebuilt; only peripheral ingests
@@ -64,6 +79,80 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     echo "publishing lens serving copy" | tee -a "$LOG_FILE"
     "$SCRIPT_DIR/publish_serving.sh" 2>&1 | tee -a "$LOG_FILE" \
         || echo "WARN publish_serving_failed (continuing)" | tee -a "$LOG_FILE"
+
+    # Publish the campaign_data read-model snapshot to Cloudflare D1 so Campaign
+    # Control can read it from D1 instead of Pipeline Supabase (retirement Lane C).
+    # .env is NOT shell-sourceable (a comment on line ~131 contains a ')'), so
+    # export the two D1 vars via grep rather than `source .env`.
+    echo "publishing campaign_data read-model to D1" | tee -a "$LOG_FILE"
+    CC_D1_API_TOKEN="$(grep '^CC_D1_API_TOKEN=' .env | cut -d= -f2- | tr -d '"')" \
+    CLOUDFLARE_RG_ACCOUNT_ID="$(grep '^CLOUDFLARE_RG_ACCOUNT_ID=' .env | cut -d= -f2- | tr -d '"')" \
+        "$PYTHON" scripts/publish_campaign_data_d1.py 2>&1 | tee -a "$LOG_FILE" \
+        || echo "WARN campaign_data_d1_publish_failed (continuing)" | tee -a "$LOG_FILE"
+
+    # Mirror cc_* operational tables from D1 into the warehouse (raw_cc_*) for
+    # consolidation/BI (retirement Step 4). Non-fatal; writes after the
+    # orchestrator has released the DuckDB writer lock.
+    echo "mirroring cc_* from D1 to warehouse" | tee -a "$LOG_FILE"
+    CC_D1_API_TOKEN="$(grep '^CC_D1_API_TOKEN=' .env | cut -d= -f2- | tr -d '"')" \
+    CLOUDFLARE_RG_ACCOUNT_ID="$(grep '^CLOUDFLARE_RG_ACCOUNT_ID=' .env | cut -d= -f2- | tr -d '"')" \
+        "$SCRIPT_DIR/mirror_cc_to_warehouse.sh" 2>&1 | tee -a "$LOG_FILE" \
+        || echo "WARN cc_mirror_failed (continuing)" | tee -a "$LOG_FILE"
+
+    # Track H — per-campaign day-by-day metrics from the Instantly analytics API
+    # (lock-free fetch + brief write; runs after the orchestrator released the lock).
+    echo "building core.campaign_daily (Track H)" | tee -a "$LOG_FILE"
+    ( set +u; source /root/codex-ops/instantly-api-keys.env 2>/dev/null || true
+      INSTANTLY_KEYS_ENV=/root/codex-ops/instantly-api-keys.env \
+        "$PYTHON" scripts/build_campaign_daily.py 2>&1 | tee -a "$LOG_FILE" ) \
+        || echo "WARN campaign_daily_build_failed (continuing)" | tee -a "$LOG_FILE"
+
+    # Track I — refresh the NS sweep weekly (cheap-ish; NS rarely changes) and backfill
+    # core.domain_registry.nameserver_host from it each night.
+    if [[ ! -f /root/core/ns_sweep.parquet || $(find /root/core/ns_sweep.parquet -mtime +6 2>/dev/null) ]]; then
+        echo "refreshing NS sweep (Track I)" | tee -a "$LOG_FILE"
+        "$PYTHON" scripts/ns_sweep.py --out /root/core/ns_sweep.parquet 2>&1 | tee -a "$LOG_FILE" \
+            || echo "WARN ns_sweep_failed (continuing)" | tee -a "$LOG_FILE"
+    fi
+    echo "backfilling domain_registry NS (Track I)" | tee -a "$LOG_FILE"
+    "$PYTHON" scripts/backfill_domain_registry.py --ns /root/core/ns_sweep.parquet 2>&1 | tee -a "$LOG_FILE" \
+        || echo "WARN domain_registry_backfill_failed (continuing)" | tee -a "$LOG_FILE"
+
+    # Track I — backfill purchased_at from a registrar API. Refresh the date cache
+    # weekly; load nightly. Some registrar accounts need their own creds (residual gap);
+    # vendor-provisioned domains legitimately have no registration date.
+    if [[ ! -f /root/core/vendorB_dates.parquet || $(find /root/core/vendorB_dates.parquet -mtime +6 2>/dev/null) ]]; then
+        "$PYTHON" scripts/backfill_purchased_at_vendorB.py --cache /root/core/vendorB_dates.parquet 2>&1 | tee -a "$LOG_FILE" \
+            || echo "WARN vendorB_purchased_at_failed (continuing)" | tee -a "$LOG_FILE"
+    else
+        "$PYTHON" scripts/backfill_purchased_at_vendorB.py --from-cache /root/core/vendorB_dates.parquet 2>&1 | tee -a "$LOG_FILE" \
+            || echo "WARN vendorB_purchased_at_failed (continuing)" | tee -a "$LOG_FILE"
+    fi
+
+    # Track I — fill remaining purchased_at (+ expires_at) from the Domain Tech Sheet
+    # mirror (expiration − 1y, per Sam). Runs AFTER the exact-registrar fills so exact
+    # dates win; the sheet fills the rest as purchased_at_is_derived=TRUE.
+    echo "backfilling purchased_at from Domain Tech Sheet (Track I)" | tee -a "$LOG_FILE"
+    "$PYTHON" scripts/backfill_purchased_at_from_sheet.py 2>&1 | tee -a "$LOG_FILE" \
+        || echo "WARN purchased_at_sheet_backfill_failed (continuing)" | tee -a "$LOG_FILE"
+
+    # Track E — freshness backbone. Refresh core.sync_registry (writer; runs after
+    # the orchestrator + all mirrors released the lock) then fail-loud QA. The QA
+    # job posts a #cc-sam alert on any SLA breach so silent staleness is impossible.
+    echo "refreshing sync_registry (freshness backbone)" | tee -a "$LOG_FILE"
+    "$PYTHON" scripts/refresh_sync_registry.py 2>&1 | tee -a "$LOG_FILE" \
+        || echo "WARN sync_registry_refresh_failed (continuing)" | tee -a "$LOG_FILE"
+
+    echo "running warehouse QA (fail-loud freshness/invariant alert)" | tee -a "$LOG_FILE"
+    "$PYTHON" scripts/warehouse_qa.py 2>&1 | tee -a "$LOG_FILE"
+    QA_RC=${PIPESTATUS[0]}
+    if [[ "$QA_RC" -ne 0 ]]; then
+        echo "WARN warehouse_qa reported breaches (alert posted to #cc-sam)" | tee -a "$LOG_FILE"
+    fi
+
+    # Hardening DoD status to the log (no Slack — warehouse_qa already alerts).
+    echo "hardening DoD check (log-only)" | tee -a "$LOG_FILE"
+    "$PYTHON" scripts/verify_hardening_dod.py --no-post 2>&1 | tee -a "$LOG_FILE" || true
 else
     echo "orchestrator hard-failed (exit=$EXIT_CODE); keeping existing dashboards + serving copy" | tee -a "$LOG_FILE"
 fi

@@ -1,52 +1,53 @@
-"""One-time FROZEN backfill of Darcy's im_bookings -> warehouse raw_im_bookings.
+"""One-time FROZEN backfill of the bookings portal im_bookings table -> raw_im_bookings.
 
 Workstream F. This is NOT part of the nightly orchestrator. It captures a single
-frozen snapshot of the Renaissance-Portal IM bookings table for funding-partner
-attribution analysis, then never runs again (unless Sam wants a fresh snapshot under
-a new --snapshot-date).
+frozen snapshot of the bookings portal table for funding-partner attribution analysis,
+then never runs again (unless a fresh snapshot is wanted under a new --snapshot-date).
 
 WHAT IT DOES
-  1. Pages through PostgREST on REDACTED.supabase.co/rest/v1/im_bookings
-     (select=*, limit=1000, offset=N, ordered by id) using the portal's publishable key.
-  2. Accumulates all ~36,806 rows in memory (tiny — <50 MB).
+  1. Pages through PostgREST on <SUPABASE_URL>/rest/v1/im_bookings (select=*, limit=1000,
+     offset=N, ordered by id) using the portal's publishable key. Both the URL and the
+     publishable key are read from the environment (IM_BOOKINGS_SUPABASE_URL /
+     IM_BOOKINGS_SUPABASE_ANON_KEY).
+  2. Accumulates all rows in memory (small).
   3. Loads them into DuckDB table raw_im_bookings with the extra columns:
-       _snapshot_date (constant, default '2026-05-31'), _source='darcy_portal_im_bookings',
-       _loaded_at = now().
+       _snapshot_date (constant, default below), _source (source tag), _loaded_at = now().
      Idempotent for a given snapshot_date: deletes existing rows for that _snapshot_date
      first, then inserts (so a re-run replaces, never duplicates).
 
 USAGE (run ON the droplet, where warehouse.duckdb + duckdb live):
-    ssh renaissance-worker 'cd /root/renaissance-warehouse && source .venv/bin/activate \
-        && python scripts/backfill_im_bookings.py'
+    cd <repo> && source .venv/bin/activate && python scripts/backfill_im_bookings.py
 
     # custom freeze date / dry-run (fetch + print counts, NO warehouse write):
     python scripts/backfill_im_bookings.py --snapshot-date 2026-05-31 --dry-run
 
 PREREQUISITE: sql/ddl/27_raw_im_bookings.sql must be applied first (creates the table).
 
-⚠ WRITE WINDOW: writes to the warehouse, so do NOT run during the 03:30-04:15 UTC nightly
-  sync (single-writer lock). The fetch phase is read-only and safe anytime.
+⚠ WRITE WINDOW: writes to the warehouse, so do NOT run during the nightly sync window
+  (single-writer lock). The fetch phase is read-only and safe anytime.
 """
 from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-# --- Source config (verified 2026-05-31, extracted from the portal page HTML) ----------
-# The portal embeds these client-side; the publishable key is read-only-ish (RLS-gated,
-# anon/publishable role). We use it exactly as the portal does for im_bookings reads.
-SUPABASE_URL = "https://REDACTED.supabase.co"
-SUPABASE_ANON_KEY = "REDACTED"
+# --- Source config (read from environment) ---------------------------------------------
+# The bookings portal exposes im_bookings via PostgREST using a publishable (RLS-gated,
+# anon-role) key. Both the project URL and the key are read from the environment so they
+# are not committed to the repo.
+SUPABASE_URL = os.environ.get("IM_BOOKINGS_SUPABASE_URL", "")
+SUPABASE_ANON_KEY = os.environ.get("IM_BOOKINGS_SUPABASE_ANON_KEY", "")
 TABLE = "im_bookings"
 PAGE = 1000
 
-WAREHOUSE_DB = "/root/core/warehouse.duckdb"
+WAREHOUSE_DB = os.environ.get("CORE_DB_PATH", "/root/core/warehouse.duckdb")
 DEFAULT_SNAPSHOT_DATE = "2026-05-31"
-SOURCE_TAG = "darcy_portal_im_bookings"
+SOURCE_TAG = "portal_im_bookings"
 
 # Column order must match sql/ddl/27_raw_im_bookings.sql (the 22 source cols, in table order).
 SOURCE_COLUMNS = [

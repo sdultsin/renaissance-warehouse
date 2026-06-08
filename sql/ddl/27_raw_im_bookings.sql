@@ -1,9 +1,9 @@
--- Workstream F: raw_im_bookings — a ONE-TIME FROZEN snapshot of Darcy's im_bookings table.
+-- Workstream F: raw_im_bookings — a ONE-TIME FROZEN snapshot of the bookings portal table.
 -- Applied at schema version 27 by scripts/setup_db.py / orchestrator DDL applier.
 --
--- Source: Supabase project REDACTED.supabase.co, table `im_bookings`
--- (~36,806 rows as of 2026-05-31), the table behind the Renaissance-Portal IM dashboard.
--- Loaded by scripts/backfill_im_bookings.py via PostgREST paging.
+-- Source: an upstream Supabase project (credentials/IDs via env), table `im_bookings`,
+-- the table behind the bookings portal dashboard. Loaded by
+-- scripts/backfill_im_bookings.py via PostgREST paging.
 --
 -- ⚠ THIS TABLE IS FROZEN. It is NOT part of the nightly orchestrator sync. It is a single
 --   captured snapshot for analysis/attribution. Do not register a phase for it. If a fresh
@@ -13,21 +13,15 @@
 -- Columns: every column im_bookings exposes, preserved verbatim (PostgREST `select=*`), as
 -- VARCHAR except the clearly-numeric source columns. Plus warehouse audit columns:
 --   _snapshot_date  DATE     — the frozen-as-of date (constant, passed to the script).
---   _source         VARCHAR  — 'darcy_portal_im_bookings'.
+--   _source         VARCHAR  — source tag for the snapshot.
 --   _loaded_at      TIMESTAMPTZ — ingestion wall-clock (matches raw_* convention).
---
--- im_bookings real column set (verified 2026-05-31, 22 cols):
---   id, type, date, offer, partner, advisor, owner_name, company, first_name, last_name,
---   email, phone, job_title, num_employees, annual_revenue, workspace, our_email, campaign,
---   status, inbox_manager, campaign_manager, interested_in
--- (brief listed 18; the live table also carries id, campaign_manager, interested_in.)
 
 CREATE TABLE IF NOT EXISTS raw_im_bookings (
   id               BIGINT,      -- im_bookings PK (verbatim)
   type             VARCHAR,     -- 'Booking' / 'Bookings' / 'Submitted Form' (dirty — verbatim)
   date             VARCHAR,     -- booking date as stored (ISO-ish string; kept as text)
   offer            VARCHAR,
-  partner          VARCHAR,     -- LONG form: partnerA Capital, partnerB, partnerC, Llama, DCX, Infusion, Clarify, partnerD
+  partner          VARCHAR,     -- funding partner (long form as stored in the portal)
   advisor          VARCHAR,
   owner_name       VARCHAR,
   company          VARCHAR,

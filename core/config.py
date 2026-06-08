@@ -19,11 +19,13 @@ BACKUP_RETENTION_DAYS = 14
 
 # .env search order. First match wins for any given key, but credentials.py merges
 # across all of them so per-workspace Instantly keys can live in .env.instantly while
-# other keys live in .env.
+# other keys live in .env. An optional parent directory holding shared .env files can be
+# pointed at via the RENAISSANCE_ENV_DIR environment variable (e.g. a local dev checkout).
+_ENV_DIR = Path(os.environ.get("RENAISSANCE_ENV_DIR", str(REPO_ROOT.parent)))
 ENV_FILE_CANDIDATES = [
     REPO_ROOT / ".env",
-    Path("/Users/sam/Documents/Claude Code/Renaissance/.env"),
-    Path("/Users/sam/Documents/Claude Code/Renaissance/.env.instantly"),
+    _ENV_DIR / ".env",
+    _ENV_DIR / ".env.instantly",
 ]
 
 # Sync window phase order. Orchestrator runs phases in this order. Within a phase
@@ -34,9 +36,11 @@ PHASE_ORDER = [
     "sendivo",           # 03:50 — Sendivo SMS send-side (delivery metrics, campaigns, billing)
     "outreachify",       # 03:45 — Outreachify Supabase snapshot
     "instantly",         # 04:00 — workspaces, campaigns, accounts, tags, lead membership
-    "sheets",            # 04:15 — Domain Tech Sheet, blacklist sheet
+    "close",             # 04:05 — Close CRM warm-call activity (BI/BOF layer, spec 16)
+    "sheets",            # 04:15 — Domain Tech Sheet, blacklist sheet, partner feedback
     "account_truth",     # 04:30 — snapshot from droplet account-truth duckdb
     "dns_sweep",         # 04:45 — MX/A/SPF/DKIM/DMARC/PTR + DNSBLs + redirects
-    "canonical",         # 05:30 — rebuild canonical tables from raw
-    "derived",           # 05:40 — materialize derived views
+    "canonical",         # 05:30 — rebuild canonical tables from raw (incl. core.reply, lead spine, conversions)
+    "intent",            # 05:35 — LLM reply-intent classifier (after canonical builds core.reply)
+    "derived",           # 05:40 — materialize derived views (incl. lead_intel)
 ]

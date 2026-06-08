@@ -158,7 +158,7 @@ CREATE TABLE IF NOT EXISTS raw_comms_call_opportunity (
     _run_id                     VARCHAR
 );
 
--- comms.phone_enrichment  (vendorN enrich audit; opportunity_id, not conversation_id)
+-- comms.phone_enrichment  (phone-enrichment audit; opportunity_id, not conversation_id)
 CREATE TABLE IF NOT EXISTS raw_comms_phone_enrichment (
     id              BIGINT,
     opportunity_id  BIGINT,
@@ -222,6 +222,20 @@ CREATE TABLE IF NOT EXISTS raw_comms_ai_decision_log (
     resulted_in_message_id      BIGINT,
     resulted_in_escalation      BOOLEAN,
     created_at                  TIMESTAMPTZ,
+    _loaded_at                  TIMESTAMPTZ NOT NULL,
+    _run_id                     VARCHAR
+);
+
+-- comms.enrichment_vendor_pricing (editable $/credit rate table for dollarizing
+-- phone-enrichment spend; see derived.enrichment_cost in 35_enrichment_cost.sql).
+-- usd_per_credit is the single source of truth for the dollar conversion — update
+-- it in the comms-orchestration Postgres when a vendor plan changes; this mirror
+-- and the derived views pick it up on the next nightly run.
+CREATE TABLE IF NOT EXISTS raw_comms_enrichment_vendor_pricing (
+    provider                    VARCHAR,
+    usd_per_credit              DOUBLE,
+    plan_note                   VARCHAR,
+    updated_at                  TIMESTAMPTZ,
     _loaded_at                  TIMESTAMPTZ NOT NULL,
     _run_id                     VARCHAR
 );

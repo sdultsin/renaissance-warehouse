@@ -11,7 +11,27 @@ set -euo pipefail
 PRIMARY="${CORE_DB_PATH:-/root/core/warehouse.duckdb}"
 SERVING="${LENS_WAREHOUSE_PATH:-/root/core/warehouse_serving.duckdb}"
 TMP="${SERVING}.tmp"
-MIN_FREE_GB_AFTER_COPY="${MIN_FREE_GB_AFTER_COPY:-40}"
+# Post-copy free-space floor. Sized down 40->20GB on 2026-06-08 (F2): the warehouse
+# grew to ~44GB so a fixed 40GB floor blocked every publish (serving frozen since
+# 06-03). 20GB is ample headroom — the DB is quiescent during publish and grows only
+# a few GB between nightly runs; compaction (which runs first) keeps it ~36GB.
+MIN_FREE_GB_AFTER_COPY="${MIN_FREE_GB_AFTER_COPY:-20}"
+ENV_FILE="${ENV_FILE:-/root/renaissance-warehouse/.env}"
+SLACK_CHANNEL="${SLACK_CHANNEL:-}"  # alert channel ID; set via env
+
+# Fail-loud: post a #cc-sam alert if the serving publish errors out at all (F2 DoD).
+alert() {
+    local msg="$1" token cookie
+    token="$(grep '^SLACK_TOKEN=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"')"
+    cookie="$(grep '^SLACK_COOKIE=' "$ENV_FILE" 2>/dev/null | cut -d= -f2- | tr -d '"')"
+    [[ -z "$token" || -z "$SLACK_CHANNEL" ]] && return 0
+    curl -s -X POST https://slack.com/api/chat.postMessage \
+        -H "Authorization: Bearer $token" \
+        -H "Content-Type: application/json; charset=utf-8" \
+        ${cookie:+-H "Cookie: d=$cookie"} \
+        -d "{\"channel\":\"$SLACK_CHANNEL\",\"text\":\"$msg\"}" >/dev/null 2>&1 || true
+}
+trap 'rc=$?; if [[ $rc -ne 0 ]]; then alert ":rotating_light: publish_serving FAILED (exit $rc) — serving copy NOT refreshed (stale)."; fi' EXIT
 
 if [[ ! -f "$PRIMARY" ]]; then
     echo "$(date -u +%FT%TZ) ERROR: primary DB not found: $PRIMARY" >&2
