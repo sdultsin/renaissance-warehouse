@@ -1,19 +1,23 @@
-"""Compute IAM response times — builds core.iam_response_time.
+"""Compute IM (Inbox Manager) response times — builds core.iam_response_time.
 
-One row per prospect reply, with the time delta to the next IAM manual response
-in the same thread. Source:
-  - raw_instantly_email: prospect replies with thread_id (Instantly-source)
-  - raw_instantly_sent_email: manual IAM outbound replies (ue_type=3)
+One row per prospect reply, with the time delta to the next IM manual response
+in the same thread.
 
-Coverage:
-  - Instantly-source replies (have thread_id): response time computed when a
-    matching IAM sent email exists in the same thread after the reply timestamp.
-  - Pipeline-source replies (no thread_id available): get iam_responded_at=NULL.
+Source: main.raw_pipeline_conversation_messages — the full prospect<->IM thread
+backfill (both directions, ~10 months deep). This supersedes the thin
+raw_instantly_sent_email pull (which only covered a few days from the
+email_type=sent endpoint).
+  - ue_type=2  → inbound prospect replies   (the message we measure FROM)
+  - ue_type=3  → outbound_manual IM replies  (the response we measure TO)
+
+Coverage: response time is computed when a matching IM manual reply (ue_type=3)
+exists in the same thread AFTER the prospect reply timestamp. Replies with no
+later IM response get iam_responded_at = NULL (response_bucket='no_response').
 
 thread_reply_number = rank of this prospect reply within its thread (1=first).
-Rebuilt fully each run (DELETE + INSERT, like core.reply). Idempotent.
+Rebuilt fully each run (DELETE + INSERT). Idempotent.
 
-Registers under 'canonical' phase, must run AFTER f_reply_canonical.
+Registers under 'canonical' phase.
 Schema: sql/ddl/50_iam_response_time.sql.
 """
 
@@ -29,6 +33,8 @@ logger = logging.getLogger("entities.iam_response_time")
 
 _DDL = REPO_ROOT / "sql" / "ddl" / "50_iam_response_time.sql"
 
+_CONV = "main.raw_pipeline_conversation_messages"
+
 _RESPONSE_BUCKET_SQL = """\
 CASE
   WHEN iam_responded_at IS NULL THEN 'no_response'
@@ -43,15 +49,25 @@ END"""
 
 def run(ctx: RunContext) -> PhaseResult:
     db = ctx.db
-    db.execute(_DDL.read_text())
 
-    # Check whether raw_instantly_sent_email has any data.
-    sent_count = db.execute(
-        "SELECT count(*) FROM raw_instantly_sent_email"
+    inbound_count = db.execute(
+        f"SELECT count(*) FROM {_CONV} WHERE ue_type = 2 AND thread_id IS NOT NULL"
     ).fetchone()[0]
-    logger.info("raw_instantly_sent_email rows: %d", sent_count)
+    outbound_count = db.execute(
+        f"SELECT count(*) FROM {_CONV} WHERE ue_type = 3 AND thread_id IS NOT NULL"
+    ).fetchone()[0]
+    logger.info(
+        "conversation_messages: inbound(ue2)=%d outbound_manual(ue3)=%d",
+        inbound_count,
+        outbound_count,
+    )
 
-    db.execute("DELETE FROM core.iam_response_time")
+    # Full rebuild. Insert into an UNINDEXED table, then bulk-build indexes:
+    # inserting ~800k rows into a table with live ART indexes throws DuckDB
+    # "Invalid argument" (same bug family as the raw_instantly_sent_email incident).
+    table_ddl, _, index_ddl = _DDL.read_text().partition("-- @@INDEXES@@")
+    db.execute("DROP TABLE IF EXISTS core.iam_response_time")
+    db.execute(table_ddl)
 
     db.execute(
         f"""
@@ -60,58 +76,58 @@ def run(ctx: RunContext) -> PhaseResult:
              prospect_replied_at, iam_responded_at, response_minutes, response_bucket,
              synced_at)
         WITH
-        -- Prospect replies with thread_id (from direct-Instantly source)
-        instantly_replies AS (
-            SELECT
-                rie.email_id,
-                rie.campaign_id,
-                lower(trim(rie.lead_email))                          AS lead_email,
-                rie.thread_id,
-                rie.reply_timestamp                                  AS prospect_replied_at,
-                ROW_NUMBER() OVER (
-                    PARTITION BY rie.thread_id
-                    ORDER BY rie.reply_timestamp
-                )                                                    AS thread_reply_number
-            FROM raw_instantly_email rie
-            WHERE rie.thread_id IS NOT NULL
-              AND rie.lead_email IS NOT NULL
+        -- Distinct inbound prospect replies (dedupe exact dup rows from raw sync)
+        inbound_src AS (
+            SELECT DISTINCT
+                id                          AS email_id,
+                campaign_id,
+                lower(trim(lead_email))     AS lead_email,
+                thread_id,
+                message_timestamp           AS prospect_replied_at
+            FROM {_CONV}
+            WHERE ue_type = 2
+              AND thread_id IS NOT NULL
+              AND lead_email IS NOT NULL
+              AND message_timestamp IS NOT NULL
         ),
-        -- Next IAM manual reply after each prospect reply in the same thread
+        inbound AS (
+            SELECT
+                email_id,
+                campaign_id,
+                lead_email,
+                thread_id,
+                prospect_replied_at,
+                ROW_NUMBER() OVER (
+                    PARTITION BY thread_id
+                    ORDER BY prospect_replied_at, email_id
+                )                           AS thread_reply_number
+            FROM inbound_src
+        ),
+        -- IM manual outbound replies (ue_type=3)
+        outbound AS (
+            SELECT thread_id, message_timestamp AS resp_ts
+            FROM {_CONV}
+            WHERE ue_type = 3
+              AND thread_id IS NOT NULL
+              AND message_timestamp IS NOT NULL
+        ),
+        -- Next IM manual reply after each prospect reply in the same thread
         with_iam AS (
             SELECT
-                ir.email_id,
-                ir.campaign_id,
-                ir.lead_email,
-                ir.thread_id,
-                ir.thread_reply_number,
-                ir.prospect_replied_at,
-                MIN(se.sent_timestamp)                               AS iam_responded_at
-            FROM instantly_replies ir
-            LEFT JOIN raw_instantly_sent_email se
-                ON se.thread_id = ir.thread_id
-               AND se.sent_timestamp > ir.prospect_replied_at
+                ib.email_id,
+                ib.campaign_id,
+                ib.lead_email,
+                ib.thread_id,
+                ib.thread_reply_number,
+                ib.prospect_replied_at,
+                MIN(o.resp_ts)              AS iam_responded_at
+            FROM inbound ib
+            LEFT JOIN outbound o
+                ON o.thread_id = ib.thread_id
+               AND o.resp_ts > ib.prospect_replied_at
             GROUP BY
-                ir.email_id, ir.campaign_id, ir.lead_email, ir.thread_id,
-                ir.thread_reply_number, ir.prospect_replied_at
-        ),
-        -- Pipeline-source replies have no thread_id; include as no_response rows
-        -- using reply_id as email_id so DoD row count roughly matches core.reply
-        pipeline_replies AS (
-            SELECT
-                r.reply_id   AS email_id,
-                r.campaign_id,
-                r.lead_email,
-                NULL         AS thread_id,
-                1            AS thread_reply_number,
-                r.reply_timestamp AS prospect_replied_at,
-                NULL::TIMESTAMPTZ AS iam_responded_at
-            FROM core.reply r
-            WHERE r.source = 'pipeline'
-        ),
-        combined AS (
-            SELECT * FROM with_iam
-            UNION ALL
-            SELECT * FROM pipeline_replies
+                ib.email_id, ib.campaign_id, ib.lead_email, ib.thread_id,
+                ib.thread_reply_number, ib.prospect_replied_at
         )
         SELECT
             email_id || '_' || thread_reply_number               AS id,
@@ -131,9 +147,13 @@ def run(ctx: RunContext) -> PhaseResult:
             END                                                  AS response_minutes,
             {_RESPONSE_BUCKET_SQL}                               AS response_bucket,
             now()                                                AS synced_at
-        FROM combined
+        FROM with_iam
         """
     )
+
+    # Bulk-build indexes on the now-populated table (avoids the incremental-insert
+    # ART index bug; this is the same path the earlier index-corruption fix used).
+    db.execute(index_ddl)
 
     total = db.execute("SELECT count(*) FROM core.iam_response_time").fetchone()[0]
     stats = db.execute(
@@ -142,16 +162,16 @@ def run(ctx: RunContext) -> PhaseResult:
             count(*)                                              AS total_pairs,
             count(*) FILTER (WHERE iam_responded_at IS NOT NULL) AS with_response,
             count(*) FILTER (WHERE iam_responded_at IS NULL)     AS no_response,
-            round(avg(response_minutes)
-                  FILTER (WHERE response_minutes IS NOT NULL))   AS avg_min,
-            count(*) FILTER (WHERE thread_id IS NOT NULL)        AS with_thread_id
+            round(median(response_minutes)
+                  FILTER (WHERE response_minutes IS NOT NULL))   AS median_min,
+            count(DISTINCT lead_email)                           AS distinct_leads
         FROM core.iam_response_time
         """
     ).fetchone()
 
     logger.info(
         "core.iam_response_time: %d rows | with_response=%d no_response=%d "
-        "avg_min=%s with_thread_id=%d",
+        "median_min=%s distinct_leads=%d",
         *stats,
     )
 
@@ -162,9 +182,10 @@ def run(ctx: RunContext) -> PhaseResult:
             "total_pairs": stats[0],
             "with_response": stats[1],
             "no_response": stats[2],
-            "avg_response_min": float(stats[3]) if stats[3] else None,
-            "with_thread_id": stats[4],
-            "sent_rows_available": sent_count,
+            "median_response_min": float(stats[3]) if stats[3] else None,
+            "distinct_leads": stats[4],
+            "inbound_available": inbound_count,
+            "outbound_available": outbound_count,
         },
     )
 
