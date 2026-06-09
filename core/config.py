@@ -41,6 +41,7 @@ PHASE_ORDER = [
     "account_truth",     # 04:30 — snapshot from droplet account-truth duckdb
     "dns_sweep",         # 04:45 — MX/A/SPF/DKIM/DMARC/PTR + DNSBLs + redirects
     "canonical",         # 05:30 — rebuild canonical tables from raw (incl. core.reply, lead spine, conversions)
-    "intent",            # 05:35 — LLM reply-intent classifier (after canonical builds core.reply)
+    # "intent" phase removed — LLM reply-intent classifier uses Anthropic API; needs explicit Sam go-ahead before enabling
+    "iam_response_time", # 05:35 — IAM response latency per prospect reply (after canonical)
     "derived",           # 05:40 — materialize derived views (incl. lead_intel)
 ]

@@ -24,6 +24,7 @@ fi
 
 PYTHON="${PYTHON:-python3}"
 ORCHESTRATOR_ARGS="${ORCHESTRATOR_ARGS:-}"
+export WAREHOUSE_PULL_IAM_SENT="${WAREHOUSE_PULL_IAM_SENT:-1}"  # incremental IAM sent email ingest (iam_response_time)
 
 # Apply any new versioned DDL before the run so new tables/views (sync_registry,
 # infra-capacity views, campaign_daily, ...) always materialize. Idempotent
@@ -76,9 +77,9 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
         echo "WARN overview_data_refresh_failed (continuing)" | tee -a "$LOG_FILE"
     fi
 
-    echo "publishing lens serving copy" | tee -a "$LOG_FILE"
-    "$SCRIPT_DIR/publish_serving.sh" 2>&1 | tee -a "$LOG_FILE" \
-        || echo "WARN publish_serving_failed (continuing)" | tee -a "$LOG_FILE"
+    # Lens serving copy disabled 2026-06-09 (warehouse_serving.duckdb deleted)
+    # "$SCRIPT_DIR/publish_serving.sh" 2>&1 | tee -a "$LOG_FILE" \
+    #     || echo "WARN publish_serving_failed (continuing)" | tee -a "$LOG_FILE"
 
     # Publish the campaign_data read-model snapshot to Cloudflare D1 so Campaign
     # Control can read it from D1 instead of Pipeline Supabase (retirement Lane C).
@@ -118,15 +119,18 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     "$PYTHON" scripts/backfill_domain_registry.py --ns /root/core/ns_sweep.parquet 2>&1 | tee -a "$LOG_FILE" \
         || echo "WARN domain_registry_backfill_failed (continuing)" | tee -a "$LOG_FILE"
 
-    # Track I — backfill purchased_at from a registrar API. Refresh the date cache
-    # weekly; load nightly. Some registrar accounts need their own creds (residual gap);
-    # vendor-provisioned domains legitimately have no registration date.
-    if [[ ! -f /root/core/vendorB_dates.parquet || $(find /root/core/vendorB_dates.parquet -mtime +6 2>/dev/null) ]]; then
-        "$PYTHON" scripts/backfill_purchased_at_vendorB.py --cache /root/core/vendorB_dates.parquet 2>&1 | tee -a "$LOG_FILE" \
-            || echo "WARN vendorB_purchased_at_failed (continuing)" | tee -a "$LOG_FILE"
+    # Track I — backfill purchased_at (+ exact expires_at) from ALL THREE registrar APIs
+    # (Porkbun, Spaceship, Dynadot), every configured account. Refresh the per-registrar
+    # date caches weekly; load from cache nightly. Upgrades derived->API-exact where a
+    # registrar covers the domain. OTD vendor-provisioned domains have no registration we
+    # own and aren't in any account -> stay sheet-derived/null (filled below). Residual
+    # derived rows = domains not in any of our registrar accounts.
+    if [[ ! -f /root/core/porkbun_dates.parquet || $(find /root/core/porkbun_dates.parquet -mtime +6 2>/dev/null) ]]; then
+        "$PYTHON" scripts/backfill_purchased_at_registrars.py --refresh-cache 2>&1 | tee -a "$LOG_FILE" \
+            || echo "WARN registrars_purchased_at_failed (continuing)" | tee -a "$LOG_FILE"
     else
-        "$PYTHON" scripts/backfill_purchased_at_vendorB.py --from-cache /root/core/vendorB_dates.parquet 2>&1 | tee -a "$LOG_FILE" \
-            || echo "WARN vendorB_purchased_at_failed (continuing)" | tee -a "$LOG_FILE"
+        "$PYTHON" scripts/backfill_purchased_at_registrars.py --from-cache 2>&1 | tee -a "$LOG_FILE" \
+            || echo "WARN registrars_purchased_at_failed (continuing)" | tee -a "$LOG_FILE"
     fi
 
     # Track I — fill remaining purchased_at (+ expires_at) from the Domain Tech Sheet
