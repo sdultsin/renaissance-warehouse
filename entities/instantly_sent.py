@@ -31,11 +31,10 @@ _COLS = [
     "i_status", "api_response_raw", "_loaded_at", "_run_id",
 ]
 _PLACEHOLDERS = ", ".join("?" for _ in _COLS)
-_UPDATE_SET = ", ".join(f"{c} = excluded.{c}" for c in _COLS if c != "email_id")
 _UPSERT_SQL = (
     f"INSERT INTO raw_instantly_sent_email ({', '.join(_COLS)}) "
     f"VALUES ({_PLACEHOLDERS}) "
-    f"ON CONFLICT (email_id) DO UPDATE SET {_UPDATE_SET}"
+    "ON CONFLICT (email_id) DO NOTHING"
 )
 
 
