@@ -286,12 +286,18 @@ def run_backfill(args) -> None:
 
 # ------------------------------------------------------------------- requeue
 
-REMAINING_SQL = """
+# A recovered row only counts if it would survive the view's hygiene filters
+# (rows ingested before the unsub-echo ingest filter may still be in the table).
+RECOVERED_EXISTS = """exists (
+     select 1 from comms.sendivo_outbound_recovered r
+      where r.phone10 = right(regexp_replace(coalesce(o.phone_e164,''), '[^0-9]', '', 'g'), 10)
+        and r.message_content not ilike 'You have successfully unsubscribed%')"""
+
+REMAINING_SQL = f"""
 select count(*) from comms.call_opportunity o
  where o.source = 'sendivo' and o.close_lead_id is not null
    and o.original_message is null and o.enrich_exhausted_at is null
-   and exists (select 1 from comms.sendivo_outbound_recovered r
-                where r.phone10 = right(regexp_replace(coalesce(o.phone_e164,''), '[^0-9]', '', 'g'), 10))
+   and {RECOVERED_EXISTS}
 """
 
 
@@ -301,13 +307,12 @@ def run_requeue(args) -> None:
         # Un-tombstone: rows retired as "provably unrecoverable" that NOW have a
         # recovered blast. Pure un-retirement — fabricates nothing; the worker
         # re-derives original/response from real rows.
-        cur.execute("""
+        cur.execute(f"""
             update comms.call_opportunity o
                set enrich_exhausted_at = null
              where o.source = 'sendivo' and o.close_lead_id is not null
                and o.original_message is null and o.enrich_exhausted_at is not null
-               and exists (select 1 from comms.sendivo_outbound_recovered r
-                            where r.phone10 = right(regexp_replace(coalesce(o.phone_e164,''), '[^0-9]', '', 'g'), 10))
+               and {RECOVERED_EXISTS}
         """)
         untombed = cur.rowcount
     conn.commit()
