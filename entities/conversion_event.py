@@ -1,11 +1,22 @@
 """WS-G — core.conversion_event (Spec 16, BI / Lead-Intent layer).
 
 ONE unifying row per appointment / booking across every conversion agent and channel.
-Rebuilt DELETE+INSERT (idempotent full rebuild) from two feeders:
+Rebuilt DELETE+INSERT (idempotent full rebuild) from three feeders:
 
   • core.meeting                       → agent='im',          type='meeting_booked'
+        feeder='slack_meeting' — the original Slack-scrape count feed; NO lead identity.
   • core.call ⋈ core.call_outcome      → agent='warm_caller', type='appointment_set'
         WHERE core.call_outcome.outcome_class = 'answered_appt_set'
+        feeder='close_call'
+  • raw_im_bookings (latest snapshot)  → agent='im',          type='meeting_booked'
+        feeder='portal_im_bookings' — Scope A (2026-06-09): the identity-bearing feed from
+        Darcy's bookings portal (~99.9% email, ~97% phone). This is what makes per-lead
+        conversion analysis possible (response-time × conversion etc.).
+
+⚠ COUNTING RULE (see sql/ddl/54_conversion_event_feeder.sql): the same physical IM booking
+can appear via BOTH 'slack_meeting' and 'portal_im_bookings' (no row-level join key exists
+between the feeds). Never count(*) across feeders for "total meetings" — filter feeder.
+Identity joins are safe: only portal rows carry lead_email/phone.
 
 The agent / channel / type dims are FREE-TEXT VARCHAR (see sql/ddl/45_conversion_event.sql),
 so SMS-AIM v1/v2 slot in later by inserting a new string — NO DDL change (DoD item).
@@ -40,6 +51,7 @@ from core.sync_run import PhaseResult
 logger = logging.getLogger("entities.conversion_event")
 
 _DDL = Path(__file__).resolve().parent.parent / "sql" / "ddl" / "45_conversion_event.sql"
+_DDL_FEEDER = Path(__file__).resolve().parent.parent / "sql" / "ddl" / "54_conversion_event_feeder.sql"
 
 
 def _table_exists(db, schema: str, name: str) -> bool:
@@ -71,16 +83,19 @@ def _channel_from_call_source(source_channel_expr: str) -> str:
 def rebuild(db, now: datetime) -> dict:
     """DELETE+INSERT rebuild of core.conversion_event from the two feeders. Returns notes."""
     db.execute(_DDL.read_text())  # idempotent CREATE IF NOT EXISTS
+    db.execute(_DDL_FEEDER.read_text())  # idempotent ADD COLUMN feeder + backfill
 
     has_lead = _table_exists(db, "core", "lead")
     has_meeting = _table_exists(db, "core", "meeting")
     has_call = _table_exists(db, "core", "call")
     has_call_outcome = _table_exists(db, "core", "call_outcome")
+    has_portal = _table_exists(db, "main", "raw_im_bookings")
 
     db.execute("DELETE FROM core.conversion_event")
 
     n_im = 0
     n_wc = 0
+    n_portal = 0
 
     # ── Feeder 1: IM meetings (core.meeting) → agent='im', type='meeting_booked' ──
     # ASSUMPTION (flagged): core.meeting (v1, Slack success-channel scrape) is the IM
@@ -94,7 +109,7 @@ def rebuild(db, now: datetime) -> dict:
             INSERT INTO core.conversion_event
               (event_id, lead_key, lead_email, phone_e164, source_channel,
                conversion_agent, conversion_type, occurred_at, campaign_id,
-               warm_caller_id, resolved_at)
+               warm_caller_id, resolved_at, feeder)
             SELECT
               md5('im:' || meeting_id)  AS event_id,
               NULL                      AS lead_key,
@@ -106,14 +121,66 @@ def rebuild(db, now: datetime) -> dict:
               posted_at                 AS occurred_at,
               campaign_id,
               NULL                      AS warm_caller_id,
-              ?                         AS resolved_at
+              ?                         AS resolved_at,
+              'slack_meeting'           AS feeder
             FROM core.meeting
             """,
             [now],
         )
-        n_im = db.execute("SELECT count(*) FROM core.conversion_event WHERE conversion_agent='im'").fetchone()[0]
+        n_im = db.execute("SELECT count(*) FROM core.conversion_event WHERE feeder='slack_meeting'").fetchone()[0]
     else:
         logger.warning("core.meeting absent — skipping IM meeting feeder")
+
+    # ── Feeder 1b (Scope A, 2026-06-09): portal bookings (raw_im_bookings) ───────
+    # The identity-bearing IM booking feed: Darcy's CEO-Portal im_bookings table, mirrored
+    # nightly by entities/im_bookings.py (latest snapshot only — the frozen 2026-05-31
+    # snapshot is a strict subset historically). Carries prospect email (~99.9%) + phone
+    # (~97%). occurred_at = portal `date` parsed + CLAMPED (the portal has date-entry typos,
+    # e.g. 2027-05-28): outside [2024-01-01, today+14d] → NULL (row kept; identity joins
+    # don't need the date). phone normalized to E.164 best-effort (US default).
+    # campaign_id left NULL: the portal `campaign` is a display NAME, not an Instantly
+    # campaign id — resolving names across workspaces is unreliable; the raw table keeps it.
+    if has_portal:
+        db.execute(
+            """
+            INSERT INTO core.conversion_event
+              (event_id, lead_key, lead_email, phone_e164, source_channel,
+               conversion_agent, conversion_type, occurred_at, campaign_id,
+               warm_caller_id, resolved_at, feeder)
+            SELECT
+              md5('im_portal:' || id)              AS event_id,
+              NULL                                 AS lead_key,
+              nullif(lower(trim(email)), '')       AS lead_email,
+              CASE
+                WHEN length(regexp_replace(COALESCE(phone, ''), '[^0-9]', '', 'g')) = 10
+                  THEN '+1' || regexp_replace(phone, '[^0-9]', '', 'g')
+                WHEN length(regexp_replace(COALESCE(phone, ''), '[^0-9]', '', 'g')) = 11
+                     AND regexp_replace(phone, '[^0-9]', '', 'g') LIKE '1%'
+                  THEN '+' || regexp_replace(phone, '[^0-9]', '', 'g')
+                ELSE NULL
+              END                                  AS phone_e164,
+              'cold_email'                         AS source_channel,
+              'im'                                 AS conversion_agent,
+              'meeting_booked'                     AS conversion_type,
+              CASE
+                WHEN try_cast(date AS DATE) BETWEEN DATE '2024-01-01'
+                     AND current_date + INTERVAL 14 DAY
+                  THEN try_cast(date AS TIMESTAMPTZ)
+              END                                  AS occurred_at,
+              NULL                                 AS campaign_id,
+              NULL                                 AS warm_caller_id,
+              ?                                    AS resolved_at,
+              'portal_im_bookings'                 AS feeder
+            FROM raw_im_bookings
+            WHERE _snapshot_date = (SELECT max(_snapshot_date) FROM raw_im_bookings)
+            """,
+            [now],
+        )
+        n_portal = db.execute(
+            "SELECT count(*) FROM core.conversion_event WHERE feeder='portal_im_bookings'"
+        ).fetchone()[0]
+    else:
+        logger.warning("raw_im_bookings absent — skipping portal booking feeder")
 
     # ── Feeder 2: warm-caller appts (core.call ⋈ core.call_outcome) ──────────────
     # outcome_class='answered_appt_set' marks a warm-caller appointment. source_channel
@@ -126,7 +193,7 @@ def rebuild(db, now: datetime) -> dict:
             INSERT INTO core.conversion_event
               (event_id, lead_key, lead_email, phone_e164, source_channel,
                conversion_agent, conversion_type, occurred_at, campaign_id,
-               warm_caller_id, resolved_at)
+               warm_caller_id, resolved_at, feeder)
             SELECT
               md5('warm_caller:' || c.call_id)  AS event_id,
               NULL                              AS lead_key,
@@ -138,7 +205,8 @@ def rebuild(db, now: datetime) -> dict:
               c.occurred_at,
               c.source_campaign                 AS campaign_id,
               c.warm_caller_id,
-              ?                                 AS resolved_at
+              ?                                 AS resolved_at,
+              'close_call'                      AS feeder
             FROM core.call c
             JOIN core.call_outcome o ON o.call_id = c.call_id
             WHERE o.outcome_class = 'answered_appt_set'
@@ -190,7 +258,8 @@ def rebuild(db, now: datetime) -> dict:
         "SELECT count(*) FROM core.conversion_event WHERE source_channel IS NULL"
     ).fetchone()[0]
     return {
-        "im_meeting_booked": n_im,
+        "im_meeting_booked_slack": n_im,
+        "im_meeting_booked_portal": n_portal,
         "warm_caller_appt_set": n_wc,
         "total": total,
         "lead_key_joined": lead_joined,

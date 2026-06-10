@@ -67,13 +67,14 @@ OVERRIDES: dict[str, dict] = {
         notes="launched variant copy — never changes (VARIANT_COPY_SYNC_ONCE)"),
     "raw_blacklist_check": dict(
         cadence="periodic", source="dns", freshness_column="checked_at"),
-    # F3 2026-06-08: NOT a broken sync — backfill_im_bookings.py is a deliberate ONE-TIME
-    # frozen snapshot of Darcy's portal im_bookings (for funding-partner attribution). It
-    # legitimately never advances, so cadence='once' (no false staleness alert). Re-run with
-    # a new --snapshot-date if a fresh snapshot is ever wanted.
+    # Scope A 2026-06-09: upgraded from the F3 one-time frozen snapshot to a NIGHTLY
+    # mirror (entities/im_bookings.py, 'im_bookings' phase). The frozen 2026-05-31
+    # snapshot is preserved alongside exactly ONE live snapshot; staleness alerts apply.
     "raw_im_bookings": dict(
-        cadence="once", status="active", source="darcy_portal",
-        notes="F3: deliberate one-time frozen snapshot (2026-05-31); not a live feed"),
+        cadence="daily", status="active", source="darcy_portal",
+        freshness_column="_loaded_at",
+        notes="nightly portal mirror since 2026-06-09 (entities/im_bookings.py); "
+              "frozen 2026-05-31 snapshot preserved alongside the live one"),
 }
 
 # Curated core/derived decision tables to register IF they exist (raw_ are auto).

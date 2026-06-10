@@ -39,6 +39,7 @@ PHASE_ORDER = [
     "close",             # 04:05 — Close CRM warm-call activity (BI/BOF layer, spec 16)
     "sheets",            # 04:15 — Domain Tech Sheet, blacklist sheet, partner feedback
     "otd_billing",       # 04:20 — parse OTD account statement -> core.otd_* + cost_ledger rate fix
+    "im_bookings",       # 04:25 — nightly mirror of the bookings-portal im_bookings table (Scope A)
     "account_truth",     # 04:30 — snapshot from droplet account-truth duckdb
     "dns_sweep",         # 04:45 — MX/A/SPF/DKIM/DMARC/PTR + DNSBLs + redirects
     "canonical",         # 05:30 — rebuild canonical tables from raw (incl. core.reply, lead spine, conversions)

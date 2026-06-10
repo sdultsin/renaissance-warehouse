@@ -1,5 +1,12 @@
 """One-time FROZEN backfill of the bookings portal im_bookings table -> raw_im_bookings.
 
+⚠ SUPERSEDED for freshness (Scope A, 2026-06-09): entities/im_bookings.py now mirrors the
+portal table NIGHTLY ('im_bookings' phase) — do not run this for routine refreshes. This
+script remains only for capturing an additional FROZEN snapshot under a new --snapshot-date.
+NOTE: the nightly entity deletes every snapshot except the frozen 2026-05-31 one on each
+run, so any extra frozen snapshot captured here must also be added to its
+FROZEN_SNAPSHOT_DATE handling or it will be swept on the next nightly.
+
 Workstream F. This is NOT part of the nightly orchestrator. It captures a single
 frozen snapshot of the bookings portal table for funding-partner attribution analysis,
 then never runs again (unless a fresh snapshot is wanted under a new --snapshot-date).
