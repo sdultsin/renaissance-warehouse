@@ -100,8 +100,8 @@ class _BodyCapture:
         try:
             for r in logs:
                 body = (r.get("message_content") or "").strip()
-                if not body:
-                    continue
+                if not body or body.lower().startswith("you have successfully unsubscribed"):
+                    continue  # empty / unsubscribe echo — never a blast body
                 p10 = "".join(c for c in (r.get("to_number") or "") if c.isdigit())[-10:]
                 if len(p10) != 10 or p10 not in self.targets:
                     continue

@@ -82,10 +82,18 @@ def pause_if_nightly_window() -> None:
         time.sleep(max(wait, 0) + 5)
 
 
+# Sendivo sits behind a WAF that hangs/403s non-browser User-Agents (curl,
+# python-urllib) under load while a browser UA sails through — proven live
+# 2026-06-10 (no-UA: timeout; browser-UA: 200 within seconds, same key, same
+# second). This also explains the 2026-06-09 session's "API outage" diagnosis.
+UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"
+
+
 def get_page(day: str, page: int, tries: int = 7):
     """One /sms/logs page. Returns the `data` dict {logs, pagination} or None on hard failure."""
     q = urllib.parse.urlencode({"start_date": day, "end_date": day, "per_page": PER_PAGE, "page": page})
-    req = urllib.request.Request(f"{API}?{q}", headers={"Authorization": "Bearer " + os.environ["SENDIVO_API_KEY"]})
+    req = urllib.request.Request(f"{API}?{q}", headers={
+        "Authorization": "Bearer " + os.environ["SENDIVO_API_KEY"], "User-Agent": UA})
     for a in range(tries):
         pause_if_nightly_window()
         try:
@@ -146,8 +154,8 @@ def match_rows(logs: list[dict], targets: set[str]) -> list[tuple]:
     out = []
     for r in logs:
         body = (r.get("message_content") or "").strip()
-        if not body:
-            continue
+        if not body or body.lower().startswith("you have successfully unsubscribed"):
+            continue  # empty / unsubscribe echo — never a blast body (view filters these anyway)
         p10 = "".join(c for c in (r.get("to_number") or "") if c.isdigit())[-10:]
         if len(p10) != 10 or p10 not in targets:
             continue
@@ -322,7 +330,8 @@ def run_requeue(args) -> None:
         if remaining == 0:
             break
         req = urllib.request.Request(url, data=b"{}", method="POST", headers={
-            "Authorization": "Bearer " + secret, "Content-Type": "application/json"})
+            "Authorization": "Bearer " + secret, "Content-Type": "application/json",
+            "User-Agent": UA})  # Cloudflare bot-blocks python-urllib's default UA with 403
         try:
             resp = urllib.request.urlopen(req, timeout=120)
             body = resp.read()[:200].decode(errors="replace")
