@@ -45,6 +45,112 @@ def register(registry: Registry) -> None:
     registry.add_phase("sendivo", "sms_logs", run_sms_logs)
 
 
+class _BodyCapture:
+    """Side-channel (2026-06-09 blast-body reconciliation): while this entity is
+    paging every day's /sms/logs for the rollup anyway, also capture the raw
+    blast BODIES for phones we track in comms (conversation.prospect_number) and
+    upsert them into comms.sendivo_outbound_recovered (worker migration 010).
+    That table is UNIONed into comms.v_sendivo_outbound_message, which the
+    comms-orchestration worker resolves Sendivo original_message from — so this
+    keeps fill at ~100% even when Sendivo's outbound-status webhook rots.
+
+    HARD RULE: capture failures must NEVER fail the rollup — every public method
+    swallows its own errors and just disables itself.
+    Gated by SENDIVO_BODY_CAPTURE=1 — read through ctx.credentials (the
+    orchestrator loads .env via dotenv_values WITHOUT exporting to os.environ,
+    so a plain os.environ gate would silently never fire).
+    """
+
+    def __init__(self, ctx) -> None:
+        flag = None
+        try:
+            flag = ctx.credentials.optional("SENDIVO_BODY_CAPTURE")
+        except Exception:  # noqa: BLE001
+            pass
+        self.enabled = (flag or os.environ.get("SENDIVO_BODY_CAPTURE") or "0") == "1"
+        self.was_enabled = self.enabled
+        self.conn = None
+        self.targets: set | None = None
+        self.buf: list = []
+        self.inserted = 0
+        if not self.enabled:
+            return
+        try:
+            import psycopg2  # droplet venv has it (comms mirror dependency)
+
+            try:
+                url = ctx.credentials.require("COMMS_SUPABASE_DB_URL")
+            except Exception:  # noqa: BLE001
+                url = os.environ["COMMS_SUPABASE_DB_URL"]
+            self.conn = psycopg2.connect(url)
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    "select distinct right(regexp_replace(prospect_number, '[^0-9]', '', 'g'), 10) "
+                    "from comms.conversation where prospect_number is not null"
+                )
+                self.targets = {r[0] for r in cur.fetchall() if r[0] and len(r[0]) == 10}
+            logger.info("body-capture ON: %d target phone10s", len(self.targets))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("body-capture disabled (init failed, rollup unaffected): %s", exc)
+            self.enabled = False
+
+    def collect(self, logs) -> None:
+        if not self.enabled:
+            return
+        try:
+            for r in logs:
+                body = (r.get("message_content") or "").strip()
+                if not body:
+                    continue
+                p10 = "".join(c for c in (r.get("to_number") or "") if c.isdigit())[-10:]
+                if len(p10) != 10 or p10 not in self.targets:
+                    continue
+                self.buf.append((
+                    str(r.get("id")), p10, r.get("to_number"), r.get("from_number"), body,
+                    r.get("created_at"), (r.get("campaign") or {}).get("name"),
+                    r.get("sub_account_name"),
+                ))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("body-capture collect failed (disabling, rollup unaffected): %s", exc)
+            self.enabled = False
+
+    def flush_day(self, day: str) -> None:
+        if not self.enabled or not self.buf:
+            self.buf = []
+            return
+        try:
+            import psycopg2.extras
+
+            with self.conn.cursor() as cur:
+                psycopg2.extras.execute_values(
+                    cur,
+                    "insert into comms.sendivo_outbound_recovered "
+                    "(sendivo_log_id, phone10, to_number, from_number, message_content, "
+                    "sent_at, campaign_name, sub_account_name) "
+                    "values %s on conflict (sendivo_log_id) do nothing",
+                    self.buf,
+                )
+                n = cur.rowcount
+            self.conn.commit()
+            self.inserted += n
+            logger.info("body-capture %s: matched %d, inserted %d", day, len(self.buf), n)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("body-capture flush %s failed (disabling, rollup unaffected): %s", day, exc)
+            try:
+                self.conn.rollback()
+            except Exception:  # noqa: BLE001
+                pass
+            self.enabled = False
+        self.buf = []
+
+    def close(self) -> None:
+        try:
+            if self.conn is not None:
+                self.conn.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _target_days(today) -> list[str]:
     return [(today - timedelta(days=i)).isoformat() for i in range(BACKFILL_DAYS, 0, -1)]
 
@@ -59,6 +165,7 @@ def run_sms_logs(ctx: RunContext) -> PhaseResult:
     per: dict[str, dict] = {}
     failures: dict[str, str] = {}
     rows_out = 0
+    capture = _BodyCapture(ctx)
     with SendivoClient(api_key) as cli:
         for day in _target_days(today):
           # Per-day isolation: a flaky-endpoint failure on one day must NOT raise — that would
@@ -89,9 +196,13 @@ def run_sms_logs(ctx: RunContext) -> PhaseResult:
             total = pg.get("total")
             last_page = min(int(pg.get("last_page") or 1), MAX_PAGES)
             fold(d.get("logs") or [])
+            capture.collect(d.get("logs") or [])
             for page in range(2, last_page + 1):
                 time.sleep(PAGE_PACE_S)
-                fold((cli.sms_logs_page(day, page, PER_PAGE)).get("logs") or [])
+                logs = (cli.sms_logs_page(day, page, PER_PAGE)).get("logs") or []
+                fold(logs)
+                capture.collect(logs)
+            capture.flush_day(day)
 
             conn.execute(
                 "DELETE FROM raw_sendivo_campaign_daily WHERE metric_date = ? AND _run_id = ?",
@@ -116,7 +227,10 @@ def run_sms_logs(ctx: RunContext) -> PhaseResult:
             failures[day] = str(exc)[:200]
             logger.warning("sms_logs %s FAILED (skipped, non-fatal): %s", day, exc)
 
+    capture.close()
     notes = dict(per)
     if failures:
         notes["_failed_days"] = failures
+    if capture.was_enabled:
+        notes["_body_capture_inserted"] = capture.inserted
     return PhaseResult(rows_in=rows_out, rows_out=rows_out, notes=notes)
