@@ -5,7 +5,7 @@ REFERENCE data only -- on any conflict with Instantly, Instantly wins.
 
 WHY CSV-STAGED (read this before changing the design)
 -----------------------------------------------------
-The droplet runtime has NO Google Sheets credentials and
+The droplet runtime (renaissance-worker) has NO Google Sheets credentials and
 NO MCP bridge. The only place the sheets are reachable is an interactive Claude
 session with the session-connected `google-sheets` MCP. So the ingest is split:
 
@@ -42,20 +42,34 @@ from typing import Iterable
 # Default staging dir on the droplet. Override with SHEETS_STAGING_DIR.
 DEFAULT_STAGING_DIR = "/root/core/sheets_staging"
 
-# Spreadsheet IDs are read from the environment (not committed). Only needed if the
-# sheets sync is resumed; empty by default.
-DOMAIN_TECH_SHEET_ID = os.environ.get("DOMAIN_TECH_SHEET_ID", "")
-BLACKLIST_SHEET_ID = os.environ.get("BLACKLIST_SHEET_ID", "")
+DOMAIN_TECH_SHEET_ID = "1bGj5bPyyGHg6eY6nRrkfXzTed44L0qHWhf8-4-gLlqM"
+BLACKLIST_SHEET_ID = "1fKqwQkEy4vRDYIrj7bq13aUZdTxBhjvKVRXbU1bXf6o"
+OTD_SHEET_ID = "1lRbIk1TvQyBkU9W-aTmI9iKIvY4IcnfWqOPxz4pVTm4"  # OTD account statement (billing)
 
 # (table_name, spreadsheet_id, tab_name, csv_filename)
 #
-# RETIRED: this backfill-only reference data is no longer synced. The tab registry is
-# intentionally empty so the CONSUME step (entities/sheets_mirror.py) is a no-op -- it
-# iterates SHEET_TABS, so an empty list means "nothing to snapshot". The raw_sheets_*
-# table definitions and the final snapshot data are PRESERVED (not dropped); the table
-# constants and write_tab_csv() are kept for reference/restore. To resume syncing, add
-# entries of the form (table_name, <sheet-id-const>, tab_name, csv_filename) below.
-SHEET_TABS = []
+# RETIRED 2026-06-07: backfill-only reference data, no longer synced (Sam). Final
+# snapshot loaded this date (124,153 rows across the 6 raw_sheets_* tables). The
+# tab registry is intentionally emptied so the CONSUME step (entities/
+# sheets_mirror.py) becomes a no-op going forward -- it iterates SHEET_TABS, so
+# an empty list means "nothing to snapshot". The raw_sheets_* table definitions
+# and the final snapshot data are PRESERVED (not dropped); the table constants
+# and write_tab_csv() are kept for reference/restore. To resume syncing, restore
+# the entries below from git history.
+#
+# Original entries (confirmed against the LIVE sheets 2026-05-30):
+#   ("raw_sheets_domain_tech_main",          DOMAIN_TECH_SHEET_ID, "MAIN",                  "domain_tech__MAIN.csv")
+#   ("raw_sheets_domain_tech_domains",       DOMAIN_TECH_SHEET_ID, "Domains",               "domain_tech__Domains.csv")
+#   ("raw_sheets_domain_tech_domains_table", DOMAIN_TECH_SHEET_ID, "Domains(Table)",        "domain_tech__Domains_Table.csv")
+#   ("raw_sheets_domain_tech_admin_renaissance", DOMAIN_TECH_SHEET_ID, "ADMIN - Renaissance", "domain_tech__ADMIN_Renaissance.csv")
+#   ("raw_sheets_blacklist_all_domains",     BLACKLIST_SHEET_ID, "All Domains",             "blacklist__All_Domains.csv")
+#   ("raw_sheets_blacklist_blocklisted",     BLACKLIST_SHEET_ID, "All Blocklisted Domains", "blacklist__All_Blocklisted_Domains.csv")
+SHEET_TABS = [
+    # OTD account statement (added 2026-06-09, spec 2026-06-09-otd-billing-integration).
+    # Producer: scripts/stage_otd_billing.py (run on the Mac; has the google-sheets token).
+    ("raw_sheets_otd_account_summary",  OTD_SHEET_ID, "Account Summary",  "otd__Account_Summary.csv"),
+    ("raw_sheets_otd_charges_by_batch", OTD_SHEET_ID, "Charges by Batch", "otd__Charges_by_Batch.csv"),
+]
 
 
 def staging_dir() -> str:

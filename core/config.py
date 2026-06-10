@@ -38,6 +38,7 @@ PHASE_ORDER = [
     "instantly",         # 04:00 — workspaces, campaigns, accounts, tags, lead membership
     "close",             # 04:05 — Close CRM warm-call activity (BI/BOF layer, spec 16)
     "sheets",            # 04:15 — Domain Tech Sheet, blacklist sheet, partner feedback
+    "otd_billing",       # 04:20 — parse OTD account statement -> core.otd_* + cost_ledger rate fix
     "account_truth",     # 04:30 — snapshot from droplet account-truth duckdb
     "dns_sweep",         # 04:45 — MX/A/SPF/DKIM/DMARC/PTR + DNSBLs + redirects
     "canonical",         # 05:30 — rebuild canonical tables from raw (incl. core.reply, lead spine, conversions)
