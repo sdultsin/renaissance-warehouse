@@ -24,7 +24,6 @@ fi
 
 PYTHON="${PYTHON:-python3}"
 ORCHESTRATOR_ARGS="${ORCHESTRATOR_ARGS:-}"
-export WAREHOUSE_PULL_IAM_SENT="${WAREHOUSE_PULL_IAM_SENT:-0}"  # DISABLED 2026-06-09: iam_response_time now sources IM replies from raw_pipeline_conversation_messages (10mo deep), not the thin email_type=sent pull. Set to 1 only to revive the legacy raw_instantly_sent_email ingest.
 
 # Apply any new versioned DDL before the run so new tables/views (sync_registry,
 # infra-capacity views, campaign_daily, ...) always materialize. Idempotent

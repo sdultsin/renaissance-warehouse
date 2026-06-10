@@ -185,46 +185,6 @@ class InstantlyClient:
                         pass
             yield item
 
-    def sent_emails(
-        self,
-        since: str | None = None,
-        workspace_id: str | None = None,
-    ) -> Iterator[dict]:
-        """`GET /emails?email_type=sent` (paginated), ue_type=3 only -- IAM manual replies.
-
-        ue_type=3 = manual outbound reply from IAM in a thread.
-        ue_type=1 = automated campaign sequence step send (filtered out here).
-
-        `since` (ISO8601) lower bound; pagination stops when timestamp_email < cutoff.
-        The key already scopes the workspace; `workspace_id` is informational.
-        """
-        params: dict = {"email_type": "sent", "ue_type": 3}
-        from datetime import datetime, timezone
-        cutoff = None
-        if since:
-            try:
-                cutoff = datetime.fromisoformat(since.replace("Z", "+00:00"))
-                if cutoff.tzinfo is None:
-                    cutoff = cutoff.replace(tzinfo=timezone.utc)
-            except ValueError:
-                cutoff = None
-
-        for item in self._paginate("/emails", params=params, limit=100):
-            if item.get("ue_type") != 3:
-                continue
-            if cutoff is not None:
-                ts = item.get("timestamp_email") or item.get("timestamp_created")
-                if ts:
-                    try:
-                        t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
-                        if t.tzinfo is None:
-                            t = t.replace(tzinfo=timezone.utc)
-                        if t < cutoff:
-                            return
-                    except ValueError:
-                        pass
-            yield item
-
     def list_tags(self, workspace_id: str | None = None) -> Iterator[dict]:
         """`GET /custom-tags` — workspace-level tag catalog.
 
