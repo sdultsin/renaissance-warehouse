@@ -18,13 +18,20 @@ Read-side: immutable event tables pull incrementally by a timestamp watermark
 pull full (small). See spec 15 for the full rationale + acceptance tests.
 
 Schema (the _key column + copy content_hash) lives in sql/ddl/04_pipeline_mirror.sql
-(fresh installs) and sql/ddl/34_pipeline_mirror_sync_modes.sql (live migration).
-The `_key` / `content_hash` SQL expressions here MUST match those in DDL 34.
+(fresh installs). The original insert_hash live migration was
+scripts/migrate_pipeline_mirror_v2.py (built from this module's SPECS so keys can't
+drift). The `_key` / `content_hash` SQL expressions here MUST match those used by the
+live migrations.
+
+Amendment 2026-06-06 (spec 15): campaign_data moved insert_hash -> upsert (its daily
+metric rollup was frozen by the content-hashed key). The live re-key migration is
+sql/ddl/36_campaign_data_upsert_rekey.sql; copy-version history stays in variant_copy.
 """
 
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 
 from core.registry import Registry, RunContext
@@ -75,9 +82,17 @@ SPECS: dict[str, Spec] = {
         array_columns={"tags", "rg_batch_ids"},
     ),
     "campaign_data": Spec(
-        mode="insert_hash",
-        key_sql=_key_concat(["campaign_id", "step", "variant", "content_hash"]),
-        hash_cols=["subject", "body", "signature"],
+        # UPSERT (spec 15 amendment 2026-06-06): campaign_data carries the daily
+        # metric rollup (emails_sent / opportunities / v_disabled / total_leads …)
+        # alongside copy. insert_hash froze metrics because copy rarely changes, so
+        # the content-hashed _key never moved and ON CONFLICT DO NOTHING discarded
+        # every new metric snapshot — raw_pipeline_campaign_data (and the __ALL__
+        # rollup built off it) went stale. Switch to upsert on the natural key
+        # (campaign_id|step|variant), dropping content_hash from the key so metric
+        # updates land in place. Copy-version HISTORY is unaffected here and remains
+        # fully covered by the separate variant_copy mirror (still insert_hash).
+        mode="upsert",
+        key_sql=_key_concat(["campaign_id", "step", "variant"]),
         columns=[
             "campaign_id", "campaign_name", "workspace_id", "workspace_name", "cm_name",
             "segment", "product", "infra_type", "status", "date_launched", "daily_limit",
@@ -172,6 +187,33 @@ SPECS: dict[str, Spec] = {
         ],
         array_columns={"workspaces_seen", "source_campaigns"},
     ),
+    # Full Instantly email thread bodies (~17.1M rows, growing). Immutable email
+    # events: a sent/received message never mutates in place, so mode='insert'
+    # keyed on the stable Instantly message id (`id`, text NOT NULL) is the right
+    # grain — one row per message. thread_id/workspace_id are denormalized columns
+    # for BI joins, not part of the key (id is globally unique on its own). No
+    # content_hash: bodies are write-once. Incremental pull by message_timestamp so
+    # nightly runs scan only the recent tail, never the full 17M every night.
+    #
+    # LINEAGE: source today is pipeline-supabase public.conversation_messages,
+    # which itself mirrors Instantly Unibox conversations. Post pipeline-supabase
+    # retirement, swap this mirror's source to a direct Instantly conversation
+    # sync (per-workspace Unibox/emails endpoints) feeding the same
+    # raw_pipeline_conversation_messages shape — the warehouse contract is the
+    # table, not the upstream Supabase.
+    "conversation_messages": Spec(
+        mode="insert",
+        key_sql="CAST(id AS VARCHAR)",
+        watermark_col="message_timestamp",
+        columns=[
+            "id", "thread_id", "campaign_id", "workspace_id", "lead_email",
+            "sender_email", "sender_name", "recipient_email", "recipient_name",
+            "direction", "ue_type", "body_text", "body_html", "subject",
+            "message_timestamp", "step_raw", "step", "variant", "is_unread",
+            "interest_status", "ai_interest_value", "content_preview", "eaccount",
+            "subsequence_id", "synced_at",
+        ],
+    ),
 }
 
 
@@ -230,6 +272,19 @@ def run_pipeline_mirror(ctx: RunContext) -> PhaseResult:
     pg_url = ctx.credentials.require("PIPELINE_SUPABASE_DB_URL")
     conn = ctx.db
 
+    # PIPELINE_MIRROR_ONLY=tbl1,tbl2 restricts the run to named SPECS tables.
+    # Used by scripts/meetings_refresh.sh (07:00 UTC) to pull just meetings_booked_raw
+    # without re-mirroring everything; unknown names fail loudly rather than no-op.
+    only_env = os.environ.get("PIPELINE_MIRROR_ONLY", "").strip()
+    specs = SPECS
+    if only_env:
+        wanted = [t.strip() for t in only_env.split(",") if t.strip()]
+        unknown = [t for t in wanted if t not in SPECS]
+        if unknown:
+            raise ValueError(f"PIPELINE_MIRROR_ONLY names unknown tables: {unknown}")
+        specs = {t: SPECS[t] for t in wanted}
+        logger.info("PIPELINE_MIRROR_ONLY -> mirroring only %s", wanted)
+
     conn.execute("INSTALL postgres")
     conn.execute("LOAD postgres")
     try:
@@ -241,7 +296,7 @@ def run_pipeline_mirror(ctx: RunContext) -> PhaseResult:
     rows_total = 0
     per_table: dict[str, dict] = {}
     try:
-        for table, spec in SPECS.items():
+        for table, spec in specs.items():
             logger.info("mirroring %s (mode=%s, watermark=%s)", table, spec.mode, spec.watermark_col or "-")
             before = conn.execute(f"SELECT count(*) FROM raw_pipeline_{table}").fetchone()[0]
             conn.execute("BEGIN")

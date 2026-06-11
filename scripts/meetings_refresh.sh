@@ -22,8 +22,10 @@ LOCK=/root/core/warehouse.write.lock
 echo "=== meetings_refresh @ $(date -u +%FT%TZ) ==="
 
 # 1. Mirror just meetings_booked_raw from Pipeline-Supabase (watermark + 2d overlap).
-flock -w 300 "$LOCK" -c "$PY -m core.orchestrator --phase pipeline_mirror --ingest meetings_booked_raw" \
-    || { echo "SKIP: writer lock busy (mirror)"; exit 0; }
+#    The phase registers a single 'all' ingest, so table selection goes through the
+#    PIPELINE_MIRROR_ONLY env filter, not --ingest.
+flock -w 300 "$LOCK" -c "PIPELINE_MIRROR_ONLY=meetings_booked_raw $PY -m core.orchestrator --phase pipeline_mirror" \
+    || { echo "SKIP: writer lock busy or mirror failed"; exit 0; }
 
 # 2. Rebuild core.meeting (idempotent full rebuild).
 flock -w 300 "$LOCK" -c "$PY -m core.orchestrator --phase canonical --ingest meeting" \
