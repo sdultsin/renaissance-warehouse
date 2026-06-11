@@ -25,6 +25,13 @@ fi
 PYTHON="${PYTHON:-python3}"
 ORCHESTRATOR_ARGS="${ORCHESTRATOR_ARGS:-}"
 
+# Direct-Instantly reply ingest (raw_instantly_email → core.reply). The entity reads
+# this gate from the PROCESS environment only (not the merged .env files), so it must
+# be exported here — without it the nightly logs "skipping" and reports ok rows_in=0
+# (silent success; feed went stale after the June-8 step-2a backfill finished).
+# (2026-06-11 hygiene fix, Task 2.)
+export WAREHOUSE_PULL_REPLIES=1
+
 # Apply any new versioned DDL before the run so new tables/views (sync_registry,
 # infra-capacity views, campaign_daily, ...) always materialize. Idempotent
 # (version-tracked); runs before the orchestrator opens its connection.

@@ -20,7 +20,7 @@ BASE_URL = "https://api.instantly.ai/api/v2"
 _UA = "curl/8.4.0"
 # Conservative serial pace. Per `feedback_instantly_list_accounts_serial_only.md`,
 # do not parallelize across workspaces or hit the API hot.
-_REQUEST_TIMEOUT = 30.0
+_REQUEST_TIMEOUT = 60.0  # 30s tripped on slow /emails pages (big workspaces), 2026-06-11
 
 
 class InstantlyError(RuntimeError):
@@ -56,7 +56,21 @@ class InstantlyClient:
         import time as _time
         retries = 3
         for attempt in range(retries):
-            resp = self._client.get(path, params=params)
+            # Transient transport failures (ReadTimeout on slow /emails pages, conn
+            # resets) must retry, not kill the whole workspace pull — a single slow
+            # page repeatedly aborted the-gatekeepers replies ingest (2026-06-11).
+            try:
+                resp = self._client.get(path, params=params)
+            except httpx.TransportError as exc:
+                if attempt + 1 >= retries:
+                    raise
+                wait = 15 * (attempt + 1)
+                logger.warning(
+                    "GET %s -> %s (attempt %d/%d), sleeping %ds",
+                    path, type(exc).__name__, attempt + 1, retries, wait,
+                )
+                _time.sleep(wait)
+                continue
             if resp.status_code == 429:
                 wait = 65  # 429 = rate limit; wait >60s (window resets per minute)
                 logger.warning(
@@ -65,6 +79,17 @@ class InstantlyClient:
                 )
                 _time.sleep(wait)
                 continue
+            if resp.status_code >= 500:
+                # Instantly 5xx are transient ("please try again") — seen repeatedly
+                # on deep /emails pagination (2026-06-11). Retry with backoff.
+                if attempt + 1 < retries:
+                    wait = 30 * (attempt + 1)
+                    logger.warning(
+                        "GET %s -> %d (attempt %d/%d), sleeping %ds",
+                        path, resp.status_code, attempt + 1, retries, wait,
+                    )
+                    _time.sleep(wait)
+                    continue
             if resp.status_code >= 400:
                 body = resp.text[:500]
                 raise InstantlyError(f"GET {path} -> {resp.status_code}: {body}")

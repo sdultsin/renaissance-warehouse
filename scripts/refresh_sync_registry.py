@@ -82,6 +82,23 @@ OVERRIDES: dict[str, dict] = {
     "raw_pipeline_meetings_booked_raw": dict(
         biz_date_column="posted_at", biz_sla_days=2,
         notes="meetings ground truth (Slack scrape via pipeline); biz-recency SLA 2d"),
+    # 2026-06-11 hygiene Task 4: give the replies feed a business date so the
+    # send-sensitive FLAT check runs on data-presence (and is_data_stale FAILs when
+    # the feed dies while the sync still reports ok — the June-8→11 silent stall).
+    "raw_instantly_email": dict(
+        biz_date_column="reply_timestamp", biz_sla_days=2,
+        notes="direct-Instantly replies (WAREHOUSE_PULL_REPLIES gate in nightly.sh); "
+              "biz-recency SLA 2d"),
+    # 2026-06-11 hygiene (optional task): these two are ONE-TIME ad-hoc snapshots —
+    # no loader exists anywhere (verified: repo entities/scripts + droplet ops dirs).
+    # cadence=periodic gave them a phantom 192h SLA they breach on a cycle (239h FAILs).
+    # No SQL consumer reads either. Re-snapshot manually if infra inventory changes.
+    "raw_cloudflare_zones": dict(
+        cadence="once", source="cloudflare",
+        notes="one-time CF zone snapshot; no automated loader; refresh manually"),
+    "raw_registrar_domains": dict(
+        cadence="once", source="registrar",
+        notes="one-time registrar snapshot; no automated loader; refresh manually"),
 }
 
 # Curated core/derived decision tables to register IF they exist (raw_ are auto).

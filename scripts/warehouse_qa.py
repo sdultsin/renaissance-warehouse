@@ -136,14 +136,32 @@ def run_checks(con) -> tuple[list[str], list[str]]:
     except Exception:
         pass  # registry/view predates biz_sla_days; refresh_sync_registry upgrades it
 
-    # 2. SEND-SENSITIVE feeds with non-positive delta.
+    # 2. SEND-SENSITIVE feeds. Keyed on DATA-PRESENCE where the feed is date-grained
+    # (last_biz_date tracked): the newest business date must cover the last completed
+    # send day (current_date - 1). Insert-delta is NOT used for those — a backfill
+    # that pre-inserts rows before the nightly makes row_delta=0 look like a dead
+    # feed (2026-06-11 false alarm on core.campaign_daily after the 45-day bounce
+    # backfill). Insert-delta stays as the only signal for send-sensitive feeds
+    # without a business-date column.
     flat = con.execute(
-        "SELECT name, last_row_delta FROM core.sync_registry "
-        "WHERE is_send_sensitive AND status='active' "
-        "AND last_row_delta IS NOT NULL AND last_row_delta <= 0"
+        "SELECT name, last_row_delta, last_biz_date, "
+        "       (biz_date_column IS NOT NULL AND last_biz_date IS NOT NULL) AS date_grained "
+        "FROM core.sync_registry "
+        "WHERE is_send_sensitive AND status='active' AND ("
+        "      (biz_date_column IS NOT NULL AND last_biz_date IS NOT NULL"
+        "       AND last_biz_date < current_date - 1)"
+        "   OR ((biz_date_column IS NULL OR last_biz_date IS NULL)"
+        "       AND last_row_delta IS NOT NULL AND last_row_delta <= 0))"
     ).fetchall()
-    for name, delta in flat:
-        warns.append(f"FLAT: send-sensitive `{name}` row_delta={delta} (no new rows on a send-day)")
+    for name, delta, biz_date, date_grained in flat:
+        if date_grained:
+            warns.append(
+                f"FLAT: send-sensitive `{name}` newest data day = {biz_date} "
+                f"(expected >= yesterday; feed not landing send-day data)")
+        else:
+            warns.append(
+                f"FLAT: send-sensitive `{name}` row_delta={delta} "
+                f"(no new rows on a send-day; no date column to check presence)")
 
     # 3. EMPTY decision tables.
     for tbl in EMPTY_CHECK_TABLES:
