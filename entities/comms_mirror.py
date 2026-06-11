@@ -31,6 +31,7 @@ Tables mirrored:
   comms.close_sync         -> raw_comms_close_sync        (WS-E gap-close, 2026-06-08)
   comms.gbc_application    -> raw_comms_gbc_application    (WS-E gap-close, 2026-06-08)
   comms.app_link_check     -> raw_comms_app_link_check     (WS-E gap-close, 2026-06-08)
+  comms.lead_application   -> raw_comms_lead_application   (Lumara apply-form, 2026-06-11)
 
 Explicitly NOT mirrored: comms.webhook_receipt and config.* tables.
   * comms.webhook_receipt (~6.18M rows) is a raw pre-processing webhook log —
@@ -75,6 +76,10 @@ _TABLES: list[tuple[str, str, str]] = [
     ("comms", "close_sync", "raw_comms_close_sync"),
     ("comms", "gbc_application", "raw_comms_gbc_application"),
     ("comms", "app_link_check", "raw_comms_app_link_check"),
+    # ── Lumara apply-form applications (2026-06-11): the AIM app-link funnel's
+    # conversion event. Webform → worker /apply/webhook → this table → partner
+    # CRM (GBC; Ken round-robin planned). DDL in sql/ddl/56_lead_application_mirror.sql.
+    ("comms", "lead_application", "raw_comms_lead_application"),
 ]
 
 # Columns that must be CAST to VARCHAR for postgres_scanner -> DuckDB. Covers
@@ -94,6 +99,8 @@ _CAST_TO_VARCHAR: dict[str, set[str]] = {
     "raw_comms_close_sync": {"request_payload", "response_payload"},
     "raw_comms_gbc_application": {"raw_payload", "suppression_log"},
     "raw_comms_app_link_check": {"raw_response"},
+    # ── lead_application (2026-06-11): id is uuid, raw is jsonb.
+    "raw_comms_lead_application": {"id", "raw"},
 }
 
 
