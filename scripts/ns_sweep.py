@@ -49,13 +49,17 @@ def main(argv=None) -> int:
                     help="read-only DB to pull the domain list from")
     ap.add_argument("--out", required=True)
     ap.add_argument("--all", action="store_true", help="sweep all domains, not just active")
+    ap.add_argument("--missing-only", action="store_true",
+                    help="only sweep domains whose nameserver_host is still NULL (delta/drift sweep)")
     ap.add_argument("--workers", type=int, default=60)
     ap.add_argument("--limit", type=int, default=0)
     args = ap.parse_args(argv)
 
     con = duckdb.connect(args.src_db, read_only=True)
     where = "" if args.all else \
-        "WHERE assigned_workspace IS NOT NULL OR COALESCE(inbox_count,0) > 0"
+        "WHERE (assigned_workspace IS NOT NULL OR COALESCE(inbox_count,0) > 0)"
+    if args.missing_only:
+        where += (" AND " if where else "WHERE ") + "nameserver_host IS NULL"
     lim = f" LIMIT {args.limit}" if args.limit else ""
     domains = [r[0] for r in con.execute(
         f"SELECT DISTINCT domain FROM core.domain_registry {where}{lim}"
