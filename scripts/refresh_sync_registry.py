@@ -75,17 +75,26 @@ OVERRIDES: dict[str, dict] = {
         freshness_column="_loaded_at",
         notes="nightly portal mirror since 2026-06-09 (entities/im_bookings.py); "
               "frozen 2026-05-31 snapshot preserved alongside the live one"),
+    # 2026-06-11 (meetings outage postmortem): a successful mirror run that pulls 0 new
+    # rows must still alert when the DATA goes stale — the Jun 4-10 outage showed
+    # sync-ran freshness alone masks an upstream death. Scraper lands D+1, the 07:00 UTC
+    # meetings refresh pulls it same morning -> 2-day biz SLA.
+    "raw_pipeline_meetings_booked_raw": dict(
+        biz_date_column="posted_at", biz_sla_days=2,
+        notes="meetings ground truth (Slack scrape via pipeline); biz-recency SLA 2d"),
 }
 
 # Curated core/derived decision tables to register IF they exist (raw_ are auto).
-# (name, source, owner_phase, cadence, freshness_column, biz_date_column, notes)
+# (name, source, owner_phase, cadence, freshness_column, biz_date_column, biz_sla_days, notes)
 CORE_FEEDS = [
-    ("core.campaign_daily",        "instantly_step_api", "derived",   "daily",    "_loaded_at", "date", "Track H per-campaign daily"),
-    ("core.sending_account_daily", "account_truth",      "account_truth", "daily", "_loaded_at", "date", "Track G infra daily"),
-    ("core.meeting",               "slack_scrape",       "canonical", "daily",    "_last_seen_at", None, "booked meetings"),
-    ("core.opportunity",           "instantly",          "canonical", "daily",    "_resolved_at",  None, "opportunities"),
-    ("core.domain_registry",       "registrar+dns",      "canonical", "periodic", "_loaded_at", None,   "Track I domain master"),
-    ("core.sending_account",       "account_truth",      "canonical", "daily",    "last_seen_at", None, "canonical inbox"),
+    ("core.campaign_daily",        "instantly_step_api", "derived",   "daily",    "_loaded_at", "date", None, "Track H per-campaign daily"),
+    ("core.sending_account_daily", "account_truth",      "account_truth", "daily", "_loaded_at", "date", None, "Track G infra daily"),
+    # biz date = posted_at (when the meeting was POSTED, not when we synced) — the Jun 4-10
+    # outage had last_synced_at current while the newest meeting was 4 days old.
+    ("core.meeting",               "slack_scrape",       "canonical", "daily",    "_last_seen_at", "posted_at", 2, "booked meetings; biz-recency SLA 2d"),
+    ("core.opportunity",           "instantly",          "canonical", "daily",    "_resolved_at",  None, None, "opportunities"),
+    ("core.domain_registry",       "registrar+dns",      "canonical", "periodic", "_loaded_at", None,   None, "Track I domain master"),
+    ("core.sending_account",       "account_truth",      "canonical", "daily",    "last_seen_at", None, None, "canonical inbox"),
 ]
 
 
@@ -131,14 +140,15 @@ def _columns_by_table(conn) -> dict[str, set[str]]:
 
 
 def _upsert_policy(conn, name, schema, source, owner_phase, cadence,
-                   fresh_col, biz_col, send_sensitive, status, notes) -> None:
+                   fresh_col, biz_col, send_sensitive, status, notes,
+                   biz_sla_days=None) -> None:
     sla = CADENCE_SLA_HOURS.get(cadence)
     conn.execute(
         """
         INSERT INTO core.sync_registry
           (name, table_schema, source, owner_phase, expected_cadence, sla_hours,
-           freshness_column, biz_date_column, is_send_sensitive, status, notes)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           freshness_column, biz_date_column, biz_sla_days, is_send_sensitive, status, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT (name) DO UPDATE SET
           table_schema = excluded.table_schema,
           source = excluded.source,
@@ -147,12 +157,13 @@ def _upsert_policy(conn, name, schema, source, owner_phase, cadence,
           sla_hours = excluded.sla_hours,
           freshness_column = excluded.freshness_column,
           biz_date_column = excluded.biz_date_column,
+          biz_sla_days = excluded.biz_sla_days,
           is_send_sensitive = excluded.is_send_sensitive,
           status = excluded.status,
           notes = COALESCE(excluded.notes, core.sync_registry.notes)
         """,
         [name, schema, source, owner_phase, cadence, sla, fresh_col, biz_col,
-         send_sensitive, status, notes],
+         biz_sla_days, send_sensitive, status, notes],
     )
 
 
@@ -176,11 +187,12 @@ def seed(conn) -> int:
         biz_col = ov.get("biz_date_column") or _pick(cols, BIZ_PRIORITY)
         send_sensitive = name in SEND_SENSITIVE
         _upsert_policy(conn, name, "main", source, owner_phase, cadence,
-                       fresh_col, biz_col, send_sensitive, status, notes)
+                       fresh_col, biz_col, send_sensitive, status, notes,
+                       biz_sla_days=ov.get("biz_sla_days"))
         n += 1
 
     # 2. Curated core/derived decision tables that exist.
-    for name, source, owner_phase, cadence, fresh_col, biz_col, notes in CORE_FEEDS:
+    for name, source, owner_phase, cadence, fresh_col, biz_col, biz_sla, notes in CORE_FEEDS:
         if name not in cols_by:
             continue
         cols = cols_by[name]
@@ -192,7 +204,8 @@ def seed(conn) -> int:
             biz_col = _pick(cols, BIZ_PRIORITY)
         send_sensitive = name in SEND_SENSITIVE
         _upsert_policy(conn, name, schema, source, owner_phase, cadence,
-                       fresh_col, biz_col, send_sensitive, "active", notes)
+                       fresh_col, biz_col, send_sensitive, "active", notes,
+                       biz_sla_days=biz_sla)
         n += 1
 
     return n

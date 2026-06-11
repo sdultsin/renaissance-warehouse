@@ -10,7 +10,11 @@ Per campaign across the 16 live workspaces:
 human/auto split is native per-day:
   replies_human = unique_replies   replies_auto = unique_replies_automatic
 opportunities = unique_opportunities. meetings_booked joins core.meeting (posted_at::date).
-bounces: not in the daily endpoint -> 0 (documented gap).
+bounces: NOT in the daily endpoint — fetched per campaign-day from the campaign-summary
+  endpoint (GET /campaigns/analytics with start_date=end_date=<day> -> bounced_count)
+  into core.instantly_bounce_daily (DDL 55), which survives the full rebuild and is
+  UPDATE-joined into campaign_daily.bounces. Default window = last BOUNCE_DAYS days with
+  sent > 0; one-time backfill via --bounce-days 45.
 
 LIFECYCLE-AWARE: ACTIVE campaigns densified min(date)..today (no-send day = sent 0);
 paused/completed/deleted keep only their real send days (endpoint stops at last activity).
@@ -31,6 +35,7 @@ import json
 import logging
 import os
 import sys
+import time
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -74,6 +79,7 @@ def _get(path: str, key: str, params: dict):
                 return json.load(r)
         except Exception as exc:  # noqa: BLE001
             last = exc
+            time.sleep(2 * (attempt + 1))  # immediate retries just re-trip 429 rate limits
     raise last
 
 
@@ -130,6 +136,49 @@ def fetch_all(keys: dict[str, str], today: str, workers: int = 8) -> list[dict]:
     return results
 
 
+def bounce_pairs(results: list[dict], days: int, today: str) -> list[tuple[str, str, str]]:
+    """(campaign_id, date, workspace_slug) pairs needing a bounce fetch: days within the
+    window that had sent > 0. Zero-send days keep bounces = 0 (bounce events land on the
+    send day at the grain this endpoint reports)."""
+    cutoff = (dt.date.fromisoformat(today) - dt.timedelta(days=days)).isoformat()
+    pairs = []
+    for r in results:
+        c = r["campaign"]
+        for d in r["daily"]:
+            ds = (d.get("date") or "")[:10]
+            if ds >= cutoff and int(d.get("sent") or 0) > 0:
+                pairs.append((c["id"], ds, c["workspace_slug"]))
+    return pairs
+
+
+def fetch_bounces(pairs: list[tuple[str, str, str]], keys: dict[str, str],
+                  workers: int = 6) -> list[tuple[str, str, str, int]]:
+    """One campaign-summary call per (campaign, day) -> bounced_count rows."""
+    def one(pair):
+        cid, day, slug = pair
+        resp = _get("/campaigns/analytics", keys[slug],
+                    {"id": cid, "start_date": day, "end_date": day})
+        rec = resp[0] if isinstance(resp, list) and resp else (resp or {})
+        # order matches the instantly_bounce_daily INSERT column list
+        return (cid, day, int(rec.get("bounced_count") or 0), slug)
+
+    rows, failed = [], 0
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(one, p): p for p in pairs}
+        for i, fut in enumerate(as_completed(futs)):
+            try:
+                rows.append(fut.result())
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                if failed <= 5:
+                    logger.warning("bounce fetch %s failed: %s", futs[fut][:2], exc)
+            if (i + 1) % 500 == 0:
+                logger.info("bounce fetch %d/%d", i + 1, len(pairs))
+    logger.info("fetched bounces for %d/%d campaign-days (%d failed)",
+                len(rows), len(pairs), failed)
+    return rows
+
+
 def build_rows(results: list[dict], today: str):
     """Return (daily_rows, variant_rows) with densification + cumulative."""
     today_d = dt.date.fromisoformat(today)
@@ -161,7 +210,7 @@ def build_rows(results: list[dict], today: str):
                 rh = int(d.get("unique_replies") or 0)
                 ra = int(d.get("unique_replies_automatic") or 0)
                 cs += sent; co += opp; crh += rh; cra += ra
-                daily_rows.append([cid, ds, slug, status, sent, opp, None,  # meetings filled in SQL
+                daily_rows.append([cid, ds, slug, status, sent, opp, 0,  # meetings UPDATEd in SQL; 0 = none
                                    rh, ra, 0, cs, co, crh, cra])
         # variants
         for s in r["steps"]:
@@ -175,10 +224,11 @@ def build_rows(results: list[dict], today: str):
     return daily_rows, variant_rows
 
 
-def write_warehouse(daily_rows, variant_rows, db_path=None) -> None:
+def write_warehouse(daily_rows, variant_rows, bounce_rows=None, db_path=None) -> None:
     conn = db_module.connect(db_path)
     ddl = REPO_ROOT / "sql" / "ddl" / "40_campaign_daily.sql"
     conn.execute(ddl.read_text())
+    conn.execute((REPO_ROOT / "sql" / "ddl" / "55_instantly_bounce_daily.sql").read_text())
     run_id = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ-camdaily")
     conn.execute("BEGIN")
     try:
@@ -207,6 +257,21 @@ def write_warehouse(daily_rows, variant_rows, db_path=None) -> None:
             WHERE m.campaign_id = d.campaign_id AND m.date = d.date
             """
         )
+        # refresh the durable bounce store, then apply it to the rebuilt table
+        if bounce_rows:
+            conn.executemany(
+                "INSERT OR REPLACE INTO core.instantly_bounce_daily "
+                "(campaign_id, date, bounced, workspace_slug, _fetched_at) "
+                "VALUES (?,?,?,?,now())",
+                bounce_rows,
+            )
+        conn.execute(
+            """
+            UPDATE core.campaign_daily d SET bounces = b.bounced
+            FROM core.instantly_bounce_daily b
+            WHERE b.campaign_id = d.campaign_id AND b.date = d.date
+            """
+        )
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
@@ -224,11 +289,15 @@ def main(argv=None) -> int:
     ap.add_argument("--cache", default=None, help="write fetched analytics JSON here")
     ap.add_argument("--from-cache", default=None, help="skip fetch; load analytics JSON")
     ap.add_argument("--workers", type=int, default=8)
+    ap.add_argument("--bounce-days", type=int, default=3,
+                    help="fetch bounced_count for sent>0 days this far back (45 = backfill)")
+    ap.add_argument("--skip-bounces", action="store_true")
     args = ap.parse_args(argv)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
     today = dt.datetime.now(dt.timezone.utc).date().isoformat()
 
+    keys = None
     if args.from_cache:
         results = json.loads(Path(args.from_cache).read_text())
     else:
@@ -242,9 +311,18 @@ def main(argv=None) -> int:
         logger.info("fetch-only; %d campaigns", len(results))
         return 0
 
+    bounce_rows = None
+    if not args.skip_bounces:
+        if keys is None:
+            keys = load_keys()
+        pairs = bounce_pairs(results, args.bounce_days, today)
+        logger.info("fetching bounces for %d campaign-days (last %d days, sent>0)",
+                    len(pairs), args.bounce_days)
+        bounce_rows = fetch_bounces(pairs, keys, workers=min(args.workers, 6))
+
     daily_rows, variant_rows = build_rows(results, today)
     logger.info("built %d daily rows, %d variant rows", len(daily_rows), len(variant_rows))
-    write_warehouse(daily_rows, variant_rows, Path(args.db) if args.db else None)
+    write_warehouse(daily_rows, variant_rows, bounce_rows, Path(args.db) if args.db else None)
     return 0
 
 

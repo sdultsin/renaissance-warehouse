@@ -120,6 +120,22 @@ def run_checks(con) -> tuple[list[str], list[str]]:
     for name, cadence, source, h in stale:
         fails.append(f"STALE: `{name}` ({cadence}/{source}) — {h}h since last sync (SLA breach)")
 
+    # 1b. DATA-STALE feeds — the sync ran but the data's own business date is old
+    # (successful-but-empty pulls; the Jun 4-10 meetings outage failure mode).
+    try:
+        data_stale = con.execute(
+            "SELECT name, source, biz_sla_days, "
+            "       COALESCE(CAST(days_since_biz AS VARCHAR),'never') AS d "
+            "FROM v_warehouse_freshness WHERE is_data_stale "
+            "ORDER BY days_since_biz DESC NULLS FIRST"
+        ).fetchall()
+        for name, source, sla_d, d in data_stale:
+            fails.append(
+                f"DATA-STALE: `{name}` ({source}) — newest business date is {d}d old "
+                f"(SLA {sla_d}d); sync may be running but pulling nothing new")
+    except Exception:
+        pass  # registry/view predates biz_sla_days; refresh_sync_registry upgrades it
+
     # 2. SEND-SENSITIVE feeds with non-positive delta.
     flat = con.execute(
         "SELECT name, last_row_delta FROM core.sync_registry "
