@@ -74,6 +74,18 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
           AND regexp_extract(raw_text, '\b(SAM|SAMUEL|LEO|IDO|EYVER|TOUKIR|TOMER|LUCAS|MAX)\b', 1) <> ''
         """
     )
+    # Mixed-case fallback for the "<CM>: <campaign>" Slack line ("Ido: MCA …").
+    # Deliberately anchored to the name-colon position — a bare case-insensitive
+    # \b-match would false-positive on lead/caller first names in raw_text.
+    db.execute(
+        r"""
+        UPDATE core.meeting
+        SET cm = upper(regexp_extract(raw_text, '(?i)\b(SAM|SAMUEL|LEO|IDO|EYVER|TOUKIR|TOMER|LUCAS|MAX)\s*:', 1))
+        WHERE cm IS NULL
+          AND raw_text IS NOT NULL
+          AND regexp_extract(raw_text, '(?i)\b(SAM|SAMUEL|LEO|IDO|EYVER|TOUKIR|TOMER|LUCAS|MAX)\s*:', 1) <> ''
+        """
+    )
 
     n = db.execute("SELECT count(*) FROM core.meeting").fetchone()[0]
     logger.info("core.meeting rebuilt: %d rows", n)
