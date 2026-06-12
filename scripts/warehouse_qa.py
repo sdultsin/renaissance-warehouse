@@ -92,10 +92,10 @@ EMPTY_CHECK_TABLES = [
     "core.campaign_daily",
     "v_infra_capacity_daily",
     "raw_account_truth_daily_actuals",
-    # infra-batch layer (DDL 60). 0 rows = the dims were truncated/lost (the
+    # infra-batch layer (DDL 61). 0 rows = the dims were truncated/lost (the
     # 06-08 domain_registry failure mode); the populate (build_infra_batch.sql)
     # is manual/snapshot so these stay put between exports.
-    "core.infra_batch_root",
+    "core.infra_batch_key",
     "core.sending_account_batch",
 ]
 
