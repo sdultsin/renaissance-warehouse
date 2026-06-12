@@ -158,6 +158,11 @@ def extract_new(con, state: dict, stats: dict) -> dict[str, tuple[str, str]]:
         if "@" not in email:
             return
         stats["rows_considered"] += 1
+        # Body cap: signatures sit at the end of the author's own portion, which
+        # is at the TOP of the body (quoted history below). Multi-MB bodies
+        # (base64 inline images) cost ~25ms+/row unbounded — truncate.
+        if len(body) > 200_000:
+            body = body[:200_000]
         if is_htmlish(body):
             body = html_to_text(body)
         phone = best_signature_phone(body)
