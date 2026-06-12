@@ -63,7 +63,7 @@ def run_sending_account(ctx: RunContext) -> PhaseResult:
           rampup_completed_at, paused_at, retired_at,
           status, warmup_phase, warmup_score, daily_limit, daily_limit_used,
           cost_per_day_usd_estimated, vendor_billing_cycle,
-          is_active, first_seen_at, last_seen_at, resolved_at
+          is_active, has_errors, first_seen_at, last_seen_at, resolved_at
         )
         WITH latest AS (
           SELECT * FROM {RAW}
@@ -93,7 +93,10 @@ def run_sending_account(ctx: RunContext) -> PhaseResult:
           CASE
             WHEN status_label = 'Missing Current Inventory' THEN 'retired'
             WHEN status_label = 'Paused'                    THEN 'paused'
+            WHEN status_label = 'Temporarily Paused'        THEN 'paused'
             WHEN status_label = 'Connection Error'          THEN 'paused'
+            WHEN status_label = 'Soft Bounce Error'         THEN 'paused'
+            WHEN status_label = 'Sending Error'             THEN 'paused'
             WHEN status_label = 'Active' AND warmup_status = 1  THEN 'active'
             WHEN status_label = 'Active' AND warmup_status = -1 THEN 'warmed'
             WHEN status_label = 'Active'                     THEN 'warming'
@@ -119,6 +122,8 @@ def run_sending_account(ctx: RunContext) -> PhaseResult:
           NULL                                               AS cost_per_day_usd_estimated,
           NULL                                               AS vendor_billing_cycle,
           (status_label <> 'Missing Current Inventory')      AS is_active,
+          -- has_errors: negative status codes excluding Missing Current Inventory (-999)
+          (status < 0 AND status_label <> 'Missing Current Inventory') AS has_errors,
           now()                                              AS first_seen_at,
           now()                                              AS last_seen_at,
           now()                                              AS resolved_at
