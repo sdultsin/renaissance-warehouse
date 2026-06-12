@@ -179,18 +179,22 @@ def extract_new(con, state: dict, stats: dict) -> dict[str, tuple[str, str]]:
         if cur is None or tss > cur[0]:
             winners[email] = (tss, phone)
 
+    # Inbound filter VERIFIED empirically 2026-06-12: direction='inbound' <->
+    # ue_type=2 (834,590 rows at verification); sender==lead covers only 85% of
+    # them, so filter on direction/ue_type. Timestamps cast to VARCHAR: the
+    # droplet venv lacks pytz, which duckdb needs to materialize TIMESTAMPTZ.
     q1 = """
         SELECT lead_email,
                CASE WHEN body_text IS NOT NULL AND length(body_text) > 0
                     THEN body_text ELSE body_html END AS body,
-               CASE WHEN message_timestamp >= TIMESTAMP '2024-01-01'
-                         AND message_timestamp <= now() + INTERVAL 1 DAY
-                    THEN message_timestamp ELSE synced_at END AS ts,
-               _loaded_at
+               CAST(CASE WHEN message_timestamp >= TIMESTAMP '2024-01-01'
+                              AND message_timestamp <= now() + INTERVAL 1 DAY
+                         THEN message_timestamp ELSE synced_at END AS VARCHAR) AS ts,
+               CAST(_loaded_at AS VARCHAR) AS _loaded_at
         FROM raw_pipeline_conversation_messages
         WHERE _loaded_at > CAST(? AS TIMESTAMPTZ)
           AND lead_email IS NOT NULL
-          AND lower(trim(sender_email)) = lower(trim(lead_email))
+          AND (direction = 'inbound' OR ue_type = 2)
           AND (body_text IS NOT NULL OR body_html IS NOT NULL)
     """
     cur = con.execute(q1, [state["wm_conversation_messages"]])
@@ -204,10 +208,10 @@ def extract_new(con, state: dict, stats: dict) -> dict[str, tuple[str, str]]:
 
     q2 = """
         SELECT lead_email, reply_text,
-               CASE WHEN reply_timestamp >= TIMESTAMP '2024-01-01'
-                         AND reply_timestamp <= now() + INTERVAL 1 DAY
-                    THEN reply_timestamp ELSE _loaded_at END AS ts,
-               _loaded_at
+               CAST(CASE WHEN reply_timestamp >= TIMESTAMP '2024-01-01'
+                              AND reply_timestamp <= now() + INTERVAL 1 DAY
+                         THEN reply_timestamp ELSE _loaded_at END AS VARCHAR) AS ts,
+               CAST(_loaded_at AS VARCHAR) AS _loaded_at
         FROM raw_instantly_email
         WHERE _loaded_at > CAST(? AS TIMESTAMPTZ)
           AND coalesce(ue_type, 2) = 2
