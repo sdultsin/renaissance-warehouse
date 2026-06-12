@@ -190,8 +190,8 @@ def extract_new(con, state: dict, stats: dict) -> dict[str, tuple[str, str]]:
     # droplet venv lacks pytz, which duckdb needs to materialize TIMESTAMPTZ.
     q1 = """
         SELECT lead_email,
-               CASE WHEN body_text IS NOT NULL AND length(body_text) > 0
-                    THEN body_text ELSE body_html END AS body,
+               left(CASE WHEN body_text IS NOT NULL AND length(body_text) > 0
+                         THEN body_text ELSE body_html END, 200000) AS body,
                CAST(CASE WHEN message_timestamp >= TIMESTAMP '2024-01-01'
                               AND message_timestamp <= now() + INTERVAL 1 DAY
                          THEN message_timestamp ELSE synced_at END AS VARCHAR) AS ts,
@@ -212,7 +212,7 @@ def extract_new(con, state: dict, stats: dict) -> dict[str, tuple[str, str]]:
             consider(email, body, ts, la, "wm_conversation_messages")
 
     q2 = """
-        SELECT lead_email, reply_text,
+        SELECT lead_email, left(reply_text, 200000) AS reply_text,
                CAST(CASE WHEN reply_timestamp >= TIMESTAMP '2024-01-01'
                               AND reply_timestamp <= now() + INTERVAL 1 DAY
                          THEN reply_timestamp ELSE _loaded_at END AS VARCHAR) AS ts,
