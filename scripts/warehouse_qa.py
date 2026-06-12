@@ -92,7 +92,18 @@ EMPTY_CHECK_TABLES = [
     "core.campaign_daily",
     "v_infra_capacity_daily",
     "raw_account_truth_daily_actuals",
+    # infra-batch layer (DDL 60). 0 rows = the dims were truncated/lost (the
+    # 06-08 domain_registry failure mode); the populate (build_infra_batch.sql)
+    # is manual/snapshot so these stay put between exports.
+    "core.infra_batch_root",
+    "core.sending_account_batch",
 ]
+
+# Active-account batch-coverage WARN threshold (infra-batch layer). The infra
+# export is a MANUAL snapshot, so some currently-active inboxes will always be
+# newer than the last export → unmatched. Warn (not fail) only when the gap is
+# large enough to mean the snapshot has gone materially stale.
+INFRA_BATCH_UNMATCHED_WARN_FRAC = 0.30
 
 
 def _exists(con, name: str) -> bool:
@@ -171,6 +182,26 @@ def run_checks(con) -> tuple[list[str], list[str]]:
         n = con.execute(f"SELECT count(*) FROM {tbl}").fetchone()[0]
         if n == 0:
             fails.append(f"EMPTY: decision table `{tbl}` returned 0 rows")
+
+    # 3b. Infra-batch coverage. WARN if too large a share of currently-active
+    # inboxes have no batch mapping (the manual infra snapshot has gone stale).
+    try:
+        if _exists(con, "core.sending_account_batch") and _exists(con, "core.sending_account"):
+            total, unmatched = con.execute(
+                "SELECT count(*), "
+                "       count(*) FILTER (WHERE b.account_email IS NULL) "
+                "FROM core.sending_account sa "
+                "LEFT JOIN core.sending_account_batch b "
+                "       ON b.account_email = lower(sa.account_id) "
+                "WHERE sa.is_active"
+            ).fetchone()
+            if total and unmatched / total > INFRA_BATCH_UNMATCHED_WARN_FRAC:
+                warns.append(
+                    f"INFRA-BATCH STALE: {unmatched}/{total} "
+                    f"({unmatched/total:.0%}) active inboxes have no batch mapping "
+                    f"— refresh the infra export + rerun build_infra_batch.sql")
+    except Exception as exc:  # noqa: BLE001
+        warns.append(f"INFRA-BATCH coverage check errored ({exc})")
 
     # 4. Warehouse<->API faithfulness (campaign grain). WARN-only during retirement.
     try:
