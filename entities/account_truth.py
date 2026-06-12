@@ -69,7 +69,7 @@ def run_account_truth_mirror(ctx: RunContext) -> PhaseResult:
     conn.execute(f"ATTACH '{snapshot}' AS acct_src (READ_ONLY)")
 
     select_list = ", ".join(_SRC_COLS)
-    target_cols = ", ".join(_SRC_COLS + ["raw_json", "_snapshot_file", "_loaded_at", "_run_id"])
+    target_cols = ", ".join(_SRC_COLS + ["has_errors", "raw_json", "_snapshot_file", "_loaded_at", "_run_id"])
     try:
         conn.execute("BEGIN")
         conn.execute(
@@ -78,7 +78,7 @@ def run_account_truth_mirror(ctx: RunContext) -> PhaseResult:
         conn.execute(
             f"""
             INSERT INTO raw_account_truth_accounts ({target_cols})
-            SELECT {select_list}, NULL AS raw_json, ?, now(), ?
+            SELECT {select_list}, (status < 0) AS has_errors, NULL AS raw_json, ?, now(), ?
             FROM acct_src.account_inventory
             """,
             [snapshot.name, ctx.run_id],

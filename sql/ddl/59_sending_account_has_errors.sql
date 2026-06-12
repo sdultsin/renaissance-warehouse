@@ -16,6 +16,9 @@
 -- Adds derived.v_sending_account_capacity: per-workspace active/errored/total_active
 -- matching the Instantly/CM dashboard "Total Active Accounts (Active − Has Errors)".
 
+ALTER TABLE raw_account_truth_accounts
+    ADD COLUMN IF NOT EXISTS has_errors BOOLEAN;
+
 ALTER TABLE core.sending_account
     ADD COLUMN IF NOT EXISTS has_errors BOOLEAN;
 
