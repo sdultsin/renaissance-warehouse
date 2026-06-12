@@ -66,6 +66,15 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     echo "compacting warehouse (skips unless bloated)" | tee -a "$LOG_FILE"
     "$SCRIPT_DIR/compact_warehouse.sh" 2>&1 | tee -a "$LOG_FILE" || echo "compaction non-fatal failure/skip" | tee -a "$LOG_FILE"
 
+    # Signature->phone self-enrichment (sig-phone Phase 2): extract US phones from
+    # tonight's new inbound reply signatures -> public.leads enriched_phone sidecar.
+    # Watermarked + restartable; fail-loud to Slack inside the script itself. Runs
+    # AFTER compaction (warehouse lock free; read-only, coexists with publishes).
+    # Spec: Renaissance handoffs/2026-06-12-signature-phone-warehouse-native.md
+    echo "signature-phone sync (reply signatures -> leads.enriched_phone)" | tee -a "$LOG_FILE"
+    "$PYTHON" scripts/signature_phone_sync.py 2>&1 | tee -a "$LOG_FILE" \
+        || echo "WARN signature_phone_sync_failed (continuing)" | tee -a "$LOG_FILE"
+
     echo "refreshing campaign-performance dashboard data" | tee -a "$LOG_FILE"
     "$SCRIPT_DIR/refresh_campaign_performance.sh" 2>&1 | tee -a "$LOG_FILE" \
         || echo "WARN campaign_performance_refresh_failed (continuing)" | tee -a "$LOG_FILE"
