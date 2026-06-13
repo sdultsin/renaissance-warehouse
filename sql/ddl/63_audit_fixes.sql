@@ -100,9 +100,10 @@ spine AS (
   FULL JOIN email_meetings mt
     ON s.date=mt.date AND s.infra=mt.infra AND s.cm=mt.cm AND s.is_mca IS NOT DISTINCT FROM mt.is_mca
 ),
-bnc AS (
-  SELECT b.date, COALESCE(d.cm,'(no cm)') AS cm, sum(b.bounced) AS bounces
-  FROM core.instantly_bounce_daily b LEFT JOIN dims d ON d.campaign_id=b.campaign_id GROUP BY 1,2
+bnc AS (  -- resolve bounces to the FULL spine grain (date,infra,cm,is_mca) to avoid fan-out (dp-review HIGH fix)
+  SELECT b.date, COALESCE(d.infra,'unknown') AS infra, COALESCE(d.cm,'(no cm)') AS cm,
+         COALESCE(d.is_mca,false) AS is_mca, sum(b.bounced) AS bounces
+  FROM core.instantly_bounce_daily b LEFT JOIN dims d ON d.campaign_id=b.campaign_id GROUP BY 1,2,3,4
 )
 SELECT sp.date, sp.infra, sp.cm, sp.is_mca, sp.sent, sp.opportunities, sp.replies_human, sp.replies_auto,
        COALESCE(bn.bounces,0) AS bounces, sp.meetings,
@@ -112,7 +113,7 @@ SELECT sp.date, sp.infra, sp.cm, sp.is_mca, sp.sent, sp.opportunities, sp.replie
        CAST(sp.replies_human AS double)/NULLIF(sp.sent,0) AS reply_rate_human,
        CAST(sp.replies_auto AS double)/NULLIF(sp.sent,0) AS reply_rate_auto
 FROM spine sp
-LEFT JOIN bnc bn ON bn.date=sp.date AND bn.cm=sp.cm;
+LEFT JOIN bnc bn ON bn.date=sp.date AND bn.infra=sp.infra AND bn.cm=sp.cm AND bn.is_mca IS NOT DISTINCT FROM sp.is_mca;
 
 -- =====================================================================================
 -- WS-G: derived.v_funnel — campaign-grain funnel lead -> sent -> reply(human/auto) -> opp ->
