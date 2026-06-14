@@ -21,7 +21,11 @@ DUCKDB=$(command -v duckdb)
 MEMLIMIT="${COMPACT_MEMORY_LIMIT:-8GB}"
 TMPDIR=/root/core/duckdb_tmp
 mkdir -p "$TMPDIR"
-SET_PRELUDE="SET memory_limit='$MEMLIMIT'; SET temp_directory='$TMPDIR';"
+# preserve_insertion_order=false is REQUIRED for EXPORT/IMPORT of a large DB under a memory_limit:
+# order-preserving EXPORT buffers rows and cannot fully spill -> OOMs even at 8GB (observed
+# 2026-06-14). Row ORDER within a table is not semantically meaningful here (queries use ORDER BY)
+# and compaction reorders anyway; exact COUNT(*) verification below proves data identity.
+SET_PRELUDE="SET preserve_insertion_order=false; SET memory_limit='$MEMLIMIT'; SET temp_directory='$TMPDIR';"
 # Disk guard factor (free >= SIZE * NUM/10). Default 7 (conservative). Override for a one-time
 # compaction on a tight-but-sufficient disk: COMPACT_FREE_FACTOR_NUM=4 (the real export+import
 # peak is ~30GB for a high-bloat DB, well under the default 0.7*SIZE).
