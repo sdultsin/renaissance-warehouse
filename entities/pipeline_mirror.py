@@ -317,6 +317,30 @@ def run_pipeline_mirror(ctx: RunContext) -> PhaseResult:
         except Exception:
             pass
 
+    # Durable workspace_id carry-forward (D-L2-4). The upstream campaign_daily_metrics.workspace_id
+    # went increasingly NULL over time (Apr ~0%, May ~13%, Jun ~100%), so the faithful mirror above
+    # preserves send-time workspace ONLY when the source provides it. This post-step fills the
+    # remaining NULLs from the campaign dim (raw_pipeline_campaigns, mirrored earlier this run) —
+    # best-effort current workspace — so per-workspace/CM rollups and the ground-truth harness stop
+    # dropping recent fact rows into a NULL bucket. Warehouse-only UPDATE (safe after DETACH pg).
+    if "campaign_daily_metrics" in specs:
+        conn.execute(
+            """
+            UPDATE raw_pipeline_campaign_daily_metrics m
+            SET workspace_id = c.workspace_id, workspace_name = c.workspace_name
+            FROM raw_pipeline_campaigns c
+            WHERE m.campaign_id = c.campaign_id
+              AND m.workspace_id IS NULL
+              AND c.workspace_id IS NOT NULL AND c.workspace_id <> ''
+            """
+        )
+        remaining = conn.execute(
+            "SELECT count(*) FROM raw_pipeline_campaign_daily_metrics WHERE workspace_id IS NULL"
+        ).fetchone()[0]
+        logger.info("workspace_id carry-forward fixup: %d fact rows still NULL (campaign absent from dim)",
+                    remaining)
+        per_table["_workspace_id_fixup"] = {"remaining_null": remaining}
+
     return PhaseResult(rows_in=rows_total, rows_out=rows_total, notes={"per_table": per_table})
 
 

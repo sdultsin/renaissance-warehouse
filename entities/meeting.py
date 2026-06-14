@@ -1,12 +1,27 @@
-"""core.meeting canonical entity — resolved from raw_pipeline_meetings_booked_raw.
+"""core.meeting canonical entity — split-sourced at the 2026-06-01 cutover (WS-E re-platform).
 
-Slack is the source of truth for meetings (per Sam). Calendly + Close are v1.5.
-Registers under the 'canonical' phase. Idempotent full rebuild each run.
+  posted_at <  2026-06-01  -> Slack scrape (raw_pipeline_meetings_booked_raw), source='slack'.
+                              LEGACY: left untouched (the sheet may not be accurate pre-June-1).
+  posted_at >= 2026-06-01  -> Funding-Form Google Sheet (raw_sheets_funding_form_data),
+                              source='sheet'. SOURCE OF TRUTH: it carries an explicit Channel
+                              (Email/SMS/WhatsApp/Call/LinkedIn), Campaign Manager, Campaign Name
+                              and lead Email per booking — so meetings attribute DIRECTLY (no fuzzy
+                              keyword splitting on raw_text, the P2 over-count root cause) and link
+                              to leads by email (which the Slack source could never do).
+
+The sheet load happens in the 'sheets' phase (04:15) BEFORE this 'canonical' phase (05:30); the
+meetings_refresh.sh cron stages+loads the sheet immediately before rebuilding. Idempotent full
+rebuild each run (core.meeting is a pure projection of its two raw sources).
+
+Campaign attribution for sheet rows = main.norm_campaign_name() join to the campaign universe
+(raw_pipeline_campaigns); ~97.5% of email submissions resolve directly. The residual (genuine
+non-campaign labels / truncated names) land with campaign_id NULL and match_method='unmatched' —
+those are the campaigns flagged as carrying inaccurate data (per the DoD), and the 4-tier fallback
+matcher is the safety net for them.
 """
 from __future__ import annotations
 
 import logging
-from datetime import datetime, timezone
 
 from core.registry import Registry, RunContext
 from core.sync_run import PhaseResult
@@ -14,6 +29,23 @@ from core.sync_run import PhaseResult
 logger = logging.getLogger("entities.meeting")
 
 RAW = "raw_pipeline_meetings_booked_raw"
+FF = "main.raw_sheets_funding_form_data"
+CUTOVER = "2026-06-01"  # sheet is canonical on/after this date; Slack stays untouched before it
+# NOTE (boundary): Slack posted_at is TIMESTAMPTZ→DATE in UTC; the sheet's Submission time is a naive
+# local timestamp→DATE. The two branches are disjoint (< vs >=) so DOUBLE-counting is impossible. A
+# near-midnight booking on 2026-05-31 could land in neither branch (single-digit, one-time gap on the
+# transition day only). Accepted: pre-cutover data is explicitly "may not be accurate"; not worth a
+# TZ-normalization pass for a handful of boundary-day meetings.
+
+# Funding-Form 'Data' tab column positions (0-based), confirmed 2026-06-13. Keep in sync with
+# scripts/stage_funding_form.py EXPECTED_HEADER (the producer fails loud on column drift).
+_C_SUBMISSION_ID = 1
+_C_SUBMISSION_TIME = 2
+_C_CHANNEL = 3
+_C_PARTNER = 4
+_C_EMAIL = 9
+_C_CAMPAIGN_MANAGER = 17
+_C_CAMPAIGN_NAME = 18
 
 
 def register(registry: Registry) -> None:
@@ -23,8 +55,12 @@ def register(registry: Registry) -> None:
 def run_meeting(ctx: RunContext) -> PhaseResult:
     db = ctx.db
 
-    # Idempotent full rebuild — core.meeting is a pure projection of the raw table.
+    # Idempotent full rebuild — core.meeting is a pure projection of its raw sources.
     db.execute("DELETE FROM core.meeting")
+
+    # -- 1. Pre-cutover Slack rows (date < 2026-06-01) — unchanged legacy behavior, channel/
+    #       lead_email left NULL (the Slack source has neither). Date-grain boundary so there is
+    #       no overlap/gap with the sheet rows.
     db.execute(
         f"""
         INSERT INTO core.meeting
@@ -44,10 +80,11 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
           match_method,
           match_confidence,
           NULL                 AS is_duplicate_of,
-          NULL                 AS cost_per_meeting_usd_estimated,  -- v3 derivation
+          NULL                 AS cost_per_meeting_usd_estimated,
           raw_text
         FROM {RAW}
         WHERE id IS NOT NULL
+          AND CAST(posted_at AS DATE) < DATE '{CUTOVER}'
         QUALIFY ROW_NUMBER() OVER (
           PARTITION BY COALESCE(channel_id,'') || ':' || COALESCE(message_ts,'') || ':' ||
             COALESCE(CAST(line_index AS VARCHAR),'')
@@ -56,7 +93,82 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
         """
     )
 
-    # CM attribution: campaign join first (authoritative), regex on raw_text as fallback.
+    # -- 2. Post-cutover sheet rows (date >= 2026-06-01). Parse row_json by position, type the
+    #       timestamp, dedup on Submission ID (synthetic md5 key for the ~12 blank IDs), and
+    #       resolve campaign_id via the normalized-name join (arg_max -> most recent campaign of
+    #       that normalized name). cm = uppercased Campaign Manager to align with the dim's casing.
+    db.execute(
+        f"""
+        INSERT INTO core.meeting
+          (meeting_id, source, source_event_id, posted_at, partner, campaign_id,
+           campaign_name_raw, cm, channel, lead_email, match_method, match_confidence,
+           is_duplicate_of, cost_per_meeting_usd_estimated, raw_text)
+        WITH ff AS (
+          SELECT
+            NULLIF(json_extract_string(row_json, '$[{_C_SUBMISSION_ID}]'),'')   AS submission_id,
+            json_extract_string(row_json, '$[{_C_SUBMISSION_TIME}]')            AS submission_time,
+            NULLIF(trim(json_extract_string(row_json, '$[{_C_CHANNEL}]')),'')   AS channel,
+            NULLIF(json_extract_string(row_json, '$[{_C_PARTNER}]'),'')         AS partner,
+            NULLIF(lower(trim(json_extract_string(row_json, '$[{_C_EMAIL}]'))),'') AS lead_email,
+            NULLIF(trim(json_extract_string(row_json, '$[{_C_CAMPAIGN_MANAGER}]')),'') AS campaign_manager,
+            NULLIF(json_extract_string(row_json, '$[{_C_CAMPAIGN_NAME}]'),'')   AS campaign_name,
+            row_json
+          FROM {FF}
+          -- sheets_mirror only purges the CURRENT run's rows (last-known-good semantics), so this
+          -- raw table ACCUMULATES one snapshot per run. Read ONLY the latest snapshot so corrections
+          -- (same Submission ID, edited cells) win and the projection stays a true idempotent rebuild.
+          WHERE _run_id = (SELECT _run_id FROM {FF} ORDER BY _loaded_at DESC LIMIT 1)
+            AND row_index > 0
+        ),
+        ff_typed AS (
+          SELECT *, TRY_CAST(submission_time AS TIMESTAMP) AS posted_ts FROM ff
+          WHERE TRY_CAST(submission_time AS TIMESTAMP) IS NOT NULL
+            AND CAST(TRY_CAST(submission_time AS TIMESTAMP) AS DATE) >= DATE '{CUTOVER}'
+        ),
+        ff_keyed AS (
+          SELECT *, 'sheet:' || COALESCE(submission_id, md5(row_json)) AS meeting_id FROM ff_typed
+        ),
+        ff_dedup AS (
+          SELECT * FROM ff_keyed
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY meeting_id ORDER BY posted_ts) = 1
+        ),
+        camp AS (  -- one campaign per normalized name: most-recent, fully deterministic tiebreak
+          SELECT nk, campaign_id FROM (
+            SELECT main.norm_campaign_name(name) AS nk, campaign_id,
+                   ROW_NUMBER() OVER (PARTITION BY main.norm_campaign_name(name)
+                                      ORDER BY instantly_created_at DESC NULLS LAST, campaign_id DESC) AS rn
+            FROM main.raw_pipeline_campaigns
+            WHERE name IS NOT NULL AND name <> ''
+          ) WHERE rn = 1
+        ),
+        matched AS (
+          SELECT f.*, c.campaign_id AS matched_cid
+          FROM ff_dedup f
+          LEFT JOIN camp c ON c.nk = main.norm_campaign_name(f.campaign_name)
+        )
+        SELECT
+          meeting_id,
+          'sheet'                                  AS source,
+          submission_id                            AS source_event_id,
+          posted_ts                                AS posted_at,
+          partner,
+          matched_cid                              AS campaign_id,
+          campaign_name                            AS campaign_name_raw,
+          upper(campaign_manager)                  AS cm,
+          channel,
+          lead_email,
+          CASE WHEN matched_cid IS NOT NULL THEN 'sheet_norm' ELSE 'unmatched' END AS match_method,
+          CASE WHEN matched_cid IS NOT NULL THEN 1.0 ELSE NULL END                 AS match_confidence,
+          NULL                                     AS is_duplicate_of,
+          NULL                                     AS cost_per_meeting_usd_estimated,
+          NULL                                     AS raw_text
+        FROM matched
+        """
+    )
+
+    # CM attribution fallback (slack rows + any sheet row with a blank Campaign Manager but a
+    # resolved campaign): campaign join first (authoritative), then regex on raw_text. Sheet rows
+    # already carry cm and have raw_text NULL, so the regex passes only touch Slack rows.
     db.execute(
         """
         UPDATE core.meeting AS m
@@ -75,8 +187,6 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
         """
     )
     # Mixed-case fallback for the "<CM>: <campaign>" Slack line ("Ido: MCA …").
-    # Deliberately anchored to the name-colon position — a bare case-insensitive
-    # \b-match would false-positive on lead/caller first names in raw_text.
     db.execute(
         r"""
         UPDATE core.meeting
@@ -88,5 +198,16 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
     )
 
     n = db.execute("SELECT count(*) FROM core.meeting").fetchone()[0]
-    logger.info("core.meeting rebuilt: %d rows", n)
-    return PhaseResult(rows_in=n, rows_out=n, notes={"source": RAW})
+    by_source = db.execute(
+        "SELECT source, count(*) FROM core.meeting GROUP BY 1 ORDER BY 1"
+    ).fetchall()
+    sheet_unmatched = db.execute(
+        "SELECT count(*) FROM core.meeting WHERE source='sheet' AND channel='Email' AND campaign_id IS NULL"
+    ).fetchone()[0]
+    logger.info("core.meeting rebuilt: %d rows %s; sheet email-meetings unmatched=%d",
+                n, dict(by_source), sheet_unmatched)
+    return PhaseResult(
+        rows_in=n, rows_out=n,
+        notes={"by_source": dict(by_source), "sheet_email_unmatched": sheet_unmatched,
+               "cutover": CUTOVER},
+    )
