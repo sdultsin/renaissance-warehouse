@@ -90,6 +90,14 @@ WINDOW_LABEL = f"since {_wm.strftime('%b')} {_wm.day}"  # e.g. "since Jun 1"
 # SQL fragment: meeting m is in the clean window. `m` must be the table alias.
 WINDOW_WHERE = f"m.posted_at >= DATE '{WINDOW_START}'"
 
+# ── Org sends/replies WINDOW (Instantly-native reply scorecard) ────────────────────
+# The org-wide sends/replies scorecard is sourced from the SAME Instantly-native daily
+# fact as the per-workspace cut (raw_pipeline_campaign_daily_metrics) and windowed from
+# 2026-05-15 — the date from which native reply/positive coverage is sound
+# (reference_warehouse_reply_and_tag_truth_20260614: Instantly NATIVE is the SOLE truth
+# for human/auto/total reply + positive(=opps÷human, >= May-15)). Kept as an env knob.
+SENDS_REPLIES_WINDOW_START = os.environ.get("PORTAL_SENDS_REPLIES_WINDOW_START", "2026-05-15")
+
 # ── CM leaderboard logic: FACT-DRIVEN per time-window (not a static allowlist) ─────
 # RULE (Sam, 2026-06-14): a CM appears in a leaderboard window IFF they have meetings
 # in that window — same principle as the deleted-workspace lifecycle. So:
@@ -521,30 +529,46 @@ data["im_bookings"] = safe("im_bookings", lambda: {
     "window_label": WINDOW_LABEL,
 })
 
-# ───────────────────────────── Org + Workspace sends & replies (SHOW — UNRESTRICTED)
-# Instantly-native counts (100% — not attribution-dependent), so shown without a window.
-#   • org-wide ESP-matrix rollup: human / auto / total replies + positive (opps),
+# ───────────────────────────── Org + Workspace sends & replies (Instantly-NATIVE) ──
+# Instantly-native counts are the SOLE truth for replies (reference_warehouse_reply_and_
+# tag_truth_20260614). BOTH cuts below now read the SAME native daily fact
+# (raw_pipeline_campaign_daily_metrics) so they reconcile by construction:
+#   • org-wide rollup: human (unique_replies) / auto (unique_replies_automatic) /
+#     total (= human + auto) / positive (unique_opportunities = opps), windowed from
+#     SENDS_REPLIES_WINDOW_START (2026-05-15, where native reply coverage is sound).
 #     positive_rate = positive / human (per Sam's "positive = opps ÷ human").
-#   • per-workspace MTD sends + replies + opps (derived.v_workspace_send_mtd).
-# (Drives the Accounts/Workspaces send-volume tiles and the org reply scorecard.)
+#     The org block is the un-grouped aggregate of the SAME query the per-workspace cut
+#     uses (just without the per-workspace GROUP BY) — so it reconciles by construction.
+#   • per-workspace MTD sends + replies + opps (derived.v_workspace_send_mtd, which itself
+#     sums the same native columns).
+# NOTE: the org block is NOT currently rendered by index.html — kept native+correct so it
+# cannot mislead if ever wired. PRIOR BUG: it was built from mv_esp_send_matrix (the
+# DROPPED home-grown classifier), 8-13x wrong on replies.
 data["sends_replies"] = safe("sends_replies", lambda: {
     "org": (lambda r: {
         **r,
         "positive_rate": (round(r["positive"] / r["human"], 4)
                           if r and r.get("human") else None),
-    })(q("""
-        SELECT SUM(sends) AS sends, SUM(human_replies) AS human,
-               SUM(auto_replies) AS auto, SUM(total_replies) AS total,
-               SUM(positive_replies) AS positive
-        FROM mv_esp_send_matrix""")[0]),
+    })(q(f"""
+        SELECT SUM(sent)                     AS sends,
+               SUM(unique_replies)           AS human,
+               SUM(unique_replies_automatic) AS auto,
+               SUM(unique_replies) + SUM(unique_replies_automatic) AS total,
+               SUM(unique_opportunities)     AS positive
+        FROM raw_pipeline_campaign_daily_metrics
+        WHERE date >= DATE '{SENDS_REPLIES_WINDOW_START}'""")[0]),
     "by_workspace_mtd": q("""
         SELECT COALESCE(workspace_label, workspace_id, '(unknown)') AS workspace,
                sent_mtd AS sent, replies_mtd AS replies, opps_mtd_trend AS opps
         FROM derived.v_workspace_send_mtd
         WHERE COALESCE(workspace_deleted, FALSE) = FALSE
         ORDER BY sent_mtd DESC"""),
-    "note": "Instantly-native (100%, not attribution-dependent) — shown unrestricted. "
-            "positive = opps; positive_rate = positive / human_replies.",
+    "note": (f"Instantly-native (100%, not attribution-dependent). org = "
+             f"raw_pipeline_campaign_daily_metrics aggregate windowed from "
+             f"{SENDS_REPLIES_WINDOW_START} (human=unique_replies, auto=unique_replies_"
+             f"automatic, total=human+auto, positive=unique_opportunities); "
+             f"positive_rate = positive / human. by_workspace_mtd is June MTD from the "
+             f"same native columns (derived.v_workspace_send_mtd)."),
 })
 
 # ───────────────────── Advisor + Inbox-Manager leaderboards — WINDOWED (>= Jun 1)
