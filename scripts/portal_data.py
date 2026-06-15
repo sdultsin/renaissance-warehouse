@@ -592,6 +592,51 @@ data["inbox_managers"] = safe("inbox_managers", lambda: {
         FROM derived.v_inbox_manager_alltime_summary ORDER BY bookings_all_time DESC""")),
 })
 
+# ──────────────────────────────── Deals Funded + Bottom-line KPI — HELD/HIDDEN (Gap 1)
+# Sam's "Gap 1": the strategic bottom-line KPI is deals_funded × commission ÷ all-in cost.
+# The warehouse STRUCTURE for it is built (DDL 73: core.deal_funded + rollup views +
+# core.v_kpi_bottom_line) but ships EMPTY — we have not started tracking funded deals yet.
+# Per the 100%-or-WIPE rule (feedback_partial_data_100pct_or_wipe_20260614) this section is
+# HELD/HIDDEN: it is emitted with held=True and EMPTY/null numbers so the portal renders
+# NOTHING until real ~100%-complete funded-deal data exists. It must NEVER show a partial or
+# zero-as-if-real number. The portal-side render gate keys on `deals_funded.held` (same hold
+# convention as the partial all-time advisor/IM cuts above): when held is True, do not draw
+# the tile. Flip held->False ONLY when core.deal_funded carries real, ~100%-complete data
+# AND the all-in-cost denominator (core.v_kpi_bottom_line.all_in_cost) is wired (today NULL).
+# Best-effort + table-guarded so it never errors before DDL 73 is applied (structure-first).
+def _deals_funded_held():
+    has_table = table_exists("core.deal_funded")
+    n_rows = (one("SELECT COUNT(*) FROM core.deal_funded") or 0) if has_table else 0
+    # Read whether the cost denominator is wired (all_in_cost non-null on any KPI row).
+    cost_wired = False
+    if has_table:
+        cost_wired = bool(one(
+            "SELECT COUNT(*) FROM core.v_kpi_bottom_line WHERE all_in_cost IS NOT NULL") or 0)
+    # HARD HELD until BOTH conditions clear (real data AND cost denominator), per 100%-or-wipe.
+    held = (not has_table) or (n_rows == 0) or (not cost_wired)
+    reason = (
+        "structure not yet applied (DDL 73 deals_funded)" if not has_table
+        else "no funded-deal data yet — ships EMPTY in anticipation (Gap 1)" if n_rows == 0
+        else "all-in-cost denominator not wired (core.v_kpi_bottom_line.all_in_cost is NULL)" if not cost_wired
+        else "")
+    return {
+        "held": held,                 # portal render gate: True -> draw nothing
+        "held_reason": reason,
+        "row_count": n_rows,
+        # EMPTY payloads while held — never a partial or zero-as-if-real number.
+        "by_cm": [], "by_partner": [], "by_workspace": [], "by_month": [],
+        "kpi_bottom_line": None,      # deals_funded × commission ÷ all-in cost (NULL until live)
+        "definition": (
+            "Strategic bottom-line KPI = deals_funded × commission ÷ all-in cost "
+            "(feedback_bottom_line_kpi_only). Numerator = Σ commission over funded deals "
+            "(core.v_deal_funded_resolved); denominator = monthly all-in cost from "
+            "core.cost_ledger (NOT yet wired — stubbed join point in DDL 73). HELD until real "
+            "~100%-complete funded-deal data AND the cost denominator both exist."),
+    }
+
+
+data["deals_funded"] = safe("deals_funded", _deals_funded_held)
+
 # ───────────────────────────────────────── Instantly Lead Credits (the one true gap)
 # No warehouse table. Pulled by scripts/portal_credits.py (Instantly billing
 # plan-details API, read-only) and merged here if its JSON is present.
