@@ -15,6 +15,14 @@ export GIT_SSH_COMMAND="ssh -i /root/.ssh/portal_deploy_key -o IdentitiesOnly=ye
 
 echo "==== portal feed refresh $(date -u +%FT%TZ) ===="
 
+# 0) Sync the portal checkout to origin BEFORE regenerating, so the eventual push is always a
+#    fast-forward even if a client push (e.g. an index.html change) landed since the last run.
+#    Safe: the only tracked files this job touches are regenerated below; portal_credits.json
+#    is untracked and survives the reset. Without this the box diverges on any client push and
+#    its pushes fail indefinitely (it never pulls).
+cd "$REPO" && git fetch -q origin 2>/dev/null && git reset --hard -q origin/main 2>/dev/null \
+  && echo "  synced to origin $(git rev-parse --short HEAD)" || echo "  WARN could not sync to origin (continuing)"
+
 # 1) Instantly Lead Credits (read-only billing API). Non-fatal: keep last-known-good on failure.
 echo "[1/4] credits (Instantly billing plan-details, read-only)"
 INSTANTLY_ENV_FILE="$ENVF" "$PY" "$WH/scripts/portal_credits.py" > "$CRED_JSON.tmp" 2>>/root/portal_credits.err \
@@ -30,14 +38,34 @@ fi
 mv -f "$REPO/portal_data.js.tmp" "$REPO/portal_data.js"
 echo "  generated $(wc -c < "$REPO/portal_data.js") bytes"
 
+# 2b) Regenerate the 3 in-portal Lens dashboard feeds from the SAME serving snapshot
+#     (read-only) straight into the portal checkout so they ride this same nightly commit.
+#     CORE_DB_PATH=$SNAP is REQUIRED — the Lens generators default to the LOCKED live writer
+#     and fail otherwise (that was the old standalone-cron breakage, see
+#     handoffs/2026-06-17-portal-dashboard-freshness.md). Non-fatal each: a bad Lens feed
+#     must never block the portal_data.js publish (keep last-known-good).
+echo "[2b/4] regenerate Lens dashboard feeds (read-only, serving snapshot)"
+lensgen () {  # $1 = generator script, $2 = dest path in the portal repo
+  mkdir -p "$(dirname "$2")"
+  if CORE_DB_PATH="$SNAP" "$PY" "$WH/scripts/$1" > "$2.tmp" 2>>/root/lens_feeds.err && [ -s "$2.tmp" ]; then
+    mv -f "$2.tmp" "$2"; echo "  ok $(basename "$(dirname "$2")") $(wc -c < "$2")B"
+  else
+    rm -f "$2.tmp"; echo "  WARN $1 failed — keeping last-known-good $2" >&2
+  fi
+}
+lensgen dashboard_data.py     "$REPO/dashboards/lens-overview/data.json"
+lensgen kpi_dashboard_data.py "$REPO/dashboards/lens-kpi/data.json"
+CORE_DB_PATH="$SNAP" "$PY" "$WH/scripts/sms_campaign_dashboard_data.py" --out "$REPO/dashboards/lens-sms/data/latest.json" >>/root/lens_feeds.err 2>&1 \
+  && echo "  ok lens-sms $(wc -c < "$REPO/dashboards/lens-sms/data/latest.json")B" || echo "  WARN sms feed failed — keeping last-known-good" >&2
+
 # 3) Commit if changed.
 cd "$REPO" || exit 1
 git config --global --add safe.directory "$REPO" 2>/dev/null
-if git diff --quiet -- portal_data.js; then
-  echo "[3/4] no change in portal_data.js — nothing to publish"; exit 0
+git add portal_data.js dashboards/lens-overview/data.json dashboards/lens-kpi/data.json dashboards/lens-sms/data/latest.json 2>/dev/null
+if git diff --cached --quiet; then
+  echo "[3/4] no change in portal feed or Lens data — nothing to publish"; exit 0
 fi
-git add portal_data.js
-git commit -q -m "portal data refresh $(date -u +%FT%TZ) [conductor]" && echo "[3/4] committed"
+git commit -q -m "portal data + Lens dashboard refresh $(date -u +%FT%TZ) [conductor]" && echo "[3/4] committed"
 
 # 4) Push (GitHub Pages auto-deploys). Non-fatal so a missing credential doesn't fail the job;
 #    the commit is preserved and pushes on the next run once the deploy key/credential is live.

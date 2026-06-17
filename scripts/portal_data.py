@@ -457,6 +457,97 @@ data["cms"] = safe("cms", lambda: {
         SELECT COALESCE(workspace_slug,'(unknown)') AS workspace_slug, COUNT(*) AS inboxes
         FROM core.sending_account WHERE {ACTIVE_INBOX_WHERE}
         GROUP BY 1 ORDER BY inboxes DESC""")),
+    # B1 — per-CM email SENDS (the missing half of S/B-by-CM; meetings are above).
+    # Source = raw_pipeline_campaign_daily_metrics.sent joined to the campaign dim by
+    # campaign_id; CM = UPPER(TRIM(cm_name)) (NAME-derived, never tags). Same REAL_CMS_CTE
+    # roster as the meeting cuts -> labels join 1:1 -> client computes S/B-per-CM = sends/meetings.
+    # COVERAGE: per-CM sends do NOT sum to org sends (~0-13% orphan campaign-days); coverage block exposed.
+    "sends_by_cm": safe("cms_sends_by_cm", lambda: {
+        "since_window": q(f"""
+            WITH {REAL_CMS_CTE},
+            dims AS (
+              SELECT DISTINCT ON (campaign_id) campaign_id, UPPER(TRIM(cm_name)) AS cm
+              FROM raw_pipeline_campaigns
+              WHERE cm_name IS NOT NULL AND TRIM(cm_name) <> ''
+              ORDER BY campaign_id, _loaded_at DESC)
+            SELECT d.cm AS cm, SUM(cd.sent) AS sends
+            FROM raw_pipeline_campaign_daily_metrics cd
+            JOIN dims d USING (campaign_id)
+            JOIN real_cms rc ON rc.cm = d.cm
+            WHERE cd.date >= DATE '{WINDOW_START}'
+            GROUP BY 1 ORDER BY sends DESC"""),
+        "mtd": q(f"""
+            WITH {REAL_CMS_CTE},
+            dims AS (
+              SELECT DISTINCT ON (campaign_id) campaign_id, UPPER(TRIM(cm_name)) AS cm
+              FROM raw_pipeline_campaigns
+              WHERE cm_name IS NOT NULL AND TRIM(cm_name) <> ''
+              ORDER BY campaign_id, _loaded_at DESC)
+            SELECT d.cm AS cm, SUM(cd.sent) AS sends
+            FROM raw_pipeline_campaign_daily_metrics cd
+            JOIN dims d USING (campaign_id)
+            JOIN real_cms rc ON rc.cm = d.cm
+            WHERE cd.date >= date_trunc('month', current_date)
+            GROUP BY 1 ORDER BY sends DESC"""),
+        "monthly": q(f"""
+            WITH {REAL_CMS_CTE},
+            dims AS (
+              SELECT DISTINCT ON (campaign_id) campaign_id, UPPER(TRIM(cm_name)) AS cm
+              FROM raw_pipeline_campaigns
+              WHERE cm_name IS NOT NULL AND TRIM(cm_name) <> ''
+              ORDER BY campaign_id, _loaded_at DESC)
+            SELECT strftime(date_trunc('month', cd.date), '%b ''%y') AS month,
+                   d.cm AS cm, SUM(cd.sent) AS sends
+            FROM raw_pipeline_campaign_daily_metrics cd
+            JOIN dims d USING (campaign_id)
+            JOIN real_cms rc ON rc.cm = d.cm
+            WHERE cd.date >= current_date - INTERVAL '14 months'
+            GROUP BY date_trunc('month', cd.date), 2
+            ORDER BY date_trunc('month', cd.date), sends DESC"""),
+        "coverage": (lambda org, matched: {
+            "org_total_mtd": org, "cm_matched_mtd": matched,
+            "matched_pct": (round(100.0 * matched / org, 1) if org else None),
+            "note": ("per-CM sends are dim-matched (campaign_id -> raw_pipeline_campaigns.cm_name); "
+                     "orphan campaign-days + dimension drift leave a ~0-13% gap vs the org total. "
+                     "Do NOT expect sum(sends_by_cm) == org sent."),
+        })(
+            one("""SELECT SUM(sent) FROM raw_pipeline_campaign_daily_metrics
+                   WHERE date >= date_trunc('month', current_date)"""),
+            one("""WITH dims AS (
+                     SELECT DISTINCT ON (campaign_id) campaign_id
+                     FROM raw_pipeline_campaigns
+                     WHERE cm_name IS NOT NULL AND TRIM(cm_name) <> ''
+                     ORDER BY campaign_id, _loaded_at DESC)
+                   SELECT SUM(cd.sent) FROM raw_pipeline_campaign_daily_metrics cd
+                   JOIN dims d USING (campaign_id)
+                   WHERE cd.date >= date_trunc('month', current_date)"""),
+        ),
+    }),
+    # Per-CM per-month sends + meetings (the MONTHLY_CM replacement: CM trend, by-CM,
+    # S/B-by-CM). FULL OUTER JOIN of per-CM monthly sends (campaign-name->CM) + per-CM
+    # monthly meetings (CM_RESOLVED). Last 14 months; let-go CMs taper out. NO AI split.
+    "by_cm_monthly": safe("cms_by_cm_monthly", lambda: q(f"""
+        WITH {REAL_CMS_CTE},
+        dims AS (
+          SELECT DISTINCT ON (campaign_id) campaign_id, UPPER(TRIM(cm_name)) AS cm
+          FROM raw_pipeline_campaigns
+          WHERE cm_name IS NOT NULL AND TRIM(cm_name) <> ''
+          ORDER BY campaign_id, _loaded_at DESC),
+        se AS (
+          SELECT d.cm AS cm, date_trunc('month', cd.date) AS mo, SUM(cd.sent) AS sends
+          FROM raw_pipeline_campaign_daily_metrics cd
+          JOIN dims d USING (campaign_id) JOIN real_cms rc ON rc.cm = d.cm
+          WHERE cd.date >= current_date - INTERVAL '14 months' GROUP BY 1,2),
+        mt AS (
+          SELECT {CM_RESOLVED} AS cm, date_trunc('month', m.posted_at) AS mo, COUNT(*) AS meetings
+          FROM core.meeting m JOIN real_cms rc ON rc.cm = {CM_RESOLVED}
+          WHERE {EMAIL_WHERE} AND m.posted_at >= current_date - INTERVAL '14 months'
+          GROUP BY 1, date_trunc('month', m.posted_at))
+        SELECT strftime(COALESCE(se.mo, mt.mo), '%b ''%y') AS month,
+               COALESCE(se.cm, mt.cm) AS cm,
+               COALESCE(se.sends, 0) AS sends, COALESCE(mt.meetings, 0) AS meetings
+        FROM se FULL OUTER JOIN mt ON se.cm = mt.cm AND se.mo = mt.mo
+        ORDER BY COALESCE(se.mo, mt.mo), sends DESC""")),
 })
 
 # ─────────────────────────────────────── Business-Funding meetings trend (bar/line)
@@ -483,6 +574,80 @@ data["monthly"] = safe("monthly", lambda: q(f"""
     FROM mt FULL OUTER JOIN se USING (mo)
     WHERE COALESCE(mt.mo, se.mo) >= current_date - INTERVAL '18 months'
     ORDER BY COALESCE(mt.mo, se.mo)"""))
+
+# ───────────────────────── C2gen — monthly[] enrichments + day-of-week (dow[]) ─────
+# Reuses the SAME daily booked (email meetings, hybrid filter) + daily sent
+# (raw_pipeline_campaign_daily_metrics.sent) the feed already computes — at full history —
+# to add per-month enrichments + a top-level dow[]. ALL ratios are PERIOD ratios
+# (Sum sent / Sum booked), never averages of daily ratios. 6 S/B tiers = portal KPI_BANDS
+# verbatim: a(>4500) b(4000-4500) c(3600-4000) d(3200-3600) e(2800-3200) f(0-2800).
+# monthly_enriched rows key on the SAME "%b '%y" label as data["monthly"] (client merges by month).
+_C2_BAND_CASE = (
+    "CASE WHEN booked=0 THEN NULL "
+    "WHEN sent::DOUBLE/booked >= 4500 THEN 'a' "
+    "WHEN sent::DOUBLE/booked >= 4000 THEN 'b' "
+    "WHEN sent::DOUBLE/booked >= 3600 THEN 'c' "
+    "WHEN sent::DOUBLE/booked >= 3200 THEN 'd' "
+    "WHEN sent::DOUBLE/booked >= 2800 THEN 'e' "
+    "ELSE 'f' END"
+)
+_C2_DAILY_CTE = f"""
+    bk AS (
+      SELECT m.posted_at::DATE AS d, COUNT(*) AS booked
+      FROM core.meeting m WHERE {EMAIL_WHERE} GROUP BY 1),
+    se AS (
+      SELECT date AS d, SUM(sent) AS sent
+      FROM raw_pipeline_campaign_daily_metrics GROUP BY 1),
+    day AS (
+      SELECT COALESCE(bk.d, se.d) AS d, COALESCE(bk.booked,0) AS booked,
+             COALESCE(se.sent,0) AS sent, isodow(COALESCE(bk.d, se.d)) AS iso,
+             dayname(COALESCE(bk.d, se.d)) AS dname
+      FROM bk FULL OUTER JOIN se ON bk.d = se.d)"""
+_C2_DAILY_CTE_WINDOWED = f"""
+    bk AS (
+      SELECT m.posted_at::DATE AS d, COUNT(*) AS booked
+      FROM core.meeting m WHERE {EMAIL_WHERE} AND m.posted_at >= current_date - {TREND_DAYS} GROUP BY 1),
+    se AS (
+      SELECT date AS d, SUM(sent) AS sent
+      FROM raw_pipeline_campaign_daily_metrics WHERE date >= current_date - {TREND_DAYS} GROUP BY 1),
+    day AS (
+      SELECT COALESCE(bk.d, se.d) AS d, COALESCE(bk.booked,0) AS booked,
+             COALESCE(se.sent,0) AS sent, isodow(COALESCE(bk.d, se.d)) AS iso,
+             dayname(COALESCE(bk.d, se.d)) AS dname
+      FROM bk FULL OUTER JOIN se ON bk.d = se.d)"""
+data["monthly_enriched"] = safe("monthly_enriched", lambda: q(f"""
+    WITH {_C2_DAILY_CTE},
+    banded AS (SELECT *, {_C2_BAND_CASE} AS band FROM day
+               WHERE d >= current_date - INTERVAL '18 months')
+    SELECT strftime(date_trunc('month', d), '%b ''%y')               AS month,
+           COUNT(*)                                                  AS days_with_data,
+           SUM(booked)                                               AS booked,
+           SUM(sent)                                                 AS sent,
+           ROUND(SUM(booked)::DOUBLE / NULLIF(COUNT(*),0))           AS avg_daily_meetings,
+           CASE WHEN SUM(booked) FILTER (WHERE iso<=5)>0
+                THEN ROUND(SUM(sent) FILTER (WHERE iso<=5)::DOUBLE
+                           / SUM(booked) FILTER (WHERE iso<=5)) ELSE 0 END AS weekday_ratio,
+           CASE WHEN SUM(booked) FILTER (WHERE iso>=6)>0
+                THEN ROUND(SUM(sent) FILTER (WHERE iso>=6)::DOUBLE
+                           / SUM(booked) FILTER (WHERE iso>=6)) ELSE 0 END AS weekend_ratio,
+           COUNT(*) FILTER (WHERE band IS NOT NULL)                  AS kpi_days_rated,
+           COUNT(*) FILTER (WHERE band='a') AS kpi_days_a, COUNT(*) FILTER (WHERE band='b') AS kpi_days_b,
+           COUNT(*) FILTER (WHERE band='c') AS kpi_days_c, COUNT(*) FILTER (WHERE band='d') AS kpi_days_d,
+           COUNT(*) FILTER (WHERE band='e') AS kpi_days_e, COUNT(*) FILTER (WHERE band='f') AS kpi_days_f,
+           ROUND(100.0*COUNT(*) FILTER (WHERE band='a')/NULLIF(COUNT(*) FILTER (WHERE band IS NOT NULL),0),2) AS kpi_pct_a,
+           ROUND(100.0*COUNT(*) FILTER (WHERE band='b')/NULLIF(COUNT(*) FILTER (WHERE band IS NOT NULL),0),2) AS kpi_pct_b,
+           ROUND(100.0*COUNT(*) FILTER (WHERE band='c')/NULLIF(COUNT(*) FILTER (WHERE band IS NOT NULL),0),2) AS kpi_pct_c,
+           ROUND(100.0*COUNT(*) FILTER (WHERE band='d')/NULLIF(COUNT(*) FILTER (WHERE band IS NOT NULL),0),2) AS kpi_pct_d,
+           ROUND(100.0*COUNT(*) FILTER (WHERE band='e')/NULLIF(COUNT(*) FILTER (WHERE band IS NOT NULL),0),2) AS kpi_pct_e,
+           ROUND(100.0*COUNT(*) FILTER (WHERE band='f')/NULLIF(COUNT(*) FILTER (WHERE band IS NOT NULL),0),2) AS kpi_pct_f
+    FROM banded GROUP BY date_trunc('month', d) ORDER BY date_trunc('month', d)"""))
+data["dow"] = safe("dow", lambda: q(f"""
+    WITH {_C2_DAILY_CTE_WINDOWED}
+    SELECT iso AS iso_dow, dname AS day, COUNT(*) AS days,
+           SUM(booked) AS total_booked, SUM(sent) AS total_sent,
+           ROUND(SUM(booked)::DOUBLE / NULLIF(COUNT(*),0))      AS avg_booked,
+           CASE WHEN SUM(booked)>0 THEN ROUND(SUM(sent)::DOUBLE / SUM(booked)) ELSE 0 END AS avg_ratio
+    FROM day GROUP BY iso, dname ORDER BY iso"""))
 
 # ───────────────────────────────────── Daily booked + sent (Business ▸ Daily Trends)
 # Daily email meetings + daily sends, for the dual-axis composed chart + Day-of-Week.
