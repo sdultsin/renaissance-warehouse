@@ -550,6 +550,59 @@ data["cms"] = safe("cms", lambda: {
         ORDER BY COALESCE(se.mo, mt.mo), sends DESC""")),
 })
 
+# ──────────────────────────────────────── Accounts tab (inbox inventory) ───────────
+# Source: core.v_account_campaign_offer (account x campaign x offer, sv=78) + core.sending_account
+# (domain, daily_limit=capacity). READ-ONLY. The view's `offer` resolves to {Funding, NULL} only
+# (NO Section125/ERC in the data), and `cm` is ~93% NULL -> so we emit the ENTIRE attached fleet
+# (~494k accounts) as the single real offer the portal surfaces ("Funding"); Section125/ERC fall
+# back to the portal's existing Supabase data, and the per-CM tile stays on Supabase too. DEDUP:
+# 1 row/account, dimension = mode(); domain/capacity via lower(email)=account_email. Groups +
+# per-account Inbox Managers have NO warehouse dimension -> dropped client-side.
+_INBOX_ACCT_CTE = """
+WITH acct AS (
+  SELECT v.account_email,
+         mode(v.vendor_category) AS vendor_category,
+         mode(v.esp)             AS esp,
+         mode(v.account_status)  AS account_status,
+         mode(v.workspace_slug)  AS workspace_slug,
+         ANY_VALUE(sa.domain)      AS domain,
+         ANY_VALUE(sa.daily_limit) AS cap
+  FROM core.v_account_campaign_offer v
+  LEFT JOIN core.sending_account sa ON lower(sa.email) = v.account_email
+  GROUP BY v.account_email
+)"""
+
+def _inbox_dim(col):
+    return q(f"""{_INBOX_ACCT_CTE}
+        SELECT COALESCE({col}, '(unknown)') AS key,
+               COUNT(DISTINCT account_email)         AS accounts,
+               COUNT(DISTINCT domain)                AS domains,
+               CAST(SUM(COALESCE(cap, 0)) AS BIGINT) AS sending_volume
+        FROM acct GROUP BY 1 ORDER BY accounts DESC""")
+
+def _inboxes_by_offer():
+    totals = q(f"""{_INBOX_ACCT_CTE}
+        SELECT COUNT(DISTINCT account_email) AS accounts, COUNT(DISTINCT domain) AS domains,
+               CAST(SUM(COALESCE(cap,0)) AS BIGINT) AS sending_volume FROM acct""")[0]
+    return {
+        "Funding": {
+            "accountStatus":  _inbox_dim("account_status"),
+            "emailTypes":     _inbox_dim("vendor_category"),
+            "emailProviders": _inbox_dim("esp"),
+            "workspaces":     _inbox_dim("workspace_slug"),
+        },
+        "_meta": {
+            "distinct_accounts": totals["accounts"], "distinct_domains": totals["domains"],
+            "sending_volume_is": "sum(core.sending_account.daily_limit) = capacity",
+            "offers_present": ["Funding"], "offers_absent": ["Section 125", "ERC"],
+            "note": ("Funding = entire attached fleet (the only real offer in the warehouse). "
+                     "campaignManagers/Section125/ERC stay on Supabase; Groups + per-account "
+                     "Inbox Managers have no warehouse dimension. Full mapping (not a 30d sample)."),
+        },
+    }
+
+data["inboxes_by_offer"] = safe("inboxes_by_offer", _inboxes_by_offer)
+
 # ─────────────────────────────────────── Business-Funding meetings trend (bar/line)
 # Email-channel meetings/day over the trend window — the headline Overview chart (O4).
 # Uses the hybrid channel classifier so SMS/WhatsApp don't pollute it.
