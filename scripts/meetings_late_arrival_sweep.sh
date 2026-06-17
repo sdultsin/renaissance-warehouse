@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export WAREHOUSE_WRITE_LOCK_HELD=1  # outer flock holds the warehouse-writer lock; tell core/db.py not to re-lock (deadlock guard) [warehouse-ops 2026-06-17]
 # Weekly meetings late-arrival sweep. Cron target (UTC, droplet):
 #   15 8 * * 0 /root/renaissance-warehouse/scripts/meetings_late_arrival_sweep.sh >> /root/renaissance-warehouse/logs/meetings_late_arrival_sweep.log 2>&1
 #

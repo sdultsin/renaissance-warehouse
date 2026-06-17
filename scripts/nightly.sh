@@ -123,6 +123,27 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
         "$PYTHON" scripts/build_campaign_daily.py 2>&1 | tee -a "$LOG_FILE" ) \
         || echo "WARN campaign_daily_build_failed (continuing)" | tee -a "$LOG_FILE"
 
+    # Portal gap dimensions (DDL 67-70, 2026-06-14) — keep them fresh going forward.
+    # advisor / inbox_manager (core.meeting) refresh automatically via the canonical
+    # 'meeting' phase above + meetings_refresh.sh; only SLA + Instantly credits need
+    # an explicit nightly step. Both run AFTER the orchestrator released the writer
+    # lock; core/db.py's in-process warehouse-writer lock serializes these (acquire-or-wait).
+    LOCK_NIGHTLY=/root/core/warehouse.write.lock
+
+    # SLA reply-time: rebuild the response-level fact + re-snapshot the trailing 14d
+    # (covers late-arriving IM responses). Reads core.iam_response_time (built in the
+    # canonical phase) + main.raw_pipeline_conversation_messages.
+    echo "building core.sla_reply_time (portal gap dim)" | tee -a "$LOG_FILE"
+    "$PYTHON" scripts/build_sla_reply_time.py 2>&1 | tee -a "$LOG_FILE" \
+        || echo "WARN sla_reply_time_build_failed (continuing)" | tee -a "$LOG_FILE"
+
+    # Instantly credits: pull per-workspace lead-list quota from the Instantly billing
+    # API (read-only) and UPSERT a daily snapshot into core.instantly_credit (drops the
+    # "The Eagles" free-trial junk row). Self-contained (runs portal_credits.py internally).
+    echo "loading core.instantly_credit (portal gap dim)" | tee -a "$LOG_FILE"
+    "$PYTHON" scripts/load_instantly_credit.py 2>&1 | tee -a "$LOG_FILE" \
+        || echo "WARN instantly_credit_load_failed (continuing)" | tee -a "$LOG_FILE"
+
     # Track I — refresh the NS sweep weekly (cheap-ish; NS rarely changes) and backfill
     # core.domain_registry.nameserver_host from it each night.
     if [[ ! -f /root/core/ns_sweep.parquet || $(find /root/core/ns_sweep.parquet -mtime +6 2>/dev/null) ]]; then
