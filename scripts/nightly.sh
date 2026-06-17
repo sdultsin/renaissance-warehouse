@@ -51,6 +51,13 @@ set +e
 EXIT_CODE=${PIPESTATUS[0]}
 set -e
 
+# Set to 1 by any fail-loud post-orchestrator step (e.g. a failed campaign_data
+# D1 publish or a parity divergence) so the nightly's FINAL exit reflects the
+# degradation even when the orchestrator itself ran clean. Without this a failed
+# publish would exit 0 (silent success) — the exact failure mode the 06-17
+# read-model staleness incident exposed.
+NIGHTLY_DEGRADED=0
+
 # Publish dashboards on success (0) OR partial (1). A partial run means every
 # phase executed and the warehouse tables were rebuilt; only peripheral ingests
 # failed (dead workspaces 401/402, archive-DB lock, etc.) which do NOT feed the
@@ -99,12 +106,56 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     # Publish the campaign_data read-model snapshot to Cloudflare D1 so Campaign
     # Control can read it from D1 instead of Pipeline Supabase (retirement Lane C).
     # .env is NOT shell-sourceable (a comment on line ~131 contains a ')'), so
-    # export the two D1 vars via grep rather than `source .env`.
+    # export the D1 + Slack vars via grep rather than `source .env`.
+    #
+    # FAIL-LOUD (2026-06-17): this publish was previously best-effort-swallowed
+    # (`|| echo WARN ... continuing`). When the 06-17 nightly's publish failed on
+    # a stale DuckDB lock, the D1 snapshot went ~28h stale SILENTLY and CC was
+    # blind to ~17 active campaigns for a cycle. The publish is now fail-loud: a
+    # non-zero exit posts a :rotating_light: alert to the warehouse alert channel
+    # (same SLACK_TOKEN / SLACK_ALERT_CHANNEL path as warehouse_qa.py) and is
+    # recorded as a nightly failure so the nightly-success watchdog sees it.
+    # Cross-checked by the CC-side self-audit freshness guard (independent path).
     echo "publishing campaign_data read-model to D1" | tee -a "$LOG_FILE"
-    CC_D1_API_TOKEN="$(grep '^CC_D1_API_TOKEN=' .env | cut -d= -f2- | tr -d '"')" \
-    CLOUDFLARE_RG_ACCOUNT_ID="$(grep '^CLOUDFLARE_RG_ACCOUNT_ID=' .env | cut -d= -f2- | tr -d '"')" \
-        "$PYTHON" scripts/publish_campaign_data_d1.py 2>&1 | tee -a "$LOG_FILE" \
-        || echo "WARN campaign_data_d1_publish_failed (continuing)" | tee -a "$LOG_FILE"
+    CC_D1_API_TOKEN="$(grep '^CC_D1_API_TOKEN=' .env | cut -d= -f2- | tr -d '"')"
+    CLOUDFLARE_RG_ACCOUNT_ID="$(grep '^CLOUDFLARE_RG_ACCOUNT_ID=' .env | cut -d= -f2- | tr -d '"')"
+    # CC_D1_DATABASE_ID is often absent from .env (the publisher hardcodes a
+    # default); fall back to the canonical id (also in campaign-control/wrangler.toml,
+    # not a secret) so the parity check below has a database to read.
+    CC_D1_DATABASE_ID="$(grep '^CC_D1_DATABASE_ID=' .env | cut -d= -f2- | tr -d '"')"
+    [[ -z "$CC_D1_DATABASE_ID" ]] && CC_D1_DATABASE_ID="25a32aa3-9d95-42a3-9e9e-8cd3a9e3f3eb"
+    SLACK_ALERT_CHANNEL="$(grep '^SLACK_ALERT_CHANNEL=' .env | cut -d= -f2- | tr -d '"')"
+    export CC_D1_API_TOKEN CLOUDFLARE_RG_ACCOUNT_ID CC_D1_DATABASE_ID SLACK_ALERT_CHANNEL
+
+    set +e
+    "$PYTHON" scripts/publish_campaign_data_d1.py 2>&1 | tee -a "$LOG_FILE"
+    PUBLISH_RC=${PIPESTATUS[0]}
+    set -e
+    if [[ "$PUBLISH_RC" -ne 0 ]]; then
+        echo "ERROR campaign_data_d1_publish_failed (rc=$PUBLISH_RC) — CC read-model will go stale" | tee -a "$LOG_FILE"
+        "$PYTHON" scripts/alert_slack.py \
+            ":rotating_light: *campaign_data D1 publish FAILED* (rc=$PUBLISH_RC) — Campaign Control's read-model will go STALE until the next successful nightly. CC self-audit freshness guard will also flag this. Investigate publish_campaign_data_d1.py / DuckDB lock." \
+            2>&1 | tee -a "$LOG_FILE" || true
+        # Record into the nightly's exit status so the nightly-success watchdog
+        # (warehouse_qa.py reads sync_registry; nightly final exit is monitored)
+        # treats a failed publish as a failed nightly rather than silent success.
+        NIGHTLY_DEGRADED=1
+    else
+        # Publish succeeded — assert the D1 snapshot matches LIVE Pipeline Supabase
+        # on active-campaign set + Σemails_sent + Σopportunities (point-in-time
+        # parity). Fail-loud on divergence (posts its own :rotating_light: alert).
+        echo "verifying campaign_data D1<->Pipeline-Supabase parity" | tee -a "$LOG_FILE"
+        set +e
+        "$PYTHON" scripts/verify_campaign_data_parity.py 2>&1 | tee -a "$LOG_FILE"
+        PARITY_RC=${PIPESTATUS[0]}
+        set -e
+        if [[ "$PARITY_RC" -eq 1 ]]; then
+            echo "ERROR campaign_data_parity_divergence (alert posted)" | tee -a "$LOG_FILE"
+            NIGHTLY_DEGRADED=1
+        elif [[ "$PARITY_RC" -eq 2 ]]; then
+            echo "WARN campaign_data_parity_could_not_run (continuing)" | tee -a "$LOG_FILE"
+        fi
+    fi
 
     # Mirror cc_* operational tables from D1 into the warehouse (raw_cc_*) for
     # consolidation/BI (retirement Step 4). Non-fatal; writes after the
@@ -197,5 +248,15 @@ else
     echo "orchestrator hard-failed (exit=$EXIT_CODE); keeping existing dashboards + serving copy" | tee -a "$LOG_FILE"
 fi
 
-echo "exit=$EXIT_CODE" | tee -a "$LOG_FILE"
-exit $EXIT_CODE
+# Final exit reflects BOTH the orchestrator status AND any fail-loud
+# post-orchestrator degradation (failed campaign_data publish / parity
+# divergence). A clean orchestrator (0) with a degraded step exits 1 (partial),
+# so the nightly-success watchdog never reads a failed publish as green. A
+# hard-failed orchestrator (2) keeps its code. Slack alerts already fired inline.
+FINAL_EXIT=$EXIT_CODE
+if [[ "$NIGHTLY_DEGRADED" -eq 1 && "$EXIT_CODE" -eq 0 ]]; then
+    FINAL_EXIT=1
+    echo "nightly degraded by a fail-loud post-orchestrator step (publish/parity); exit 1" | tee -a "$LOG_FILE"
+fi
+echo "exit=$FINAL_EXIT (orchestrator=$EXIT_CODE degraded=$NIGHTLY_DEGRADED)" | tee -a "$LOG_FILE"
+exit $FINAL_EXIT

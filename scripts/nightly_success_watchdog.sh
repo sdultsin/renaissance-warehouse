@@ -9,6 +9,12 @@
 #   3. the serving snapshot file (/opt/duckdb/warehouse_current.duckdb) mtime is < SNAPSHOT_STALE_HRS.
 #   4. lock STARVATION: the warehouse-writer flock has not been HELD continuously longer than
 #      LOCK_HELD_MAX_HRS (a stuck/runaway writer starving the nightly).
+#   5. campaign_data D1 PUBLISH freshness: the CC read-model snapshot
+#      (campaign_data_publish_meta.published_at in CC's D1) is < READMODEL_STALE_HRS old.
+#      This is the OUTCOME of the nightly's publish_campaign_data_d1.py step — the
+#      06-17 incident was a SILENT failure of exactly this publish (CC went blind
+#      to ~17 active campaigns). Read-only D1 HTTP API; SKIPPED (never alerts) if
+#      D1 creds are absent, so a missing cred can't false-alarm.
 # All reads are READ-ONLY against the serving snapshot — safe to run anytime, never opens the
 # live writer.
 #
@@ -31,6 +37,7 @@ MENTION="${SLACK_MENTION:-<@U0AM2CQHW9E>}"  # Sam
 MIN_PHASES="${MIN_PHASES:-20}"              # full nightly is 30 phases; >=20 = a real full run
 SNAPSHOT_STALE_HRS="${SNAPSHOT_STALE_HRS:-28}"   # 06:30 publish + grace
 LOCK_HELD_MAX_HRS="${LOCK_HELD_MAX_HRS:-4}"      # a legit nightly+heal fits well under this
+READMODEL_STALE_HRS="${READMODEL_STALE_HRS:-26}" # CC read-model SLA (matches CC self-audit RED ceiling)
 NOW_TS="$(date -u +%FT%TZ)"
 
 post_slack() {
@@ -105,6 +112,67 @@ if [ -e "$LOCK_FILE" ] && command -v flock >/dev/null 2>&1; then
       fi
     fi
   fi
+fi
+
+# --- Check 5: campaign_data D1 publish freshness (CC read-model OUTCOME) -----------------------
+# Read the single-row campaign_data_publish_meta.published_at out of CC's D1 via the
+# Cloudflare D1 HTTP API and alert if it is older than READMODEL_STALE_HRS. This is the
+# publisher's SUCCESS signal — the thing that was SILENTLY stale on 06-17. SKIP (no alert)
+# if creds/tools are missing so a misconfigured monitor box never false-alarms.
+# D1 creds: prefer the monitor env file, fall back to the warehouse repo .env
+# (which carries CC_D1_API_TOKEN / CLOUDFLARE_RG_ACCOUNT_ID). The DB id is not a
+# secret (it is in campaign-control/wrangler.toml + the publisher default), so it
+# falls back to the canonical id. A read helper that tries both files:
+WH_ENV="${WH_ENV:-/root/renaissance-warehouse/.env}"
+_readkey() {  # $1=key — first non-empty hit across ENV_FILE then WH_ENV
+  local v
+  v="$(grep -E "^$1=" "$ENV_FILE" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"'"')"
+  [ -z "$v" ] && v="$(grep -E "^$1=" "$WH_ENV" 2>/dev/null | head -1 | cut -d= -f2- | tr -d '"'"'"'"')"
+  printf '%s' "$v"
+}
+CF_ACCT="$(_readkey CLOUDFLARE_RG_ACCOUNT_ID)"
+CC_D1_ID="$(_readkey CC_D1_DATABASE_ID)"
+[ -z "$CC_D1_ID" ] && CC_D1_ID="25a32aa3-9d95-42a3-9e9e-8cd3a9e3f3eb"
+CC_D1_TOK="$(_readkey CC_D1_API_TOKEN)"
+if [ -n "$CF_ACCT" ] && [ -n "$CC_D1_ID" ] && [ -n "$CC_D1_TOK" ] && command -v curl >/dev/null 2>&1; then
+  D1_RESP="$(curl -s -m 30 -X POST \
+    "https://api.cloudflare.com/client/v4/accounts/${CF_ACCT}/d1/database/${CC_D1_ID}/query" \
+    -H "Authorization: Bearer ${CC_D1_TOK}" \
+    -H 'Content-Type: application/json' \
+    --data '{"sql":"SELECT published_at FROM campaign_data_publish_meta WHERE id = 1"}' 2>/dev/null)"
+  # Parse + age-check in python (portable; the watchdog already relies on python3).
+  PUB_AGE_H="$(python3 - "$D1_RESP" <<'PY' 2>/dev/null
+import json, sys
+from datetime import datetime, timezone
+try:
+    out = json.loads(sys.argv[1])
+    if not out.get("success"):
+        print("ERR"); raise SystemExit
+    rows = (out.get("result") or [{}])[0].get("results") or []
+    if not rows:
+        print("NOROW"); raise SystemExit
+    ts = rows[0]["published_at"]
+    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+    age = (datetime.now(timezone.utc) - dt).total_seconds() / 3600.0
+    print(f"{age:.1f}")
+except SystemExit:
+    pass
+except Exception:
+    print("ERR")
+PY
+)"
+  if [ "$PUB_AGE_H" = "NOROW" ]; then
+    add_reason "campaign_data D1 publish meta row MISSING (publish_campaign_data_d1.py never wrote campaign_data_publish_meta) — CC read-model freshness unverifiable."
+  elif [ "$PUB_AGE_H" = "ERR" ] || [ -z "$PUB_AGE_H" ]; then
+    echo "[$NOW_TS] NOTE: could not read campaign_data publish meta from D1 (skipping check 5; not alerting)"
+  else
+    # Float compare via awk (bash has no float math).
+    if awk "BEGIN{exit !($PUB_AGE_H > $READMODEL_STALE_HRS)}"; then
+      add_reason "campaign_data D1 read-model is ${PUB_AGE_H}h stale (> ${READMODEL_STALE_HRS}h) — publish_campaign_data_d1.py did not publish a fresh snapshot; Campaign Control is reading a stale campaign set (the 06-17 failure mode)."
+    fi
+  fi
+else
+  echo "[$NOW_TS] NOTE: D1 creds/curl unavailable — skipping check 5 (campaign_data publish freshness)"
 fi
 
 # --- gating + alert ---------------------------------------------------------------------------
