@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+export WAREHOUSE_WRITE_LOCK_HELD=1  # outer flock holds the warehouse-writer lock; tell core/db.py not to re-lock (deadlock guard) [warehouse-ops 2026-06-17]
 # One-shot write-window batch for the 2026-06-08 warehouse-hardening tracks.
 # Run when the single-writer lock is free (reply backfill / nightly not active).
 set -uo pipefail
@@ -25,6 +26,6 @@ flock -w 600 "$L" -c "bash scripts/publish_serving.sh 2>&1 | tail -3"
 echo "=== 6. Track E — QA (no post) ==="
 $PY scripts/warehouse_qa.py --no-post 2>&1 | tail -20
 
-echo "=== 7. DoD verification + alert-channel self-report ==="
+echo "=== 7. DoD verification + #cc-sam self-report ==="
 $PY scripts/verify_hardening_dod.py 2>&1 | tail -25
 echo "=== BATCH DONE ==="
