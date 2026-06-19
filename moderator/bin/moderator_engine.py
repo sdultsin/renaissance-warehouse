@@ -228,6 +228,8 @@ def floor_review(ddl_files: list[dict], py_files: list[dict]) -> dict:
     file_rules = [r for r in rules if (r["spec"] or {}).get("applies") == "ddl-file"]
 
     findings: list[dict] = []
+    had_ddl_ops = False
+    py_has_sql = False
     con = None
     try:
         con = mc.duckdb_ro().__enter__()
@@ -237,6 +239,8 @@ def floor_review(ddl_files: list[dict], py_files: list[dict]) -> dict:
         for f in ddl_files:
             path, sql = f["path"], f["content"]
             ops = lib.classify_ddl(sql)
+            if ops:
+                had_ddl_ops = True
             intent = lib.parse_intent(sql)
             depends = lib.parse_depends(sql)
             # file-scoped rules (R4 intent/deps) — fire once per file if it touches columns.
@@ -272,6 +276,34 @@ def floor_review(ddl_files: list[dict], py_files: list[dict]) -> dict:
                            "consumers": ", ".join(of["consumers"][:8]) or "none statically known",
                            "reason": reason, "canonical": of["_dupe_canonical"] or "", "ddl_file": path}
                     findings.append(_finding(r, ctx, ddl_file=path, op=of))
+        # py contract check (fail-loud): an INSERT column list referencing a column not in the live
+        # catalog is drift. Needs the catalog (degrades to py_has_sql detection pre-P7).
+        kw = {"select", "insert", "update", "delete", "from", "where", "into", "values", "table",
+              "join", "on", "group", "order", "by", "core", "derived", "raw", "main", "as", "and", "or"}
+        for f in (py_files or []):
+            literals, parse_ok = lib.extract_sql_from_python(f["content"])
+            if not parse_ok:
+                continue
+            for lit in literals:
+                low = lit.text.lower()
+                if "insert into" in low or "select" in low or "update " in low:
+                    py_has_sql = True
+                if lit.dynamic or not allcols:
+                    continue
+                cols, clean = lib.columns_referenced_q(lit.text)
+                if not clean:
+                    continue
+                if "insert into" in low and "(" in lit.text:
+                    unknown = {c for c in cols if c.isidentifier() and len(c) > 2
+                               and c not in allcols and not c.startswith("_") and c not in kw}
+                    if unknown:
+                        findings.append({
+                            "rule": "CONTRACT", "tier": "warn", "severity": "Warn",
+                            "classification": "CONTRACT", "table_schema": None, "table_name": None,
+                            "column_name": None, "ddl_file": f["path"],
+                            "detail": f"{f['path']}:{lit.line}: INSERT references column(s) not in the live "
+                                      f"catalog: {', '.join(sorted(unknown)[:5])}. Ship the DDL first, else drift.",
+                            "consumers": [], "fix": {"kind": "annotate_consumer"}, "source": "floor"})
     finally:
         if con is not None:
             try:
@@ -280,8 +312,12 @@ def floor_review(ddl_files: list[dict], py_files: list[dict]) -> dict:
                 pass
 
     floor_verdict = _verdict_from(findings)
-    return {"rules_version": rv, "catalog_snapshot_id": snap,
-            "findings": findings, "floor_verdict": floor_verdict, "catalog_built": bool(allcols)}
+    # The LLM deep-review only runs on a SCHEMA-relevant change — real DDL ops, SQL-bearing py, or any
+    # floor finding. A pure-Python (no-SQL) edit clears the floor as a cheap no-op (no paid LLM call).
+    schema_relevant = had_ddl_ops or py_has_sql or bool(findings)
+    return {"rules_version": rv, "catalog_snapshot_id": snap, "findings": findings,
+            "floor_verdict": floor_verdict, "catalog_built": bool(allcols),
+            "schema_relevant": schema_relevant}
 
 
 def _reason_for(code: str, of: dict) -> str:
@@ -468,6 +504,9 @@ def review(ddl_files, py_files) -> dict:
 
     if floor_verdict == "block":
         verdict = "block"  # the floor is sufficient; LLM not needed to confirm a hard mechanical break
+    elif not floor.get("schema_relevant", True):
+        llm = {"status": "skipped-not-schema", "findings": [], "reasoning": "", "model": None}
+        verdict = floor_verdict  # pure non-schema change — cheap no-op, no paid LLM call
     else:
         llm = llm_deep_review(ddl_files, py_files, floor)
         findings.extend(llm["findings"])
