@@ -153,6 +153,50 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection, schema: str) -> None:
     conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
 
 
+def _schema_gate_apply_tooth(conn: duckdb.DuckDBPyConnection, sql_file: Path, version: int) -> None:
+    """Schema-gate Phase 1 apply tooth — WARN-ONLY by construction.
+
+    Consults core.schema_gate_pass: a DDL is "gate-passed" when a row exists for this
+    (version, sha256-of-file-content). If the gate-pass tables don't exist yet, or there
+    is no matching pass, we ONLY LOG A WARNING — we NEVER refuse the apply.
+
+    This is mandatory for Phase 1: the other 3 editors (Thomas/Darcy/David) author DDL
+    without running the gate today, and refusing their un-gated DDL would break the
+    nightly. Phase 2 (a separate Sam decision) flips the WARN to a hard refuse, gated on
+    the SCHEMA_GATE_ENFORCE_APPLY=1 env so the change is explicit and reversible.
+
+    Fully fail-safe: any error here is swallowed so the gate can never break an apply.
+    """
+    try:
+        have = conn.execute(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema='core' AND table_name='schema_gate_pass'"
+        ).fetchone()
+        if not have:
+            return  # gate not installed yet — nothing to check
+        import hashlib
+        sha = hashlib.sha256(sql_file.read_bytes()).hexdigest()
+        passed = conn.execute(
+            "SELECT verdict FROM core.schema_gate_pass WHERE version = ? AND content_sha256 = ?",
+            [version, sha],
+        ).fetchone()
+        enforce = os.environ.get("SCHEMA_GATE_ENFORCE_APPLY", "0") == "1"
+        if passed:
+            return  # gate-passed — apply proceeds
+        msg = (f"schema-gate: DDL {sql_file.name} (v{version}) has no recorded gate-pass "
+               f"for its current content (sha256={sha[:12]}…). Run "
+               f"`python scripts/schema_gate.py review --files {sql_file.name}` "
+               f"+ `record {sql_file.name}`.")
+        if enforce:
+            # Phase 2 (explicit opt-in only). Phase 1 NEVER reaches here.
+            raise RuntimeError(msg + " [SCHEMA_GATE_ENFORCE_APPLY=1 — REFUSING un-gated DDL]")
+        log.warning("%s [PHASE 1: WARN-ONLY — applying anyway]", msg)
+    except RuntimeError:
+        raise  # enforce-mode refusal must propagate
+    except Exception as exc:  # noqa: BLE001 — never let the tooth break an apply in Phase 1.
+        log.warning("schema-gate apply tooth skipped (non-fatal): %s", exc)
+
+
 def apply_ddl_file(conn: duckdb.DuckDBPyConnection, sql_file: Path, version: int) -> bool:
     """Apply a DDL file if not already applied. Returns True if newly applied.
 
@@ -173,6 +217,9 @@ def apply_ddl_file(conn: duckdb.DuckDBPyConnection, sql_file: Path, version: int
     ).fetchone()
     if existing:
         return False
+    # Schema-gate apply tooth (Phase 1: WARN-ONLY — logs but never refuses). Runs inside
+    # the writer flock with the apply, so review+apply are one critical section vs live.
+    _schema_gate_apply_tooth(conn, sql_file, version)
     sql = sql_file.read_text()
     conn.execute("BEGIN")
     try:

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Schema-gate Phase 1 pre-commit hook — the "review agent" author-time tooth.
+#
+# Runs scripts/schema_gate.py review on any staged sql/ddl/*.sql or
+# entities|sources|scripts/*.py change, prints the checklist, and logs findings to
+# core.schema_issue. For staged DDL it ALSO records a checksum-bound gate-pass so the
+# apply tooth recognizes it.
+#
+# ############################################################################
+# # PHASE 1 IS WARN-ONLY. THIS HOOK NEVER BLOCKS A COMMIT.                    #
+# #   It always exits 0 unless SCHEMA_GATE_BLOCK=1 is explicitly set (the    #
+# #   Phase-2 flip, Sam's call). So Thomas/Sam/Darcy/David commit exactly as #
+# #   before — they just see the checklist + get findings logged.            #
+# ############################################################################
+#
+# Wired via `git config core.hooksPath .githooks` (see scripts/install_schema_gate_hook.sh).
+# To skip on a single commit: `git commit --no-verify`.
+
+set -uo pipefail
+
+REPO_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$REPO_DIR" || exit 0
+
+# Pick a python: repo venv if present, else python3.
+if [[ -x .venv/bin/python ]]; then
+  PY=".venv/bin/python"
+else
+  PY="$(command -v python3 || command -v python || echo python3)"
+fi
+
+# Only fire when relevant files are staged (cheap fast-path otherwise).
+STAGED="$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)"
+if ! echo "$STAGED" | grep -Eq '^(sql/ddl/.*\.sql|(entities|sources|scripts)/.*\.py)$'; then
+  exit 0
+fi
+
+echo "── schema-gate (Phase 1: WARN-ONLY, never blocks) ──"
+# review writes to core.schema_issue if the warehouse DB is reachable; on a dev box
+# without the DB it degrades to print-only. Always exits 0 in Phase 1.
+"$PY" scripts/schema_gate.py review --staged
+GATE_RC=$?
+
+# Record a checksum-bound pass for each staged DDL file (so the apply tooth knows it
+# was gated). Non-fatal: a missing/locked DB just means no pass row (apply still WARNs).
+for f in $(echo "$STAGED" | grep -E '^sql/ddl/.*\.sql$' || true); do
+  [[ -f "$f" ]] && "$PY" scripts/schema_gate.py record "$f" || true
+done
+
+# Phase 1: never block. SCHEMA_GATE_BLOCK=1 is the explicit Phase-2 opt-in.
+if [[ "${SCHEMA_GATE_BLOCK:-0}" == "1" && "$GATE_RC" -ne 0 ]]; then
+  echo "schema-gate: BLOCKING (SCHEMA_GATE_BLOCK=1 — Phase 2 mode). Fix findings or --no-verify."
+  exit 1
+fi
+exit 0
