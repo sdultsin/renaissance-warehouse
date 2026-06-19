@@ -29,6 +29,12 @@ WAREHOUSE_ROOT  = os.environ.get("WAREHOUSE_REPO_ROOT", "/root/renaissance-wareh
 PG_DSN          = os.environ.get("MODERATOR_PG_DSN") or os.environ.get("PIPELINE_SUPABASE_DB_URL", "")
 READ_API_URL    = os.environ.get("WAREHOUSE_API_URL", "https://renaissance-droplet.tailae5c80.ts.net").rstrip("/")
 READ_API_TOKEN  = os.environ.get("WAREHOUSE_API_TOKEN", "")
+# Catalog/lineage lives in DuckDB. The service is CO-LOCATED on the droplet, so it reads the
+# served snapshot read-only directly (robust + fast; no MCP transport). Falls back to the
+# read-API only if this path is unavailable.
+DUCKDB_CURRENT  = os.environ.get("MODERATOR_DUCKDB_CURRENT", "/opt/duckdb/warehouse_current.duckdb")
+LLM_FAIL_CLOSED = os.environ.get("MODERATOR_LLM_FAIL_CLOSED", "0") not in ("0", "false", "False", "")
+LLM_TIMEOUT_S   = float(os.environ.get("MODERATOR_LLM_TIMEOUT_S", "90"))
 ANTHROPIC_KEY   = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_KEY", "")
 SERVER_LLM_ON   = os.environ.get("SCHEMA_GATE_SERVER_LLM", "1") not in ("0", "false", "False", "")
 LLM_MODEL       = os.environ.get("MODERATOR_LLM_MODEL", "claude-opus-4-8")  # strongest reasoning model
@@ -138,7 +144,26 @@ def pg_one(sql: str, params: tuple = ()):  # convenience: first column of first 
         return row[0] if row else None
 
 
-# ── read-API client (warehouse catalog stays in DuckDB; we read it over /query) ─────────────────
+# ── DuckDB serving-snapshot reader (catalog/lineage; read-only, co-located on the droplet) ──────
+@contextmanager
+def duckdb_ro():
+    """Open the CURRENT served warehouse snapshot read-only. Raises if unavailable; callers that
+    must degrade gracefully (catalog not yet built pre-P7) wrap in try/except."""
+    import duckdb
+    if not os.path.exists(DUCKDB_CURRENT):
+        raise FileNotFoundError(f"serving snapshot not found at {DUCKDB_CURRENT}")
+    real = os.path.realpath(DUCKDB_CURRENT)
+    con = duckdb.connect(real, read_only=True)
+    try:
+        yield con
+    finally:
+        try:
+            con.close()
+        except Exception:
+            pass
+
+
+# ── read-API client (fallback transport if the local snapshot is unavailable) ───────────────────
 def read_api_snapshot_id(timeout: float = 6.0) -> str | None:
     """The served snapshot id from the read-API's UNAUTHENTICATED /healthz. None on any failure."""
     import httpx
