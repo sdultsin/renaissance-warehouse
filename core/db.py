@@ -153,47 +153,103 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection, schema: str) -> None:
     conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
 
 
+def _moderator_ledger_dsn() -> str | None:
+    """Resolve the pipeline-Supabase DSN for the moderator approval ledger. Env first, then the
+    repo .env (the nightly may not export it into os.environ). None if unresolvable."""
+    dsn = os.environ.get("MODERATOR_PG_DSN") or os.environ.get("PIPELINE_SUPABASE_DB_URL")
+    if dsn:
+        return dsn
+    try:
+        from core.config import REPO_ROOT
+        envf = REPO_ROOT / ".env"
+        if envf.exists():
+            for line in envf.read_text().splitlines():
+                line = line.strip()
+                for key in ("MODERATOR_PG_DSN=", "PIPELINE_SUPABASE_DB_URL="):
+                    if line.startswith(key):
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return None
+
+
+def _ledger_pass_in_postgres(version: int, sha: str) -> bool | None:
+    """Authoritative check against moderator.approval_ledger (pipeline project, Supavisor 6543).
+    Returns True/False if Postgres is reachable and answered, or None (psycopg missing / DSN
+    missing / network error) so the caller falls back to the DuckDB mirror (degraded-but-safe)."""
+    dsn = _moderator_ledger_dsn()
+    if not dsn:
+        return None
+    try:
+        import psycopg  # absent in the nightly venv until P7 — then this path goes live
+    except Exception:
+        return None
+    try:
+        with psycopg.connect(dsn, connect_timeout=8, prepare_threshold=None) as c, c.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM moderator.approval_ledger "
+                "WHERE ddl_version=%s AND content_sha256=%s "
+                "AND verdict IN ('pass','pass-with-warn') LIMIT 1", (version, sha))
+            return cur.fetchone() is not None
+    except Exception as exc:  # network blip / auth — never hard-fail; fall back to the mirror.
+        log.warning("schema-gate: moderator.approval_ledger unreachable (%s) — using DuckDB mirror", exc)
+        return None
+
+
 def _schema_gate_apply_tooth(conn: duckdb.DuckDBPyConnection, sql_file: Path, version: int) -> None:
-    """Schema-gate Phase 1 apply tooth — WARN-ONLY by construction.
+    """Schema Moderator apply tooth (BUILD-SPEC-v2 §7.2) — WARN-ONLY until the held flip.
 
-    Consults core.schema_gate_pass: a DDL is "gate-passed" when a row exists for this
-    (version, sha256-of-file-content). If the gate-pass tables don't exist yet, or there
-    is no matching pass, we ONLY LOG A WARNING — we NEVER refuse the apply.
+    Authority: a DDL is "gate-passed" iff moderator.approval_ledger (Postgres) has a row for this
+    (ddl_version, sha256-of-file-content) with verdict pass/pass-with-warn. If Postgres is
+    unreachable (or psycopg/DSN absent — e.g. pre-P7), fall back to the DuckDB mirror
+    core.schema_gate_pass (kept fresh by entities/moderator_ledger_mirror.py). Degraded-but-safe:
+    the fallback is never bypass-open.
 
-    This is mandatory for Phase 1: the other 3 editors (Thomas/Darcy/David) author DDL
-    without running the gate today, and refusing their un-gated DDL would break the
-    nightly. Phase 2 (a separate Sam decision) flips the WARN to a hard refuse, gated on
-    the SCHEMA_GATE_ENFORCE_APPLY=1 env so the change is explicit and reversible.
+    On a miss we ONLY LOG (WARN-only) — we NEVER refuse — until SCHEMA_GATE_ENFORCE_APPLY=1 (the
+    Sam-gated flip, after a clean WARN/calibration week). Then a miss RAISES (refuses the apply).
+    Runs inside the writer flock with the apply, so record+apply are one critical section vs live.
 
-    Fully fail-safe: any error here is swallowed so the gate can never break an apply.
+    Fail-safe: any unexpected error is swallowed so the tooth can never break an apply in WARN mode;
+    an enforce-mode refusal propagates.
     """
     try:
-        have = conn.execute(
-            "SELECT 1 FROM information_schema.tables "
-            "WHERE table_schema='core' AND table_name='schema_gate_pass'"
-        ).fetchone()
-        if not have:
-            return  # gate not installed yet — nothing to check
         import hashlib
         sha = hashlib.sha256(sql_file.read_bytes()).hexdigest()
-        passed = conn.execute(
-            "SELECT verdict FROM core.schema_gate_pass WHERE version = ? AND content_sha256 = ?",
-            [version, sha],
-        ).fetchone()
         enforce = os.environ.get("SCHEMA_GATE_ENFORCE_APPLY", "0") == "1"
+
+        # 1) authoritative: the Postgres approval ledger.
+        passed = _ledger_pass_in_postgres(version, sha)
+        source = "postgres-ledger"
+        if passed is None:
+            # 2) fallback: the DuckDB mirror (degraded-but-safe).
+            source = "duckdb-mirror"
+            have = conn.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema='core' AND table_name='schema_gate_pass'").fetchone()
+            if not have:
+                # neither store available — nothing to check against.
+                if enforce:
+                    raise RuntimeError(
+                        f"schema-gate: no approval ledger reachable (Postgres + DuckDB mirror both "
+                        f"absent) for {sql_file.name} v{version} [SCHEMA_GATE_ENFORCE_APPLY=1 — REFUSING]")
+                return
+            row = conn.execute(
+                "SELECT verdict FROM core.schema_gate_pass WHERE version = ? AND content_sha256 = ?",
+                [version, sha]).fetchone()
+            passed = row is not None
+
         if passed:
             return  # gate-passed — apply proceeds
-        msg = (f"schema-gate: DDL {sql_file.name} (v{version}) has no recorded gate-pass "
-               f"for its current content (sha256={sha[:12]}…). Run "
-               f"`python scripts/schema_gate.py review --files {sql_file.name}` "
-               f"+ `record {sql_file.name}`.")
+
+        msg = (f"schema-gate: DDL {sql_file.name} (v{version}) has no recorded approval-ledger pass "
+               f"for its current content (sha256={sha[:12]}…, checked {source}). Run "
+               f"`python scripts/moderator_client.py loop --files <path>` to review + record.")
         if enforce:
-            # Phase 2 (explicit opt-in only). Phase 1 NEVER reaches here.
             raise RuntimeError(msg + " [SCHEMA_GATE_ENFORCE_APPLY=1 — REFUSING un-gated DDL]")
-        log.warning("%s [PHASE 1: WARN-ONLY — applying anyway]", msg)
+        log.warning("%s [WARN-ONLY — applying anyway]", msg)
     except RuntimeError:
         raise  # enforce-mode refusal must propagate
-    except Exception as exc:  # noqa: BLE001 — never let the tooth break an apply in Phase 1.
+    except Exception as exc:  # noqa: BLE001 — never let the tooth break an apply in WARN mode.
         log.warning("schema-gate apply tooth skipped (non-fatal): %s", exc)
 
 
