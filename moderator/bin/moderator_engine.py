@@ -401,7 +401,16 @@ _DEEP_TOOL = {
                 "severity": {"type": "string", "enum": ["block", "warn", "info"]},
                 "detail": {"type": "string"},
                 "table": {"type": "string"}, "column": {"type": "string"},
-                "fix": {"type": "string"}}, "required": ["severity", "detail"]}},
+                "fix": {"type": "string"},
+                "ambiguity": {"type": "string", "enum": ["unambiguous", "options"],
+                              "description": "unambiguous = ONE correct deterministic fix (auto-apply); "
+                                             "options = materially-different valid fixes — the SUBMITTING "
+                                             "HUMAN must choose; you must NOT pick. Default to 'options' "
+                                             "whenever judgement/intent is involved (expected most of the time)."},
+                "options": {"type": "array", "items": {"type": "string"},
+                            "description": "when ambiguity='options', the 2+ materially-different fixes to "
+                                           "present to the submitter to choose between."}},
+                "required": ["severity", "detail", "ambiguity"]}},
             "reasoning": {"type": "string"},
         },
         "required": ["verdict", "findings", "reasoning"],
@@ -417,7 +426,14 @@ _DEEP_SYSTEM = (
     "downstream effects across consumers. Be precise and conservative: BLOCK only for a real, "
     "explained break — never for style the floor already owns. Prefer pass-with-warnings to blocking "
     "when uncertain, but DO block a genuine silent-corruption or consumer-break risk. Always return "
-    "concrete fixes. Respond ONLY via the report_deep_review tool."
+    "concrete fixes. Respond ONLY via the report_deep_review tool.\n\n"
+    "AUTONOMY OF FIXES: for each finding set `ambiguity`. Use 'unambiguous' ONLY when there is exactly "
+    "ONE correct deterministic fix (e.g. a pure mechanical rename to the canonical name). Use 'options' "
+    "— and fill `options` with the 2+ materially-different valid fixes — whenever judgement or intent is "
+    "involved (which is MOST of the time: which canonical name, whether a change is a rename vs a new "
+    "column, what the down-migration should preserve). You MUST NOT choose between materially-different "
+    "options — the SUBMITTING human owns that judgement. Never defer to Sam; ambiguity goes to the person "
+    "doing the work."
 )
 
 
@@ -451,7 +467,10 @@ def llm_deep_review(ddl_files, py_files, floor_result) -> dict:
             "rule": "LLM", "tier": ("block" if x.get("severity") == "block" else x.get("severity", "warn")),
             "severity": {"block": "Error", "warn": "Warn", "info": "Info"}.get(x.get("severity"), "Warn"),
             "classification": "SEMANTIC", "table_name": x.get("table"), "column_name": x.get("column"),
-            "detail": x.get("detail", ""), "fix": {"kind": "llm", "steps": [x.get("fix", "")]},
+            "detail": x.get("detail", ""),
+            "fix": {"kind": "llm", "ambiguity": x.get("ambiguity", "options"),
+                    "steps": [x.get("fix", "")] if x.get("fix") else [],
+                    "options": x.get("options") or []},
             "consumers": [], "source": "llm",
         } for x in (payload.get("findings") or [])]
         return {"status": verdict, "findings": findings,
@@ -677,7 +696,196 @@ def decide_proposal(pid: int, decision: str, decided_by: str, edit: dict | None 
     raise ValueError("decision must be one of: promote | reject | snooze")
 
 
-def record_pass(ddl_files, py_files, actor, branch, request_id) -> dict:
+_CREATE_TABLE_RE = __import__("re").compile(r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<tbl>[\w.\"]+)", __import__("re").IGNORECASE)
+_CREATE_VIEW_RE = __import__("re").compile(r"\bCREATE\s+(?:OR\s+REPLACE\s+)?VIEW\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<v>[\w.\"]+)", __import__("re").IGNORECASE)
+
+
+def generate_down_migration(sql: str) -> tuple[str, bool]:
+    """Best-effort deterministic reverse of a forward DDL (§ Ledger -> rollback). Returns
+    (down_sql, fully_reversible). Reversible ops emit exact inverses; lossy ops (DROP/ALTER TYPE)
+    emit a commented marker pointing at the before-snapshot — never a silent wrong reverse. The
+    down is ADVISORY: a human reviews it before an actual rollback."""
+    lib = mc.engine()
+    created_raw = [m.group("tbl") for m in _CREATE_TABLE_RE.finditer(sql)]
+    created_view = [m.group("v") for m in _CREATE_VIEW_RE.finditer(sql)]
+    # unqualified names of created tables — ops on them are covered by the DROP TABLE (skip them).
+    created_unq = {lib.split_table_ref(t)[1] for t in created_raw}
+    lines: list[str] = ["-- AUTO-GENERATED best-effort reverse; REVIEW before applying."]
+    reversible = True
+    for op in lib.classify_ddl(sql):
+        t = op.table
+        _, t_unq = lib.split_table_ref(t)
+        if t_unq in created_unq:
+            continue  # table is created in this same migration; DROP TABLE below reverses it whole
+        if op.op == "add_column":
+            lines.append(f"ALTER TABLE {t} DROP COLUMN IF EXISTS {op.column};")
+        elif op.op == "rename_column":
+            lines.append(f"ALTER TABLE {t} RENAME COLUMN {op.new_name} TO {op.column};")
+        elif op.op == "rename_table":
+            # RENAME TO target must be UNQUALIFIED (can't move schemas); the subject is the new name.
+            lines.append(f"ALTER TABLE {op.new_name} RENAME TO {t_unq};")
+        elif op.op == "set_not_null":
+            lines.append(f"ALTER TABLE {t} ALTER COLUMN {op.column} DROP NOT NULL;")
+        elif op.op in ("drop_column", "drop_table"):
+            reversible = False
+            lines.append(f"-- IRREVERSIBLE: {op.op} {t}.{op.column or ''} drops data; restore from "
+                         f"before_ddl / the warehouse backup snapshot (catalog_version).")
+        elif op.op == "alter_type":
+            reversible = False
+            lines.append(f"-- MANUAL: ALTER TYPE on {t}.{op.column} — reverse needs the prior type "
+                         f"(see before_ddl).")
+    for t in created_raw:
+        lines.append(f"DROP TABLE IF EXISTS {t};")
+    for v in created_view:
+        lines.append(f"DROP VIEW IF EXISTS {v};")
+    return ("\n".join(lines), reversible)
+
+
+def _before_ddl_snapshot(ddl_files) -> str | None:
+    """Best-effort 'before' snapshot of the objects the change touches: their current column lists
+    from the live catalog. Degrades to None pre-substrate (catalog not built)."""
+    lib = mc.engine()
+    tables = set()
+    for f in ddl_files:
+        for op in lib.classify_ddl(f["content"]):
+            schema, tbl = lib.split_table_ref(op.table)
+            if tbl:
+                tables.add((schema, tbl))  # keep schema so same-named tables don't merge
+    if not tables:
+        return None
+    out = []
+    try:
+        with mc.duckdb_ro() as con:
+            for schema, tbl in sorted(tables):
+                try:
+                    rows = con.execute(
+                        "SELECT table_schema, column_name, data_type, is_nullable "
+                        "FROM core.schema_catalog WHERE lower(table_name)=lower(?) "
+                        "AND lower(table_schema)=lower(?) ORDER BY ordinal_position", [tbl, schema]).fetchall()
+                    if rows:
+                        cols = ", ".join(f"{r[1]} {r[2]}{'' if r[3] else ' NOT NULL'}" for r in rows)
+                        out.append(f"-- {rows[0][0]}.{tbl} BEFORE: {cols}")
+                except Exception:
+                    continue
+    except Exception:
+        return None
+    return "\n".join(out) or None
+
+
+# ── CORE self-improvement loops (§ Self-improvement): escape->rule, false-positive->relax ─────────
+def record_feedback(kind: str, detail: str, actor: str, ddl_file: str | None = None,
+                    evidence: dict | None = None) -> dict:
+    """Turn a gate ESCAPE (a break that got through) or a FALSE-POSITIVE (a human-overridden BLOCK)
+    into a rule_proposal, so the weekly ~10s human-confirm evolves the rules. escape -> propose a NEW
+    rule to catch the class; false_positive -> propose RELAXING the offending rule. Never auto-changes
+    a rule (still gated on the weekly confirm)."""
+    if kind not in ("escape", "false_positive"):
+        raise ValueError("kind must be 'escape' or 'false_positive'")
+    tag = "ESCAPE" if kind == "escape" else "FALSE-POSITIVE"
+    pattern = f"{tag}: {detail[:160]}"
+    if kind == "escape":
+        draft = {"kind": "note", "summary": f"A change ESCAPED the gate and broke something: {detail}. "
+                 "Propose a NEW rule/check to catch this class (edit the draft to an upsert_rules change to promote)."}
+    else:
+        draft = {"kind": "note", "summary": f"A human OVERRODE a BLOCK as a false positive: {detail}. "
+                 "Propose RELAXING the offending rule — soften its tier or add an exemplar/alias (edit to promote)."}
+    ev = evidence or {}
+    ev.update({"detail": detail, "ddl_file": ddl_file, "actor": actor, "origin": kind})
+    with mc.pg_conn() as c, c.cursor() as cur:
+        cur.execute("INSERT INTO moderator.rule_proposal (pattern, evidence, draft_rule) "
+                    "VALUES (%s,%s,%s) RETURNING proposal_id", (pattern, json.dumps(ev), json.dumps(draft)))
+        pid = cur.fetchone()[0]
+    mc.log_event("feedback_recorded", kind=kind, proposal_id=pid, actor=actor)
+    return {"proposal_id": pid, "kind": kind, "pattern": pattern}
+
+
+# ── Concurrency: serialized + QA-gated APPLY queue (§ Concurrency) ────────────────────────────────
+# REVIEW is parallel (stateless /review,/record-pass). APPLY is FIFO behind one advisory lock; each
+# item is RE-REVIEWED against the now-current catalog on dequeue (a prior apply may have moved the
+# schema), then [SUBSTRATE HOOK] applied to the warehouse + canary'd on a serving copy, green=commit/
+# red=rollback. Pre-substrate the physical apply is the nightly under the writer flock; this provides
+# the durable FIFO + re-review-on-dequeue. Items are claimed by a per-item atomic short transaction
+# (pooler-safe), NOT a session advisory lock (unreliable over the Supavisor transaction pooler).
+
+
+def enqueue_apply(ddl_files, actor, branch, request_id) -> dict:
+    enq = []
+    with mc.pg_conn() as c, c.cursor() as cur:
+        for f in ddl_files:
+            ver = _ddl_version_of(f["path"])
+            sha = hashlib.sha256(f["content"].encode("utf-8")).hexdigest()
+            try:
+                # dedup against LIVE (non-terminal) statuses — a re-enqueue while already in flight is a no-op;
+                # a committed/failed prior row does NOT block re-submitting the same content.
+                cur.execute(
+                    "INSERT INTO moderator.apply_queue (request_id, ddl_version, sql_file, "
+                    "content_sha256, content, actor, branch) "
+                    "SELECT %s,%s,%s,%s,%s,%s,%s WHERE NOT EXISTS ("
+                    "  SELECT 1 FROM moderator.apply_queue WHERE content_sha256=%s "
+                    "  AND status IN ('queued','reviewing','applying')) RETURNING queue_id",
+                    (request_id, ver, os.path.basename(f["path"]), sha, f["content"], actor, branch, sha))
+                row = cur.fetchone()
+                if row:
+                    enq.append({"queue_id": row[0], "sql_file": os.path.basename(f["path"]), "ddl_version": ver})
+            except Exception as e:
+                mc.log_event("enqueue_error", error=f"{type(e).__name__}: {e}", file=f["path"])
+    return {"enqueued": enq}
+
+
+def apply_queue_status(status: str = "all") -> list[dict]:
+    cols = ["queue_id", "request_id", "ddl_version", "sql_file", "actor", "status", "enqueued_at"]
+    with mc.pg_conn() as c, c.cursor() as cur:
+        cur.execute("SELECT queue_id, CAST(request_id AS text), ddl_version, sql_file, actor, status, "
+                    "CAST(enqueued_at AS text) FROM moderator.apply_queue "
+                    "WHERE (%s='all' OR status=%s) ORDER BY enqueued_at LIMIT 200", (status, status))
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def process_apply_queue(max_items: int = 10) -> dict:
+    """Drain the FIFO. Each item is CLAIMED atomically in a SHORT transaction (FOR UPDATE SKIP LOCKED
+    + flip to 'reviewing' — pooler-safe; no two processors take the same row), then RE-REVIEWED
+    against the CURRENT rules+catalog (never stale) OUTSIDE the claim txn (LLM latency is fine here),
+    then marked committed/failed in a short txn. The PHYSICAL warehouse apply + canary-on-serving-copy
+    is the SUBSTRATE HOOK; true single-applier serialization binds there on the warehouse writer flock.
+    Pre-substrate the nightly performs the physical apply against the now-ledgered, re-reviewed DDL.
+
+    Session-level advisory locks are NOT used: they don't serialize reliably over the Supavisor
+    transaction pooler (the backend can change between autocommit statements). The per-item atomic
+    claim is the correct pooler-safe primitive."""
+    processed = []
+    for _ in range(max_items):
+        claimed = None
+        with mc.pg_conn() as c:
+            with c.transaction():
+                with c.cursor() as cur:
+                    cur.execute("SELECT queue_id, content, sql_file, ddl_version, actor, branch, "
+                                "CAST(request_id AS text) FROM moderator.apply_queue "
+                                "WHERE status='queued' ORDER BY enqueued_at "
+                                "FOR UPDATE SKIP LOCKED LIMIT 1")
+                    row = cur.fetchone()
+                    if row:
+                        cur.execute("UPDATE moderator.apply_queue SET status='reviewing', "
+                                    "started_at=now() WHERE queue_id=%s", (row[0],))
+                        claimed = row
+        if not claimed:
+            break
+        qid, content, sql_file, ver, actor, branch, req = claimed
+        try:
+            rp = record_pass([{"path": sql_file or f"{ver or 0}_x.sql", "content": content}], [],
+                             actor, branch, req)
+            final = "failed" if (rp.get("rejected") or rp.get("verdict") == "block") else "committed"
+            result = {"verdict": rp.get("verdict"), "canary": "substrate-pending",
+                      "recorded": rp.get("recorded")}
+        except Exception as e:
+            final, result = "failed", {"error": f"{type(e).__name__}: {e}"}
+        with mc.pg_conn() as c, c.cursor() as cur:
+            cur.execute("UPDATE moderator.apply_queue SET status=%s, finished_at=now(), result=%s "
+                        "WHERE queue_id=%s", (final, json.dumps(result), qid))
+        processed.append({"queue_id": qid, "result": final, "verdict": result.get("verdict")})
+    return {"processed": processed}
+
+
+def record_pass(ddl_files, py_files, actor, branch, request_id, reason=None) -> dict:
     """Re-gate server-side against LIVE rules+catalog (incl. py contract + LLM), then write ONE
     content-hash-bound ledger row per ddl file IFF verdict != block. The ONLY way a pass enters
     moderator.approval_ledger."""
@@ -691,6 +899,8 @@ def record_pass(ddl_files, py_files, actor, branch, request_id) -> dict:
                 "detail": "server re-gate returned BLOCK — pass NOT recorded; fix and resubmit.",
                 **common}
     gate_version = mc.GATE_VERSION
+    catalog_version = result.get("catalog_snapshot_id")
+    before_ddl = _before_ddl_snapshot(ddl_files)  # rollback restore reference (None pre-substrate)
     recorded = []
     with mc.pg_conn() as c, c.cursor() as cur:
         for f in ddl_files:
@@ -698,14 +908,17 @@ def record_pass(ddl_files, py_files, actor, branch, request_id) -> dict:
             if ver is None:
                 continue
             sha = hashlib.sha256(f["content"].encode("utf-8")).hexdigest()
+            down_migration, _reversible = generate_down_migration(f["content"])
             try:
                 cur.execute(
                     "INSERT INTO moderator.approval_ledger (ddl_version, sql_file, content_sha256, "
-                    "verdict, rules_version, gate_version, findings, actor, branch, request_id) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                    "verdict, rules_version, gate_version, findings, actor, branch, request_id, "
+                    "before_ddl, down_migration, reason, catalog_version) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
                     "ON CONFLICT (ddl_version, content_sha256) DO NOTHING",
                     [ver, os.path.basename(f["path"]), sha, result["verdict"], rv, gate_version,
-                     json.dumps(result["findings"]), actor, branch, request_id])
+                     json.dumps(result["findings"]), actor, branch, request_id,
+                     before_ddl, down_migration, reason, catalog_version])
                 recorded.append({"ddl_version": ver, "sql_file": os.path.basename(f["path"]),
                                  "content_sha256": sha, "verdict": result["verdict"],
                                  "new": cur.rowcount == 1})  # False = already in ledger (idempotent)

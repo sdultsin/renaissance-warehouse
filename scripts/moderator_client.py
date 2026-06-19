@@ -152,8 +152,14 @@ def _print_checklist(result: dict) -> None:
         print(f"  [{tag}] {f.get('rule','?'):<5} {f.get('detail','')}")
         fix = f.get("fix") or {}
         if fix.get("kind") and fix["kind"] not in ("none",):
-            steps = fix.get("steps") or []
-            print(f"         fix[{fix['kind']}]: " + (" | ".join(s for s in steps if s) or "see detail"))
+            if fix.get("ambiguity") == "options" and fix.get("options"):
+                print("         CHOOSE one (YOU decide — the gate won't pick between these):")
+                for i, opt in enumerate(fix["options"], 1):
+                    print(f"            {i}. {opt}")
+            else:
+                steps = fix.get("steps") or []
+                print(f"         fix[{fix['kind']}]: "
+                      + (" | ".join(s for s in steps if s) or "see detail"))
     if result.get("llm_reasoning"):
         print(f"  LLM: {result['llm_reasoning'][:400]}")
     print("-" * 74)
@@ -288,6 +294,32 @@ def cmd_proposals_detect(args) -> int:
     return 0
 
 
+def cmd_feedback(args) -> int:
+    body = {"kind": args.kind, "detail": args.detail, "ddl_file": args.ddl_file}
+    print(json.dumps(_req("POST", "/feedback", body), indent=2))
+    return 0
+
+
+def cmd_apply_enqueue(args) -> int:
+    ddl, _ = _payload(_select(args))
+    if not ddl:
+        print("no DDL files to enqueue.")
+        return 0
+    body = {"ddl_files": ddl, "actor": os.environ.get("USER", "?"), "branch": _branch()}
+    print(json.dumps(_req("POST", "/apply/enqueue", body), indent=2))
+    return 0
+
+
+def cmd_apply_queue(args) -> int:
+    print(json.dumps(_req("GET", "/apply/queue", params={"status": args.status}), indent=2))
+    return 0
+
+
+def cmd_apply_process(args) -> int:
+    print(json.dumps(_req("POST", "/apply/process", {}), indent=2))
+    return 0
+
+
 def cmd_simple(args, path) -> int:
     params = {}
     if path == "/issues":
@@ -331,6 +363,13 @@ def main(argv=None) -> int:
     pd.add_argument("--id", type=int, required=True)
     pd.add_argument("--decision", required=True, choices=["promote", "reject", "snooze"])
     pd.add_argument("--edit", help="JSON publish_rules change to apply on promote")
+    fb = sub.add_parser("feedback")
+    fb.add_argument("--kind", required=True, choices=["escape", "false_positive"])
+    fb.add_argument("--detail", required=True)
+    fb.add_argument("--ddl-file", dest="ddl_file")
+    ae = sub.add_parser("apply-enqueue"); ae.add_argument("--files", nargs="*"); ae.add_argument("--staged", action="store_true")
+    aq = sub.add_parser("apply-queue"); aq.add_argument("--status", default="all")
+    sub.add_parser("apply-process")
     args = p.parse_args(argv)
     if args.cmd == "review":
         return cmd_review(args)
@@ -346,6 +385,14 @@ def main(argv=None) -> int:
         return cmd_proposals_detect(args)
     if args.cmd == "proposals-decide":
         return cmd_proposals_decide(args)
+    if args.cmd == "feedback":
+        return cmd_feedback(args)
+    if args.cmd == "apply-enqueue":
+        return cmd_apply_enqueue(args)
+    if args.cmd == "apply-queue":
+        return cmd_apply_queue(args)
+    if args.cmd == "apply-process":
+        return cmd_apply_process(args)
     return cmd_simple(args, "/" + args.cmd)
 
 

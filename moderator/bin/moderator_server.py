@@ -176,7 +176,8 @@ async def record_pass(request):
     request_id = body.get("request_id") or str(uuid.uuid4())
     actor = _actor(request, body)
     try:
-        out = eng.record_pass(ddl_files, py_files, actor, body.get("branch"), request_id)
+        out = eng.record_pass(ddl_files, py_files, actor, body.get("branch"), request_id,
+                              reason=body.get("reason"))
         mc.log_event("record_pass", request_id=request_id, actor=actor, verdict=out["verdict"],
                      recorded=len(out["recorded"]), rejected=out["rejected"])
         return JSONResponse({"request_id": request_id, **out},
@@ -351,6 +352,52 @@ async def decide_proposal(request):
         return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=400)
 
 
+# POST /feedback (editor) — CORE self-improvement: escape->rule / false_positive->relax.
+async def feedback(request):
+    deny = require_scope(request, "editor")
+    if deny is not None:
+        return deny
+    body = await _json_body(request)
+    try:
+        out = eng.record_feedback(body["kind"], body.get("detail", ""), _actor(request, body),
+                                  ddl_file=body.get("ddl_file"), evidence=body.get("evidence"))
+        return JSONResponse(out)
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
+# POST /apply/enqueue (editor) — add to the serialized apply FIFO. GET /apply/queue (reader) — status.
+# POST /apply/process (admin) — drain the queue under the apply-lock, re-reviewing each on dequeue.
+async def apply_enqueue(request):
+    deny = require_scope(request, "editor")
+    if deny is not None:
+        return deny
+    body = await _json_body(request)
+    ddl_files = body.get("ddl_files") or []
+    if not ddl_files:
+        return JSONResponse({"error": "apply/enqueue requires ddl_files"}, status_code=400)
+    rid = body.get("request_id") or str(uuid.uuid4())
+    return JSONResponse({"request_id": rid,
+                         **eng.enqueue_apply(ddl_files, _actor(request, body), body.get("branch"), rid)})
+
+
+async def apply_queue(request):
+    deny = require_scope(request, "reader")
+    if deny is not None:
+        return deny
+    return JSONResponse({"queue": eng.apply_queue_status(request.query_params.get("status", "all"))})
+
+
+async def apply_process(request):
+    deny = require_scope(request, "admin")
+    if deny is not None:
+        return deny
+    body = await _json_body(request)
+    out = eng.process_apply_queue(max_items=int(body.get("max_items", 10)))
+    mc.log_event("apply_process", **{k: (v if not isinstance(v, list) else len(v)) for k, v in out.items()})
+    return JSONResponse(out)
+
+
 # ── routes ──────────────────────────────────────────────────────────────────────────────────────
 ROUTES = [
     Route("/healthz", healthz, methods=["GET"]),
@@ -365,6 +412,10 @@ ROUTES = [
     Route("/proposals", get_proposals, methods=["GET"]),
     Route("/proposals/detect", detect_proposals, methods=["POST"]),
     Route("/proposals/decide", decide_proposal, methods=["POST"]),
+    Route("/feedback", feedback, methods=["POST"]),
+    Route("/apply/enqueue", apply_enqueue, methods=["POST"]),
+    Route("/apply/queue", apply_queue, methods=["GET"]),
+    Route("/apply/process", apply_process, methods=["POST"]),
 ]
 
 
