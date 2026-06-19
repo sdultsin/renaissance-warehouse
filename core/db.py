@@ -153,6 +153,116 @@ def ensure_schema(conn: duckdb.DuckDBPyConnection, schema: str) -> None:
     conn.execute(f"CREATE SCHEMA IF NOT EXISTS {schema}")
 
 
+def _moderator_ledger_dsn() -> str | None:
+    """Resolve the pipeline-Supabase DSN for the moderator approval ledger. Env first, then the
+    repo .env (the nightly may not export it into os.environ). None if unresolvable."""
+    dsn = os.environ.get("MODERATOR_PG_DSN") or os.environ.get("PIPELINE_SUPABASE_DB_URL")
+    if dsn:
+        return dsn
+    try:
+        from core.config import REPO_ROOT
+        envf = REPO_ROOT / ".env"
+        if envf.exists():
+            for line in envf.read_text().splitlines():
+                line = line.strip()
+                for key in ("MODERATOR_PG_DSN=", "PIPELINE_SUPABASE_DB_URL="):
+                    if line.startswith(key):
+                        return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        pass
+    return None
+
+
+_PG_LEDGER_DOWN = False  # process-level latch: one failed attempt -> skip PG for the rest of this
+                         # run (avoids paying connect_timeout once per DDL inside the writer flock).
+
+
+def _ledger_pass_in_postgres(version: int, sha: str) -> bool | None:
+    """Authoritative check against moderator.approval_ledger (pipeline project, Supavisor 6543).
+    Returns True/False if Postgres is reachable and answered, or None (psycopg missing / DSN
+    missing / network error) so the caller falls back to the DuckDB mirror (degraded-but-safe)."""
+    global _PG_LEDGER_DOWN
+    if _PG_LEDGER_DOWN:
+        return None
+    dsn = _moderator_ledger_dsn()
+    if not dsn:
+        return None
+    try:
+        import psycopg  # absent in the nightly venv until P7 — then this path goes live
+    except Exception:
+        _PG_LEDGER_DOWN = True  # psycopg not installed here — don't re-probe every DDL
+        return None
+    try:
+        with psycopg.connect(dsn, connect_timeout=5, prepare_threshold=None) as c, c.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM moderator.approval_ledger "
+                "WHERE ddl_version=%s AND content_sha256=%s "
+                "AND verdict IN ('pass','pass-with-warn') LIMIT 1", (version, sha))
+            return cur.fetchone() is not None
+    except Exception as exc:  # network blip / auth — never hard-fail; fall back to the mirror.
+        _PG_LEDGER_DOWN = True  # latch: subsequent DDLs this run skip straight to the mirror
+        log.warning("schema-gate: moderator.approval_ledger unreachable (%s) — using DuckDB mirror "
+                    "for the rest of this run", exc)
+        return None
+
+
+def _schema_gate_apply_tooth(conn: duckdb.DuckDBPyConnection, sql_file: Path, version: int) -> None:
+    """Schema Moderator apply tooth (BUILD-SPEC-v2 §7.2) — WARN-ONLY until the held flip.
+
+    Authority: a DDL is "gate-passed" iff moderator.approval_ledger (Postgres) has a row for this
+    (ddl_version, sha256-of-file-content) with verdict pass/pass-with-warn. If Postgres is
+    unreachable (or psycopg/DSN absent — e.g. pre-P7), fall back to the DuckDB mirror
+    core.schema_gate_pass (kept fresh by entities/moderator_ledger_mirror.py). Degraded-but-safe:
+    the fallback is never bypass-open.
+
+    On a miss we ONLY LOG (WARN-only) — we NEVER refuse — until SCHEMA_GATE_ENFORCE_APPLY=1 (the
+    Sam-gated flip, after a clean WARN/calibration week). Then a miss RAISES (refuses the apply).
+    Runs inside the writer flock with the apply, so record+apply are one critical section vs live.
+
+    Fail-safe: any unexpected error is swallowed so the tooth can never break an apply in WARN mode;
+    an enforce-mode refusal propagates.
+    """
+    try:
+        import hashlib
+        sha = hashlib.sha256(sql_file.read_bytes()).hexdigest()
+        enforce = os.environ.get("SCHEMA_GATE_ENFORCE_APPLY", "0") == "1"
+
+        # 1) authoritative: the Postgres approval ledger.
+        passed = _ledger_pass_in_postgres(version, sha)
+        source = "postgres-ledger"
+        if passed is None:
+            # 2) fallback: the DuckDB mirror (degraded-but-safe).
+            source = "duckdb-mirror"
+            have = conn.execute(
+                "SELECT 1 FROM information_schema.tables "
+                "WHERE table_schema='core' AND table_name='schema_gate_pass'").fetchone()
+            if not have:
+                # neither store available — nothing to check against.
+                if enforce:
+                    raise RuntimeError(
+                        f"schema-gate: no approval ledger reachable (Postgres + DuckDB mirror both "
+                        f"absent) for {sql_file.name} v{version} [SCHEMA_GATE_ENFORCE_APPLY=1 — REFUSING]")
+                return
+            row = conn.execute(
+                "SELECT 1 FROM core.schema_gate_pass WHERE version = ? AND content_sha256 = ? "
+                "AND verdict IN ('pass','pass-with-warn')", [version, sha]).fetchone()
+            passed = row is not None  # verdict-filtered to match the authoritative Postgres path
+
+        if passed:
+            return  # gate-passed — apply proceeds
+
+        msg = (f"schema-gate: DDL {sql_file.name} (v{version}) has no recorded approval-ledger pass "
+               f"for its current content (sha256={sha[:12]}…, checked {source}). Run "
+               f"`python scripts/moderator_client.py loop --files <path>` to review + record.")
+        if enforce:
+            raise RuntimeError(msg + " [SCHEMA_GATE_ENFORCE_APPLY=1 — REFUSING un-gated DDL]")
+        log.warning("%s [WARN-ONLY — applying anyway]", msg)
+    except RuntimeError:
+        raise  # enforce-mode refusal must propagate
+    except Exception as exc:  # noqa: BLE001 — never let the tooth break an apply in WARN mode.
+        log.warning("schema-gate apply tooth skipped (non-fatal): %s", exc)
+
+
 def apply_ddl_file(conn: duckdb.DuckDBPyConnection, sql_file: Path, version: int) -> bool:
     """Apply a DDL file if not already applied. Returns True if newly applied.
 
@@ -173,6 +283,9 @@ def apply_ddl_file(conn: duckdb.DuckDBPyConnection, sql_file: Path, version: int
     ).fetchone()
     if existing:
         return False
+    # Schema-gate apply tooth (Phase 1: WARN-ONLY — logs but never refuses). Runs inside
+    # the writer flock with the apply, so review+apply are one critical section vs live.
+    _schema_gate_apply_tooth(conn, sql_file, version)
     sql = sql_file.read_text()
     conn.execute("BEGIN")
     try:

@@ -1,0 +1,48 @@
+name: moderator-gate
+# Schema Moderator CI gate (BUILD-SPEC-v2 §7.2). On a PR touching DDL / entity / sync code, it
+# POSTs each changed sql/ddl/*.sql to the moderator /review (the single authority) and verifies a
+# matching approval_ledger row exists for the head content hash. GitHub Actions reaches both the
+# Tailscale Funnel and Supabase. ADVISORY by default (held WARN week); set repo variable
+# MODERATOR_CI_ENFORCE=1 at P8 to make a block / missing-pass FAIL the PR.
+
+on:
+  pull_request:
+    paths:
+      - 'sql/ddl/**'
+      - 'entities/**'
+      - 'sources/**'
+      - 'scripts/**'
+
+jobs:
+  moderator-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # need the base..head range to diff changed files
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Compute changed DDL / entity / sync files
+        id: changed
+        run: |
+          BASE="origin/${{ github.base_ref }}"
+          git fetch origin "${{ github.base_ref }}" --depth=1 || true
+          FILES=$(git diff --name-only "$BASE"...HEAD -- 'sql/ddl/**' 'entities/**' 'sources/**' 'scripts/**' | grep -E '\.(sql|py)$' | tr '\n' ' ')
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+          echo "changed: $FILES"
+
+      - name: Schema Moderator review + ledger-presence check
+        if: steps.changed.outputs.files != ''
+        env:
+          MODERATOR_API_URL: ${{ secrets.MODERATOR_API_URL }}
+          MODERATOR_API_TOKEN: ${{ secrets.MODERATOR_API_TOKEN }}
+          MODERATOR_CI_ENFORCE: ${{ vars.MODERATOR_CI_ENFORCE }}
+        run: |
+          if [ -z "${MODERATOR_API_TOKEN:-}" ]; then
+            echo "::warning::MODERATOR_API_TOKEN secret not configured — skipping the moderator gate."
+            exit 0
+          fi
+          python scripts/moderator_client.py ci --files ${{ steps.changed.outputs.files }}

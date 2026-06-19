@@ -1,0 +1,10 @@
+[Unit]
+Description=Schema Moderator weekly rule-proposal detection (BUILD-SPEC-v2 §8)
+After=network.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/moderator/bin
+EnvironmentFile=/opt/moderator/moderator.env
+ExecStart=/opt/duckdb/venv/bin/python /opt/moderator/bin/detect_proposals_job.py
+User=root

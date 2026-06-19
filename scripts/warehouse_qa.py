@@ -220,7 +220,109 @@ def run_checks(con) -> tuple[list[str], list[str]]:
     except Exception as exc:  # noqa: BLE001
         warns.append(f"FAITHFULNESS: check errored ({exc})")
 
+    # 5. Schema-gate graft B (Phase 1: WARN-ONLY). Two backstops:
+    #   5a. catalog drift — core.schema_catalog (rebuilt nightly by schema_manifest) must
+    #       match live information_schema. A gap = the manifest didn't run or a column
+    #       changed mid-day. WARN-only so the gate never fails the nightly in Phase 1.
+    #   5b. entity-INSERT contract — every column an entity's explicit INSERT names must
+    #       exist in the live catalog. A miss = a sync writes a column the schema doesn't
+    #       have (a rename/typo drift that would silently break a sync). WARN-only.
+    warns += _schema_gate_checks(con)
+
     return fails, warns
+
+
+def _schema_gate_checks(con) -> list[str]:
+    """Graft B — catalog-vs-live drift + entity-INSERT contract. WARN-only (Phase 1)."""
+    out: list[str] = []
+    # 5a. Catalog drift.
+    try:
+        if _exists(con, "core.schema_catalog"):
+            # columns live in information_schema but missing/absent in the active catalog
+            missing = con.execute(
+                """
+                SELECT count(*) FROM information_schema.columns c
+                WHERE c.table_schema IN ('main','core','derived','raw')
+                  AND NOT EXISTS (
+                    SELECT 1 FROM core.schema_catalog sc
+                    WHERE sc.table_schema=c.table_schema AND sc.table_name=c.table_name
+                      AND sc.column_name=c.column_name AND sc.status='active')
+                """
+            ).fetchone()[0]
+            # columns the catalog still calls active but that no longer exist live
+            stale = con.execute(
+                """
+                SELECT count(*) FROM core.schema_catalog sc
+                WHERE sc.status='active'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM information_schema.columns c
+                    WHERE c.table_schema=sc.table_schema AND c.table_name=sc.table_name
+                      AND c.column_name=sc.column_name)
+                """
+            ).fetchone()[0]
+            if missing or stale:
+                out.append(
+                    f"SCHEMA-DRIFT: catalog vs live mismatch — {missing} live column(s) not in "
+                    f"active catalog, {stale} catalog column(s) gone from live "
+                    f"(schema_manifest should rebuild nightly).")
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"SCHEMA-DRIFT: check errored ({exc})")
+
+    # 5b. Entity-INSERT contract — explicit INSERT column lists must exist in live schema.
+    try:
+        import ast as _ast
+        from pathlib import Path as _Path
+        try:
+            from core import schema_gate_lib as _lib
+        except Exception:
+            _lib = None
+        if _lib is not None:
+            live_cols = {
+                c.lower() for (c,) in con.execute(
+                    "SELECT DISTINCT column_name FROM information_schema.columns "
+                    "WHERE table_schema IN ('main','core','derived','raw')"
+                ).fetchall()
+            }
+            ent_dir = REPO_ROOT / "entities"
+            offenders = 0
+            for f in sorted(ent_dir.glob("*.py")):
+                if f.name.startswith("_"):
+                    continue
+                try:
+                    literals, ok = _lib.extract_sql_from_python(f.read_text())
+                except Exception:
+                    continue
+                if not ok:
+                    continue
+                for litobj in literals:
+                    if litobj.dynamic:
+                        continue
+                    low = litobj.text.lower()
+                    if "insert into" not in low or "(" not in litobj.text:
+                        continue
+                    cols, clean = _lib.columns_referenced_q(litobj.text)
+                    if not clean:
+                        continue  # regex-skim fallback over-counts (table names/keywords) — skip
+                    unknown = {
+                        c for c in cols
+                        if c.isidentifier() and len(c) > 2 and not c.startswith("_")
+                        and c not in live_cols
+                        and c not in ("select", "insert", "update", "from", "where",
+                                      "into", "values", "table", "core", "derived",
+                                      "raw", "main", "true", "false", "null")
+                    }
+                    if unknown:
+                        offenders += 1
+                        sample = ", ".join(sorted(unknown)[:4])
+                        out.append(
+                            f"CONTRACT: {f.name}:{litobj.line} INSERT names column(s) not in live "
+                            f"schema: {sample} (rename/typo drift, or DDL not shipped yet).")
+                        if offenders >= 8:
+                            out.append("CONTRACT: (more entity-contract findings suppressed)")
+                            return out
+    except Exception as exc:  # noqa: BLE001
+        out.append(f"CONTRACT: entity-contract check errored ({exc})")
+    return out
 
 
 def main(argv: list[str] | None = None) -> int:

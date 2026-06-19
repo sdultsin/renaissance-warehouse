@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Schema-gate pre-commit hook — the "review agent" author-time backstop (BUILD-SPEC-v2 §3.3/§7.2).
+#
+# Calls the Schema Moderator SERVICE (the single authority) on any staged sql/ddl/*.sql or
+# entities|sources|scripts/*.py change and prints the checklist. The service is /review-ONLY here
+# (a backstop) — recording a pass + applying are the explicit `moderator_client.py loop`/`record`
+# flow and the apply tooth, not the commit. If the service is unreachable, it falls back to the
+# local phase-1 engine (scripts/schema_gate.py) so the hook still reviews offline.
+#
+# ############################################################################
+# # WARN-ONLY: this hook NEVER blocks a commit. It exits 0 unless            #
+# # SCHEMA_GATE_BLOCK=1 is explicitly set (the later Sam-gated flip). So     #
+# # Thomas/Sam/Darcy/David commit exactly as before — they see the checklist.#
+# ############################################################################
+#
+# Wired via `git config core.hooksPath .githooks` (scripts/install_schema_gate_hook.sh).
+# Skip once: `git commit --no-verify`.
+
+set -uo pipefail
+REPO_DIR="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+cd "$REPO_DIR" || exit 0
+
+if [[ -x .venv/bin/python ]]; then PY=".venv/bin/python"; else PY="$(command -v python3 || command -v python || echo python3)"; fi
+
+STAGED="$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)"
+if ! echo "$STAGED" | grep -Eq '^(sql/ddl/.*\.sql|(entities|sources|scripts)/.*\.py)$'; then
+  exit 0
+fi
+
+echo "── schema moderator (WARN-ONLY backstop; never blocks) ──"
+GATE_RC=0
+# Prefer the SERVICE (catalog + LLM deep-review). --block makes the client exit 1 on a block
+# verdict and 2 on a transport/service error; we only honor a block under SCHEMA_GATE_BLOCK=1.
+if "$PY" scripts/moderator_client.py review --staged --block; then
+  GATE_RC=0
+else
+  RC=$?
+  if [[ "$RC" -eq 2 ]]; then
+    echo "  (moderator service unreachable — falling back to local phase-1 engine)"
+    "$PY" scripts/schema_gate.py review --staged || true
+    GATE_RC=0
+  else
+    GATE_RC="$RC"   # 1 = a real block verdict from the service
+  fi
+fi
+
+if [[ "${SCHEMA_GATE_BLOCK:-0}" == "1" && "$GATE_RC" -ne 0 ]]; then
+  echo "schema-moderator: BLOCKING (SCHEMA_GATE_BLOCK=1). Fix findings or commit with --no-verify."
+  exit 1
+fi
+exit 0
