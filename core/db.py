@@ -173,26 +173,36 @@ def _moderator_ledger_dsn() -> str | None:
     return None
 
 
+_PG_LEDGER_DOWN = False  # process-level latch: one failed attempt -> skip PG for the rest of this
+                         # run (avoids paying connect_timeout once per DDL inside the writer flock).
+
+
 def _ledger_pass_in_postgres(version: int, sha: str) -> bool | None:
     """Authoritative check against moderator.approval_ledger (pipeline project, Supavisor 6543).
     Returns True/False if Postgres is reachable and answered, or None (psycopg missing / DSN
     missing / network error) so the caller falls back to the DuckDB mirror (degraded-but-safe)."""
+    global _PG_LEDGER_DOWN
+    if _PG_LEDGER_DOWN:
+        return None
     dsn = _moderator_ledger_dsn()
     if not dsn:
         return None
     try:
         import psycopg  # absent in the nightly venv until P7 — then this path goes live
     except Exception:
+        _PG_LEDGER_DOWN = True  # psycopg not installed here — don't re-probe every DDL
         return None
     try:
-        with psycopg.connect(dsn, connect_timeout=8, prepare_threshold=None) as c, c.cursor() as cur:
+        with psycopg.connect(dsn, connect_timeout=5, prepare_threshold=None) as c, c.cursor() as cur:
             cur.execute(
                 "SELECT 1 FROM moderator.approval_ledger "
                 "WHERE ddl_version=%s AND content_sha256=%s "
                 "AND verdict IN ('pass','pass-with-warn') LIMIT 1", (version, sha))
             return cur.fetchone() is not None
     except Exception as exc:  # network blip / auth — never hard-fail; fall back to the mirror.
-        log.warning("schema-gate: moderator.approval_ledger unreachable (%s) — using DuckDB mirror", exc)
+        _PG_LEDGER_DOWN = True  # latch: subsequent DDLs this run skip straight to the mirror
+        log.warning("schema-gate: moderator.approval_ledger unreachable (%s) — using DuckDB mirror "
+                    "for the rest of this run", exc)
         return None
 
 
@@ -234,9 +244,9 @@ def _schema_gate_apply_tooth(conn: duckdb.DuckDBPyConnection, sql_file: Path, ve
                         f"absent) for {sql_file.name} v{version} [SCHEMA_GATE_ENFORCE_APPLY=1 — REFUSING]")
                 return
             row = conn.execute(
-                "SELECT verdict FROM core.schema_gate_pass WHERE version = ? AND content_sha256 = ?",
-                [version, sha]).fetchone()
-            passed = row is not None
+                "SELECT 1 FROM core.schema_gate_pass WHERE version = ? AND content_sha256 = ? "
+                "AND verdict IN ('pass','pass-with-warn')", [version, sha]).fetchone()
+            passed = row is not None  # verdict-filtered to match the authoritative Postgres path
 
         if passed:
             return  # gate-passed — apply proceeds

@@ -51,9 +51,12 @@ class PathPrefixStrip:
                 new_path = path[len(self.prefix):] or "/"
                 scope = dict(scope)
                 scope["path"] = new_path
-                if scope.get("raw_path"):
-                    # raw_path excludes the query string; re-encode the stripped path.
-                    scope["raw_path"] = new_path.encode("ascii", "ignore")
+                # Strip the prefix from raw_path at the BYTE level (don't re-encode the decoded
+                # path — that would drop non-ASCII / mangle percent-encoded segments).
+                raw = scope.get("raw_path")
+                if raw:
+                    pref = self.prefix.encode()
+                    scope["raw_path"] = raw[len(pref):] or b"/" if raw.startswith(pref) else new_path.encode()
         await self.app(scope, receive, send)
 
 
@@ -167,12 +170,13 @@ async def record_pass(request):
         return deny
     body = await _json_body(request)
     ddl_files = body.get("ddl_files") or []
+    py_files = body.get("py_files") or []
     if not ddl_files:
         return JSONResponse({"error": "record-pass requires ddl_files:[{path,content}]"}, status_code=400)
     request_id = body.get("request_id") or str(uuid.uuid4())
     actor = _actor(request, body)
     try:
-        out = eng.record_pass(ddl_files, actor, body.get("branch"), request_id)
+        out = eng.record_pass(ddl_files, py_files, actor, body.get("branch"), request_id)
         mc.log_event("record_pass", request_id=request_id, actor=actor, verdict=out["verdict"],
                      recorded=len(out["recorded"]), rejected=out["rejected"])
         return JSONResponse({"request_id": request_id, **out},

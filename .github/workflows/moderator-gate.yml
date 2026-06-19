@@ -30,7 +30,7 @@ jobs:
         run: |
           BASE="origin/${{ github.base_ref }}"
           git fetch origin "${{ github.base_ref }}" --depth=1 || true
-          FILES=$(git diff --name-only "$BASE"...HEAD -- 'sql/ddl/*.sql' 'entities/*.py' 'sources/*.py' 'scripts/*.py' | tr '\n' ' ')
+          FILES=$(git diff --name-only "$BASE"...HEAD -- 'sql/ddl/**' 'entities/**' 'sources/**' 'scripts/**' | grep -E '\.(sql|py)$' | tr '\n' ' ')
           echo "files=$FILES" >> "$GITHUB_OUTPUT"
           echo "changed: $FILES"
 

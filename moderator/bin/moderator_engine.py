@@ -163,6 +163,22 @@ def resolve_consumers(con, table: str | None, column: str | None) -> list[str]:
     return sorted(set(out))
 
 
+def resolve_table_consumers(con, table: str | None) -> list[str]:
+    """Consumers of ANY column of `table` — used for DROP TABLE / RENAME TABLE (where there is no
+    single column). Without this, a table-level op resolves zero consumers and the breaking-change
+    rule never fires."""
+    if con is None or not table:
+        return []
+    try:
+        rows = con.execute(
+            "SELECT consumer_file, consumer_line, confidence FROM core.schema_consumers "
+            "WHERE lower(table_name)=lower(?) AND NOT rename_resilient", [table]).fetchall()
+    except Exception:
+        return []
+    out = [f"{f}:{ln} ({conf})" if ln else f"{f} ({conf})" for f, ln, conf in rows]
+    return sorted(set(out))
+
+
 # ── per-op facts (the fixed predicate vocabulary the rule rows reference) ─────────────────────────
 def _op_facts(lib, op, aliases, canonical, allcols, con) -> dict:
     schema, tbl = lib.split_table_ref(op.table)
@@ -170,9 +186,13 @@ def _op_facts(lib, op, aliases, canonical, allcols, con) -> dict:
     naming = lib.naming_findings(op.table, col) if op.op == "add_column" else []
     extra = (op.extra or "").lower()
     consumers = []
-    if op.op in ("drop_column", "drop_table", "rename_column", "rename_table"):
-        consumers = resolve_consumers(con, tbl, col or tbl)
-    dupe = lib.alias_dupe_finding(op.table, col, aliases, canonical) if op.op == "add_column" else None
+    if op.op in ("drop_column", "rename_column"):
+        consumers = resolve_consumers(con, tbl, col)
+    elif op.op in ("drop_table", "rename_table"):
+        consumers = resolve_table_consumers(con, tbl)  # any column of the table, not the table-as-column
+    # alias dupe: look up with a lowercased column so a mixed-case synonym (Email_Address) is caught.
+    dupe = (lib.alias_dupe_finding(op.table, (col or "").lower(), aliases, canonical)
+            if op.op == "add_column" else None)
     return {
         "op": op.op, "classification": op.classification,
         "schema": schema, "table": tbl, "column": col, "new_name": op.new_name,
@@ -232,7 +252,7 @@ def floor_review(ddl_files: list[dict], py_files: list[dict]) -> dict:
     py_has_sql = False
     con = None
     try:
-        con = mc.duckdb_ro().__enter__()
+        con = mc.duckdb_ro_open()
     except Exception:
         con = None
     try:
@@ -454,7 +474,7 @@ def _deep_prompt(ddl_files, py_files, floor_result) -> str:
     ctx_lines = []
     con = None
     try:
-        con = mc.duckdb_ro().__enter__()
+        con = mc.duckdb_ro_open()
     except Exception:
         con = None
     try:
@@ -657,15 +677,19 @@ def decide_proposal(pid: int, decision: str, decided_by: str, edit: dict | None 
     raise ValueError("decision must be one of: promote | reject | snooze")
 
 
-def record_pass(ddl_files, actor, branch, request_id) -> dict:
-    """Re-gate server-side against LIVE rules+catalog, then write ONE content-hash-bound ledger row
-    per ddl file IFF verdict != block. The ONLY way a pass enters moderator.approval_ledger."""
-    result = review(ddl_files, py_files=[])
+def record_pass(ddl_files, py_files, actor, branch, request_id) -> dict:
+    """Re-gate server-side against LIVE rules+catalog (incl. py contract + LLM), then write ONE
+    content-hash-bound ledger row per ddl file IFF verdict != block. The ONLY way a pass enters
+    moderator.approval_ledger."""
+    result = review(ddl_files, py_files or [])
     rv = result["rules_version"]
+    common = {"verdict": result["verdict"], "rules_version": rv, "findings": result["findings"],
+              "floor_verdict": result["floor_verdict"], "llm_status": result["llm_status"],
+              "llm_reasoning": result["llm_reasoning"], "catalog_snapshot_id": result["catalog_snapshot_id"]}
     if result["verdict"] == "block":
-        return {"recorded": [], "rejected": True, "verdict": "block",
-                "rules_version": rv, "findings": result["findings"],
-                "detail": "server re-gate returned BLOCK — pass NOT recorded; fix and resubmit."}
+        return {"recorded": [], "rejected": True,
+                "detail": "server re-gate returned BLOCK — pass NOT recorded; fix and resubmit.",
+                **common}
     gate_version = mc.GATE_VERSION
     recorded = []
     with mc.pg_conn() as c, c.cursor() as cur:
@@ -687,5 +711,4 @@ def record_pass(ddl_files, actor, branch, request_id) -> dict:
                                  "new": cur.rowcount == 1})  # False = already in ledger (idempotent)
             except Exception as e:
                 mc.log_event("ledger_write_error", error=f"{type(e).__name__}: {e}", file=f["path"])
-    return {"recorded": recorded, "rejected": False, "verdict": result["verdict"],
-            "rules_version": rv, "findings": result["findings"]}
+    return {"recorded": recorded, "rejected": False, **common}

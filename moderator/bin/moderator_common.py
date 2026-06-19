@@ -88,25 +88,36 @@ def log_event(event: str, **fields) -> None:
         pass  # never let logging take down a request
 
 
-# ── scoped bearer-token whitelist (token<TAB>email[<TAB>scope]; reloaded per request) ───────────
+# ── scoped bearer-token whitelist (token<TAB>email[<TAB>scope]; mtime-cached) ────────────────────
+_TOK_CACHE: dict = {"mtime": None, "tokens": {}}
+
+
 def load_tokens() -> dict[str, dict]:
     """{token: {"email": str, "scope": str}}. A line with no 3rd column defaults to scope='reader'
-    (so the existing read-API tokens grant catalog/ledger READ on the moderator, nothing more)."""
+    (so the existing read-API tokens grant catalog/ledger READ on the moderator, nothing more).
+    Cached by file mtime so the auth hot path doesn't re-read+parse the file on every request, and
+    a mid-rewrite partial read isn't repeatedly served."""
+    try:
+        mtime = os.stat(ALLOWED_TOKENS).st_mtime
+    except OSError:
+        return {}
+    if _TOK_CACHE["mtime"] == mtime:
+        return _TOK_CACHE["tokens"]
     out: dict[str, dict] = {}
-    if not os.path.exists(ALLOWED_TOKENS):
-        return out
     with open(ALLOWED_TOKENS) as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            parts = line.split()
+            parts = line.split()  # split on ANY whitespace (tabs or spaces)
             tok = parts[0]
             email = parts[1] if len(parts) > 1 else "?"
             scope = parts[2].lower() if len(parts) > 2 else "reader"
             if scope not in SCOPES:
                 scope = "reader"
             out[tok] = {"email": email, "scope": scope}
+    _TOK_CACHE["mtime"] = mtime
+    _TOK_CACHE["tokens"] = out
     return out
 
 
@@ -145,15 +156,19 @@ def pg_one(sql: str, params: tuple = ()):  # convenience: first column of first 
 
 
 # ── DuckDB serving-snapshot reader (catalog/lineage; read-only, co-located on the droplet) ──────
-@contextmanager
-def duckdb_ro():
-    """Open the CURRENT served warehouse snapshot read-only. Raises if unavailable; callers that
-    must degrade gracefully (catalog not yet built pre-P7) wrap in try/except."""
+def duckdb_ro_open():
+    """Return a read-only DuckDB connection to the CURRENT served snapshot (caller closes). Raises
+    if unavailable; callers that must degrade (catalog not built pre-P7) wrap in try/except."""
     import duckdb
     if not os.path.exists(DUCKDB_CURRENT):
         raise FileNotFoundError(f"serving snapshot not found at {DUCKDB_CURRENT}")
-    real = os.path.realpath(DUCKDB_CURRENT)
-    con = duckdb.connect(real, read_only=True)
+    return duckdb.connect(os.path.realpath(DUCKDB_CURRENT), read_only=True)
+
+
+@contextmanager
+def duckdb_ro():
+    """Context-manager form of duckdb_ro_open()."""
+    con = duckdb_ro_open()
     try:
         yield con
     finally:

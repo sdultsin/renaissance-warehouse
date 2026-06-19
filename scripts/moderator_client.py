@@ -57,11 +57,13 @@ def token() -> str:
     tok = os.environ.get("MODERATOR_API_TOKEN") or _env_file_get("MODERATOR_API_TOKEN")
     if tok:
         return tok
-    # self-serve an editor-scoped token over SSH (root-readable; never fails with droplet SSH).
+    # self-serve an EDITOR-scoped token over SSH (root-readable; never fails with droplet SSH).
+    # Default awk field-split (any whitespace, tabs or spaces); editor-only — never auto-escalate
+    # to an admin token.
     try:
         out = subprocess.run(
             ["ssh", WAREHOUSE_HOST,
-             "awk -F'\\t' '$3==\"editor\"||$3==\"admin\"{print $1; exit}' /opt/duckdb/allowed_tokens.txt"],
+             "awk '$3==\"editor\"{print $1; exit}' /opt/duckdb/allowed_tokens.txt"],
             capture_output=True, text=True, timeout=20)
         t = out.stdout.strip()
         if t:
@@ -118,7 +120,9 @@ def _payload(files: list[str]) -> tuple[list[dict], list[dict]]:
     for f in files:
         if not os.path.exists(f):
             continue
-        content = open(f).read()
+        # Read BYTES then strict-decode UTF-8 so content.encode('utf-8') on the server reproduces the
+        # exact file bytes the apply tooth hashes via read_bytes() — same sha across CRLF/LF.
+        content = open(f, "rb").read().decode("utf-8")
         if _is_ddl(f):
             ddl.append({"path": f, "content": content})
         elif _is_py(f):
@@ -172,12 +176,13 @@ def cmd_review(args) -> int:
 
 
 def cmd_record(args) -> int:
-    ddl, _ = _payload(_select(args))
+    ddl, py = _payload(_select(args))
     if not ddl:
         print("moderator_client: no DDL files to record.")
         return 0
     res = _req("POST", "/record-pass",
-               {"ddl_files": ddl, "actor": os.environ.get("USER", "?"), "branch": _branch()})
+               {"ddl_files": ddl, "py_files": py, "actor": os.environ.get("USER", "?"),
+                "branch": _branch()})
     if res.get("rejected"):
         print(f"  record-pass REJECTED (verdict={res.get('verdict')}). Fix findings and re-review:")
         _print_checklist(res)
@@ -189,26 +194,30 @@ def cmd_record(args) -> int:
 
 
 def cmd_loop(args) -> int:
-    """The §7.1 auto-fix loop entry point. The client reviews; if BLOCK it prints the prescribed
-    fixes and exits 2 — the editor's Claude applies them and re-runs (bounded to ~6 by CLAUDE.md),
-    then `record`. If clean, it records straight away. File edits stay with Claude (judgement),
-    not a brittle auto-editor."""
-    files = _select(args)
-    ddl, py = _payload(files)
+    """The §7.1 auto-fix loop entry point. ONE authoritative call: /record-pass re-gates (floor+LLM)
+    AND records on pass — so the clean path costs a single LLM deep-review, not two. On BLOCK it
+    prints the prescribed fixes and exits 2; the editor's Claude applies them and re-runs (bounded
+    to ~6 by CLAUDE.md), then loop again. File edits stay with Claude, not a brittle auto-editor.
+    A py-only change (no DDL to record) just reviews."""
+    ddl, py = _payload(_select(args))
     if not ddl and not py:
         print("moderator_client loop: nothing staged.")
         return 0
-    res = _req("POST", "/review", {"ddl_files": ddl, "py_files": py,
-                                   "actor": os.environ.get("USER", "?"), "branch": _branch()})
+    actor = os.environ.get("USER", "?")
+    path = "/record-pass" if ddl else "/review"  # record-pass needs a DDL file; py-only -> review
+    res = _req("POST", path, {"ddl_files": ddl, "py_files": py, "actor": actor, "branch": _branch()})
     if res.get("error"):
         print(f"moderator_client: service error: {res['error']}")
         return 0
     _print_checklist(res)
-    if res.get("verdict") == "block":
+    if res.get("rejected") or res.get("verdict") == "block":
         print("  -> BLOCK. Apply the fixes above, then re-run `moderator_client.py loop` "
               "(<=6 iterations); escalate to the orchestrator bus if still blocked.")
         return 2
-    return cmd_record(args)
+    for r in res.get("recorded", []):
+        print(f"  recorded v{r['ddl_version']} {r['sql_file']} {r['verdict']} "
+              f"sha={r['content_sha256'][:12]} ({'new' if r.get('new') else 'already-present'})")
+    return 0
 
 
 def cmd_ci(args) -> int:
