@@ -20,6 +20,7 @@ Commands:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import ssl
@@ -210,6 +211,43 @@ def cmd_loop(args) -> int:
     return cmd_record(args)
 
 
+def cmd_ci(args) -> int:
+    """GitHub Actions gate (BUILD-SPEC-v2 §7.2): review changed DDL/entity files + verify each
+    changed DDL has a recorded approval-ledger pass for its head content hash. Emits GitHub
+    annotations. FAILS the job (exit 1) only when MODERATOR_CI_ENFORCE=1 (the Sam-gated flip);
+    advisory (exit 0) during the held WARN week."""
+    enforce = os.environ.get("MODERATOR_CI_ENFORCE", "0") not in ("0", "false", "False", "")
+    ddl, py = _payload(args.files or [])
+    if not ddl and not py:
+        print("moderator-gate: no DDL/entity/sync files changed — nothing to review.")
+        return 0
+    res = _req("POST", "/review", {"ddl_files": ddl, "py_files": py, "actor": "ci", "branch": _branch()})
+    if res.get("error"):
+        print(f"::warning::moderator service error: {res['error']} (CI advisory — not failing)")
+        return 0
+    _print_checklist(res)
+    problems = 0
+    if res.get("verdict") == "block":
+        print("::error::moderator review verdict = BLOCK")
+        problems += 1
+    for f in ddl:  # ledger-presence: author must have run record-pass for the head content.
+        sha = hashlib.sha256(f["content"].encode()).hexdigest()
+        led = _req("GET", "/ledger", params={"sha": sha})
+        if led.get("ledger"):
+            print(f"  ledger OK: {f['path']} sha {sha[:12]} recorded.")
+        else:
+            print(f"::warning::no approval-ledger pass for {f['path']} (sha {sha[:12]}). "
+                  f"Run `python scripts/moderator_client.py loop --files {f['path']}` before merge.")
+            problems += 1
+    if problems and enforce:
+        print(f"::error::moderator-gate FAILING ({problems} problem(s)) [MODERATOR_CI_ENFORCE=1]")
+        return 1
+    if problems:
+        print(f"moderator-gate: {problems} advisory problem(s) — non-blocking during the held WARN "
+              f"week (set repo var MODERATOR_CI_ENFORCE=1 to enforce at P8).")
+    return 0
+
+
 def cmd_simple(args, path) -> int:
     params = {}
     if path == "/issues":
@@ -241,6 +279,8 @@ def main(argv=None) -> int:
     rec = sub.add_parser("record")
     rec.add_argument("--files", nargs="*")
     rec.add_argument("--staged", action="store_true")
+    ci = sub.add_parser("ci")
+    ci.add_argument("--files", nargs="*")
     sub.add_parser("rules")
     iss = sub.add_parser("issues"); iss.add_argument("--status", default="open")
     cat = sub.add_parser("catalog"); cat.add_argument("--table"); cat.add_argument("--column")
@@ -252,6 +292,8 @@ def main(argv=None) -> int:
         return cmd_loop(args)
     if args.cmd == "record":
         return cmd_record(args)
+    if args.cmd == "ci":
+        return cmd_ci(args)
     return cmd_simple(args, "/" + args.cmd)
 
 

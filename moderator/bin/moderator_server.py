@@ -241,6 +241,8 @@ async def get_ledger(request):
         q += " AND actor = %s"; params.append(request.query_params["actor"])
     if request.query_params.get("version"):
         q += " AND rules_version = %s"; params.append(int(request.query_params["version"]))
+    if request.query_params.get("sha"):       # exact content-hash lookup (CI ledger-presence check)
+        q += " AND content_sha256 = %s"; params.append(request.query_params["sha"])
     q += " ORDER BY recorded_at DESC LIMIT 500"
     cols = ["ledger_id", "ddl_version", "sql_file", "content_sha256", "verdict", "rules_version",
             "gate_version", "actor", "branch", "request_id", "recorded_at"]
