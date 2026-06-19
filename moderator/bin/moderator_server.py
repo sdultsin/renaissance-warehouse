@@ -311,6 +311,42 @@ async def judge_advisory(request):
                          "note": "advisory only — never flips a deterministic verdict"})
 
 
+# GET /proposals?status=pending — the rule-evolution proposal queue (§8).
+async def get_proposals(request):
+    deny = require_scope(request, "reader")
+    if deny is not None:
+        return deny
+    status = request.query_params.get("status", "pending")
+    return JSONResponse({"proposals": eng.list_proposals(status)})
+
+
+# POST /proposals/detect (admin) — run the deterministic weekly detector now (also called by the timer).
+async def detect_proposals(request):
+    deny = require_scope(request, "admin")
+    if deny is not None:
+        return deny
+    body = await _json_body(request)
+    out = eng.detect_proposals(window_days=int(body.get("window_days", 7)),
+                               min_count=int(body.get("min_count", 3)))
+    mc.log_event("proposals_detect", **out)
+    return JSONResponse(out)
+
+
+# POST /proposals/decide (admin) — the weekly human confirm: promote | reject | snooze.
+async def decide_proposal(request):
+    deny = require_scope(request, "admin")
+    if deny is not None:
+        return deny
+    body = await _json_body(request)
+    try:
+        out = eng.decide_proposal(int(body["proposal_id"]), body["decision"],
+                                  _actor(request, body), edit=body.get("edit"))
+        mc.log_event("proposal_decided", **{k: v for k, v in out.items()})
+        return JSONResponse(out)
+    except Exception as e:
+        return JSONResponse({"error": f"{type(e).__name__}: {e}"}, status_code=400)
+
+
 # ── routes ──────────────────────────────────────────────────────────────────────────────────────
 ROUTES = [
     Route("/healthz", healthz, methods=["GET"]),
@@ -322,6 +358,9 @@ ROUTES = [
     Route("/ledger", get_ledger, methods=["GET"]),
     Route("/issues", get_issues, methods=["GET"]),
     Route("/judge-advisory", judge_advisory, methods=["POST"]),
+    Route("/proposals", get_proposals, methods=["GET"]),
+    Route("/proposals/detect", detect_proposals, methods=["POST"]),
+    Route("/proposals/decide", decide_proposal, methods=["POST"]),
 ]
 
 

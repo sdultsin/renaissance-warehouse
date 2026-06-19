@@ -248,6 +248,37 @@ def cmd_ci(args) -> int:
     return 0
 
 
+def cmd_proposals(args) -> int:
+    """Weekly rule-evolution review (§8): list pending proposals + evidence + draft. The human says
+    promote/edit/reject/snooze; Claude calls `proposals-decide`."""
+    res = _req("GET", "/proposals", params={"status": getattr(args, "status", "pending")})
+    props = res.get("proposals", [])
+    if not props:
+        print("no proposals.")
+        return 0
+    for p in props:
+        ev = p.get("evidence") or {}
+        print(f"\n#{p['proposal_id']} [{p['status']}] {p['pattern']}")
+        print(f"   evidence: {ev.get('count')}x in {ev.get('window_days')}d, issues {ev.get('issue_ids')}")
+        print(f"   draft: {json.dumps(p.get('draft_rule'))}")
+    print("\nDecide: moderator_client.py proposals-decide --id N --decision promote|reject|snooze "
+          "[--edit '<json publish_rules change>']")
+    return 0
+
+
+def cmd_proposals_decide(args) -> int:
+    body = {"proposal_id": args.id, "decision": args.decision}
+    if args.edit:
+        body["edit"] = json.loads(args.edit)
+    print(json.dumps(_req("POST", "/proposals/decide", body), indent=2))
+    return 0
+
+
+def cmd_proposals_detect(args) -> int:
+    print(json.dumps(_req("POST", "/proposals/detect", {}), indent=2))
+    return 0
+
+
 def cmd_simple(args, path) -> int:
     params = {}
     if path == "/issues":
@@ -285,6 +316,12 @@ def main(argv=None) -> int:
     iss = sub.add_parser("issues"); iss.add_argument("--status", default="open")
     cat = sub.add_parser("catalog"); cat.add_argument("--table"); cat.add_argument("--column")
     sub.add_parser("ledger")
+    prop = sub.add_parser("proposals"); prop.add_argument("--status", default="pending")
+    sub.add_parser("proposals-detect")
+    pd = sub.add_parser("proposals-decide")
+    pd.add_argument("--id", type=int, required=True)
+    pd.add_argument("--decision", required=True, choices=["promote", "reject", "snooze"])
+    pd.add_argument("--edit", help="JSON publish_rules change to apply on promote")
     args = p.parse_args(argv)
     if args.cmd == "review":
         return cmd_review(args)
@@ -294,6 +331,12 @@ def main(argv=None) -> int:
         return cmd_record(args)
     if args.cmd == "ci":
         return cmd_ci(args)
+    if args.cmd == "proposals":
+        return cmd_proposals(args)
+    if args.cmd == "proposals-detect":
+        return cmd_proposals_detect(args)
+    if args.cmd == "proposals-decide":
+        return cmd_proposals_decide(args)
     return cmd_simple(args, "/" + args.cmd)
 
 

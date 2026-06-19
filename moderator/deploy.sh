@@ -20,18 +20,20 @@ scp -q "$HERE"/bin/*.py "$HOST":/opt/moderator/bin/
 echo "==> scp vendored engine (canonical phase-1 lib, no drift) -> /opt/moderator/engine/"
 scp -q "$REPO"/core/schema_gate_lib.py "$HOST":/opt/moderator/engine/
 
-echo "==> scp systemd unit -> /etc/systemd/system/"
-scp -q "$HERE"/systemd/schema-moderator.service "$HOST":/etc/systemd/system/
+echo "==> scp systemd units (service + timer) -> /etc/systemd/system/"
+scp -q "$HERE"/systemd/*.service "$HERE"/systemd/*.timer "$HOST":/etc/systemd/system/
 
 ssh "$HOST" 'set -e
   systemctl daemon-reload
   if systemctl is-enabled schema-moderator >/dev/null 2>&1; then
     systemctl restart schema-moderator
     echo "restarted schema-moderator"
+    # weekly rule-proposal detection timer (idempotent enable).
+    systemctl enable --now moderator-proposals.timer >/dev/null 2>&1 && echo "moderator-proposals.timer enabled" || true
   else
     echo "schema-moderator NOT enabled yet (first deploy)."
     echo "  -> create /opt/moderator/moderator.env (see moderator/README.md), then:"
-    echo "     systemctl enable --now schema-moderator"
+    echo "     systemctl enable --now schema-moderator moderator-proposals.timer"
   fi
   echo "bin/:";    ls /opt/moderator/bin/
   echo "engine/:"; ls /opt/moderator/engine/

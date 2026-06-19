@@ -566,6 +566,97 @@ def _ddl_version_of(path: str) -> int | None:
         return None
 
 
+# ── §8 rule-evolution engine: deterministic weekly detection -> rule_proposal ────────────────────
+def _draft_for_cluster(rule: str, classification: str | None, col: str | None, aliases: dict) -> dict:
+    """A ready-to-edit draft for a recurring-finding cluster. The human confirms/edits before
+    promote; nothing auto-changes a rule. Drafts use the publish_rules vocabulary."""
+    if classification == "DUPE" and col in aliases:
+        canon = aliases[col]
+        return {"kind": "note",
+                "summary": f"`{col}` is already a declared alias of `{canon}` but keeps getting "
+                           f"flagged + waived. Tighten R3 to block this alias, or confirm the waivers."}
+    if classification in ("DUPE", "NAMING"):
+        return {"kind": "alias", "aliases_add": [{"alias": col, "canonical_name": "<SET_CANONICAL>",
+                                                  "reason": f"recurring {classification} on {col}"}],
+                "summary": f"`{col}` recurs as a {classification} finding. Add an alias to its canonical "
+                           f"(fill <SET_CANONICAL>) and promote, or reject if intentional."}
+    return {"kind": "note",
+            "summary": f"{rule}/{classification} recurs on `{col}` — review whether a rule/tier change "
+                       f"is warranted (edit the draft to an upsert_rules/aliases_add change to promote)."}
+
+
+def detect_proposals(window_days: int = 7, min_count: int = 3) -> dict:
+    """Deterministic, keyless clustering of recent issues into rule_proposal rows. Dedupes against
+    pending/snoozed proposals with the same pattern. Returns counts."""
+    created = 0
+    aliases = load_aliases()
+    with mc.pg_conn() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT rule, classification, lower(column_name) AS col, count(*) AS n, "
+            "array_agg(issue_id) AS ids FROM moderator.issue "
+            "WHERE created_at > now() - make_interval(days => %s) AND column_name IS NOT NULL "
+            "GROUP BY rule, classification, lower(column_name) HAVING count(*) >= %s",
+            (window_days, min_count))
+        clusters = cur.fetchall()
+        for rule, classification, col, n, ids in clusters:
+            pattern = f"{rule}/{classification} recurring on column `{col}` ({n}x/{window_days}d)"
+            cur.execute("SELECT 1 FROM moderator.rule_proposal WHERE pattern=%s "
+                        "AND status IN ('pending','snoozed') LIMIT 1", (pattern,))
+            if cur.fetchone():
+                continue
+            draft = _draft_for_cluster(rule, classification, col, aliases)
+            cur.execute(
+                "INSERT INTO moderator.rule_proposal (pattern, evidence, draft_rule) VALUES (%s,%s,%s)",
+                (pattern, json.dumps({"issue_ids": list(ids), "count": n, "window_days": window_days,
+                                      "rule": rule, "classification": classification, "column": col}),
+                 json.dumps(draft)))
+            created += 1
+    return {"clusters": len(clusters), "proposals_created": created,
+            "window_days": window_days, "min_count": min_count}
+
+
+def list_proposals(status: str = "pending") -> list[dict]:
+    cols = ["proposal_id", "pattern", "evidence", "draft_rule", "status", "detected_at"]
+    with mc.pg_conn() as c, c.cursor() as cur:
+        cur.execute(
+            "SELECT proposal_id, pattern, evidence, draft_rule, status, CAST(detected_at AS text) "
+            "FROM moderator.rule_proposal WHERE (%s='all' OR status=%s) "
+            "ORDER BY proposal_id DESC LIMIT 200", (status, status))
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+
+def _set_proposal_status(pid: int, status: str, decided_by: str) -> None:
+    with mc.pg_conn() as c, c.cursor() as cur:
+        cur.execute("UPDATE moderator.rule_proposal SET status=%s, decided_by=%s, decided_at=now() "
+                    "WHERE proposal_id=%s", (status, decided_by, pid))
+
+
+def decide_proposal(pid: int, decision: str, decided_by: str, edit: dict | None = None) -> dict:
+    """promote (optionally with an edited draft) | reject | snooze. promote applies the draft's
+    aliases_add/upsert_rules via publish_rules (a new rules_version). This is the ONLY human touch
+    in rule evolution (weekly), never per schema-change."""
+    with mc.pg_conn() as c, c.cursor() as cur:
+        cur.execute("SELECT draft_rule FROM moderator.rule_proposal WHERE proposal_id=%s", (pid,))
+        row = cur.fetchone()
+    if not row:
+        raise ValueError(f"proposal {pid} not found")
+    draft = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+    if decision == "promote":
+        d = edit or draft
+        new_v = None
+        if d.get("aliases_add") or d.get("upsert_rules") or d.get("disable_codes"):
+            new_v = publish_rules(
+                upsert_rules=d.get("upsert_rules", []), disable_codes=d.get("disable_codes", []),
+                aliases_add=d.get("aliases_add", []), note=f"promoted rule_proposal {pid}",
+                published_by=decided_by, source="weekly-auto-proposal")
+        _set_proposal_status(pid, "promoted", decided_by)
+        return {"promoted": pid, "rules_version": new_v}
+    if decision in ("reject", "snooze"):
+        _set_proposal_status(pid, "rejected" if decision == "reject" else "snoozed", decided_by)
+        return {decision: pid}
+    raise ValueError("decision must be one of: promote | reject | snooze")
+
+
 def record_pass(ddl_files, actor, branch, request_id) -> dict:
     """Re-gate server-side against LIVE rules+catalog, then write ONE content-hash-bound ledger row
     per ddl file IFF verdict != block. The ONLY way a pass enters moderator.approval_ledger."""
