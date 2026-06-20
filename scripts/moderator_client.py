@@ -4,12 +4,18 @@
 The single authority is the droplet service; this client is just transport + the author-time
 UX. Stdlib-only (urllib) so it runs on any editor's laptop without extra deps.
 
-URL/token resolution mirrors the `data-warehouse` skill (no minting, no asking Sam):
+URL/token resolution (NO Tailscale, NO SSH, NO VPN — the funnel is PUBLIC HTTPS):
   URL   : $MODERATOR_API_URL  -> Renaissance .env (MODERATOR_API_URL)  -> default funnel/moderator
-  TOKEN : $MODERATOR_API_TOKEN -> Renaissance .env (MODERATOR_API_TOKEN) -> SSH self-serve an
-          editor-scoped token from /opt/duckdb/allowed_tokens.txt (always works with droplet SSH)
+  TOKEN : $MODERATOR_API_TOKEN -> $RENAISSANCE_ENV file (MODERATOR_API_TOKEN)
+          If neither is set the client FAILS CLEARLY and tells you to run `doctor`. It does NOT
+          attempt SSH by default (that false trail made writers chase SSH/Tailscale/admin). The
+          old SSH self-serve is now strictly opt-in: MODERATOR_ALLOW_SSH_SELFSERVE=1.
+
+First time? Run:  python scripts/moderator_client.py doctor
+  -> a deterministic ✅/❌ checklist of YOUR setup with the exact copy-paste fix for each failure.
 
 Commands:
+  doctor                                         self-diagnose setup (token/url/reachable/scope/cwd)
   review  [--staged | --files A.sql B.py ...]   POST /review  -> checklist (+ exit 1 on block)
   record  --files A.sql ...                      POST /record-pass -> content-hash-bound ledger row
   loop    [--staged | --files ...]               review; if clean -> record; if block -> print the
@@ -53,25 +59,59 @@ def base_url() -> str:
             or DEFAULT_URL).rstrip("/")
 
 
-def token() -> str:
-    tok = os.environ.get("MODERATOR_API_TOKEN") or _env_file_get("MODERATOR_API_TOKEN")
+# SSH self-serve is OFF by default. It is ONLY for Sam's own machine (which has droplet root SSH);
+# a writer does NOT have droplet SSH and does NOT need it — their token is a personal editor token
+# Sam handed them, which they export or put in their $RENAISSANCE_ENV file. Leaving SSH on-by-default
+# was the root cause of the "SSH connection error" false trail that sent writers chasing
+# SSH/Tailscale/admin access they never needed. Opt in explicitly with MODERATOR_ALLOW_SSH_SELFSERVE=1.
+_TOKEN_MISSING_MSG = (
+    "moderator_client: MODERATOR_API_TOKEN is not set "
+    "(not in your shell env and not in your $RENAISSANCE_ENV file).\n"
+    "  -> Run:  python scripts/moderator_client.py doctor   (it prints the exact fix)\n"
+    "  -> You do NOT need SSH, Tailscale, or a VPN. The service is PUBLIC HTTPS. Just export your\n"
+    "     personal editor token:\n"
+    "         export MODERATOR_API_TOKEN=<your-personal-editor-token>\n"
+    "         export MODERATOR_API_URL=" + DEFAULT_URL + "\n"
+    "     (add those to ~/.zshrc / ~/.bashrc to persist; never commit the token).")
+
+
+def _ssh_selfserve_enabled() -> bool:
+    return os.environ.get("MODERATOR_ALLOW_SSH_SELFSERVE", "0").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def env_or_file_token() -> str | None:
+    """Token from shell env OR the $RENAISSANCE_ENV file — NEVER SSH. The `doctor` uses this so its
+    'never uses SSH' guarantee is structural, not just documented."""
+    return os.environ.get("MODERATOR_API_TOKEN") or _env_file_get("MODERATOR_API_TOKEN")
+
+
+def resolve_token() -> str | None:
+    """Return the token from shell env or the $RENAISSANCE_ENV file, else None.
+    Opt-in only: if MODERATOR_ALLOW_SSH_SELFSERVE=1, fall back to SSH self-serve (Sam's machine)."""
+    tok = env_or_file_token()
     if tok:
         return tok
-    # self-serve an EDITOR-scoped token over SSH (root-readable; never fails with droplet SSH).
-    # Default awk field-split (any whitespace, tabs or spaces); editor-only — never auto-escalate
-    # to an admin token.
-    try:
-        out = subprocess.run(
-            ["ssh", WAREHOUSE_HOST,
-             "awk '$3==\"editor\"{print $1; exit}' /opt/duckdb/allowed_tokens.txt"],
-            capture_output=True, text=True, timeout=20)
-        t = out.stdout.strip()
-        if t:
-            return t
-    except Exception:
-        pass
-    sys.exit("moderator_client: no MODERATOR_API_TOKEN (env/.env) and SSH self-serve failed. "
-             "Set MODERATOR_API_TOKEN or ensure droplet SSH works.")
+    if _ssh_selfserve_enabled():
+        # editor-only self-serve over droplet SSH (Sam's machine only); never auto-escalate to admin.
+        try:
+            out = subprocess.run(
+                ["ssh", WAREHOUSE_HOST,
+                 "awk '$3==\"editor\"{print $1; exit}' /opt/duckdb/allowed_tokens.txt"],
+                capture_output=True, text=True, timeout=20)
+            t = out.stdout.strip()
+            if t:
+                return t
+        except Exception:
+            pass
+    return None
+
+
+def token() -> str:
+    tok = resolve_token()
+    if tok:
+        return tok
+    sys.exit(_TOKEN_MISSING_MSG)
 
 
 def _req(method: str, path: str, body: dict | None = None, params: dict | None = None) -> dict:
@@ -163,6 +203,206 @@ def _print_checklist(result: dict) -> None:
     if result.get("llm_reasoning"):
         print(f"  LLM: {result['llm_reasoning'][:400]}")
     print("-" * 74)
+
+
+# ── doctor: deterministic self-diagnosis (NEVER attempts SSH; diagnoses + instructs) ─────────────
+def _safe_text(raw: str) -> str:
+    """Cap an arbitrary server body so a verbose/echoing/huge error page can't flood the checklist
+    (defense-in-depth: a doctor must stay terse and never dump unbounded server output)."""
+    raw = raw.strip()
+    return raw if len(raw) <= 300 else raw[:300] + "…"
+
+
+def _http_probe(method: str, path: str, tok: str | None, body: dict | None = None,
+                timeout: int = 8) -> tuple[int | None, dict | str | None]:
+    """Bare HTTP probe used by `doctor` ONLY. Returns (status_code, parsed_or_text). status_code is
+    None on a transport failure (DNS/cert/connect). Never raises; never touches SSH. Fast-fails
+    (short timeout) — doctor is a quick verdict, not the 180s production _req."""
+    url = base_url() + path
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method)
+    if tok:
+        req.add_header("Authorization", f"Bearer {tok}")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    ctx = ssl.create_default_context()
+    try:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            raw = r.read().decode()
+            try:
+                return r.status, json.loads(raw)
+            except Exception:
+                return r.status, _safe_text(raw)
+    except urllib.error.HTTPError as e:
+        raw = ""
+        try:
+            raw = e.read().decode()
+        except Exception:
+            pass
+        try:
+            return e.code, json.loads(raw)
+        except Exception:
+            return e.code, _safe_text(raw)
+    except Exception as e:
+        return None, f"{type(e).__name__}: {e}"
+
+
+def _scope_from_403(body) -> str | None:
+    """Parse the scope out of a moderator 403 body, e.g.
+    {"error":"forbidden: 'editor' scope required (you have 'reader')"} -> 'reader'."""
+    if isinstance(body, dict):
+        msg = body.get("error", "")
+        if "you have '" in msg:
+            return msg.split("you have '", 1)[1].split("'", 1)[0]
+    return None
+
+
+def _detect_scope(tok: str) -> tuple[str | None, str]:
+    """Determine the token's scope using ONLY read-only / no-mutation probes (this never writes).
+      POST /review {ddl_files:[],py_files:[]}  needs editor:
+        - 401          -> bad/unknown token.
+        - 403          -> body says "you have '<scope>'" (a reader); parse it.
+        - 400/200      -> passed the editor scope gate (empty payload = validated no-op, NO write),
+                          so the token is editor OR admin == has full write power, which is all a
+                          writer needs. We report 'editor' (the writer-relevant capability).
+    We deliberately do NOT POST to the mutating /rules route just to distinguish editor vs admin —
+    a 'doctor' must never risk a side effect, and the editor/admin split is irrelevant to a writer."""
+    code, body = _http_probe("POST", "/review", tok, body={"ddl_files": [], "py_files": []})
+    if code == 401:
+        return None, "token rejected (401 unauthorized) — unknown or revoked"
+    if code is None:
+        return None, f"could not reach service to check scope ({body})"
+    if code == 403:
+        have = _scope_from_403(body)
+        if have:
+            return have, f"scope = {have}"
+        return "reader", "scope below editor (review forbidden)"
+    if code in (200, 400):
+        # passed the editor scope gate with a no-op payload — full write power confirmed.
+        return "editor", "scope >= editor (full write power)"
+    return None, f"unexpected /review status {code}: {body}"
+
+
+def _is_warehouse_clone(cwd: str) -> tuple[bool, str]:
+    has_client = os.path.exists(os.path.join(cwd, "scripts", "moderator_client.py"))
+    has_ddl = os.path.isdir(os.path.join(cwd, "sql", "ddl"))
+    if has_client and has_ddl:
+        return True, "cwd is a renaissance-warehouse clone (scripts/ + sql/ddl present)"
+    missing = []
+    if not has_client:
+        missing.append("scripts/moderator_client.py")
+    if not has_ddl:
+        missing.append("sql/ddl/")
+    return False, "missing: " + ", ".join(missing)
+
+
+def cmd_doctor(args) -> int:
+    OK, BAD = "✅", "❌"
+    fails: list[str] = []
+    print("=" * 74)
+    print("  SCHEMA MODERATOR — SETUP DOCTOR  (read-only self-diagnosis; never uses SSH)")
+    print("=" * 74)
+
+    # (a) MODERATOR_API_TOKEN present?  doctor resolves env/file ONLY (env_or_file_token) so its
+    # "never uses SSH" promise is structural — it will NOT shell out even if the opt-in flag is set.
+    # NEVER print the token value.
+    tok = env_or_file_token()
+    src = ("shell env $MODERATOR_API_TOKEN" if os.environ.get("MODERATOR_API_TOKEN")
+           else f"$RENAISSANCE_ENV file ({RENAISSANCE_ENV})" if tok else None)
+    if tok:
+        print(f"  {OK} (a) token found via {src}  (len={len(tok)}, value hidden)")
+    else:
+        print(f"  {BAD} (a) MODERATOR_API_TOKEN NOT set (not in shell env, not in "
+              f"$RENAISSANCE_ENV={RENAISSANCE_ENV})")
+        print("         FIX (copy-paste; use YOUR personal editor token Sam sent you):")
+        print(f"           export MODERATOR_API_TOKEN=<your-personal-editor-token>")
+        print(f"           export MODERATOR_API_URL={DEFAULT_URL}")
+        print("           # add both lines to ~/.zshrc or ~/.bashrc to persist")
+        print("         You do NOT need SSH / Tailscale / a VPN — the service is PUBLIC HTTPS.")
+        fails.append("token")
+
+    # (b) MODERATOR_API_URL set + correct?
+    url = base_url()
+    url_src = ("shell env" if os.environ.get("MODERATOR_API_URL")
+               else "$RENAISSANCE_ENV file" if _env_file_get("MODERATOR_API_URL")
+               else "built-in default")
+    if url == DEFAULT_URL:
+        print(f"  {OK} (b) MODERATOR_API_URL = {url}  (via {url_src})")
+    else:
+        print(f"  {BAD} (b) MODERATOR_API_URL = {url}  (via {url_src}) — does NOT match the canonical:")
+        print(f"           {DEFAULT_URL}")
+        print(f"         FIX:  export MODERATOR_API_URL={DEFAULT_URL}")
+        fails.append("url")
+
+    # (c) GET /healthz reachable over plain HTTPS (proves no Tailscale/SSH needed).
+    code, body = _http_probe("GET", "/healthz", None)
+    healthy = code == 200 and isinstance(body, dict) and body.get("ok")
+    if healthy:
+        print(f"  {OK} (c) GET {url}/healthz reachable over public HTTPS "
+              f"(pg={body.get('pg')}, rules_v={body.get('rules_version')}) "
+              f"— confirms NO Tailscale/SSH/VPN needed")
+    elif code is None:
+        print(f"  {BAD} (c) could NOT reach {url}/healthz over HTTPS: {body}")
+        print("         FIX: check the URL (step b) and your internet. This is plain public HTTPS —")
+        print("              do NOT install Tailscale or try SSH; that is NOT the problem.")
+        fails.append("reachable")
+    else:
+        print(f"  {BAD} (c) {url}/healthz reachable but UNHEALTHY (HTTP {code}, ok!=true): {body}")
+        print("         The service is degraded (your setup is fine) — escalate to the orchestrator "
+              "bus, not Sam.")
+        fails.append("reachable")
+
+    # (d) token resolves + to what SCOPE? Only when we have a token AND the service is HEALTHY
+    # (a degraded service would give an unreliable scope verdict — defer to fixing (c) first).
+    if tok and healthy:
+        scope, note = _detect_scope(tok)
+        if scope in ("editor", "admin"):
+            print(f"  {OK} (d) token resolves -> scope = {scope.upper()} = FULL write power over the "
+                  f"warehouse (cols/views/tables/data/syncs). This is all a writer needs.")
+        elif scope == "reader":
+            print(f"  {BAD} (d) token resolves -> scope = READER (read-only). You CANNOT author schema "
+                  f"changes with a reader token.")
+            print("         FIX: this is the wrong token. Use the personal EDITOR token Sam sent you")
+            print("              for the moderator (not the read-only cc-service-reader / warehouse token).")
+            fails.append("scope")
+        elif scope:  # some other non-write scope label the server reported
+            print(f"  {BAD} (d) token scope = '{scope}' — not editor; you cannot write. "
+                  f"Use your personal EDITOR token.")
+            fails.append("scope")
+        else:
+            print(f"  {BAD} (d) could not confirm scope: {note}")
+            if "401" in note or "rejected" in note:
+                print("         FIX: the token is unknown/revoked. Re-paste your personal editor token")
+                print("              exactly (no quotes/spaces); if it still fails, ask Sam to re-issue it.")
+            fails.append("scope")
+    elif not tok:
+        print(f"  {BAD} (d) scope not checked — no token (fix (a) first).")
+    else:
+        print(f"  {BAD} (d) scope not checked — service not healthy (fix (c) first).")
+
+    # (e) cwd is a renaissance-warehouse clone?
+    cwd = os.getcwd()
+    ok_clone, clone_note = _is_warehouse_clone(cwd)
+    if ok_clone:
+        print(f"  {OK} (e) {clone_note}")
+    else:
+        print(f"  {BAD} (e) cwd is NOT a renaissance-warehouse clone — {clone_note}")
+        print("         FIX: clone the repo and run commands from inside it:")
+        print("           git clone https://github.com/sdultsin/renaissance-warehouse.git")
+        print("           cd renaissance-warehouse")
+        fails.append("clone")
+
+    print("-" * 74)
+    if not fails:
+        print(f"  {OK} ALL CHECKS PASS — you are set up to edit the warehouse. Author your")
+        print("     sql/ddl/NN_*.sql (or entities|sources|scripts/*.py) then run:")
+        print("       python scripts/moderator_client.py loop --files <your-files>")
+        print("     A 'queued for nightly' / 'recorded' result is CORRECT — changes apply on the")
+        print("     ~03:30 UTC nightly rebuild by design, not instantly.")
+        return 0
+    print(f"  {BAD} {len(fails)} check(s) failed: {', '.join(fails)} — apply the FIX lines above, then")
+    print("     re-run:  python scripts/moderator_client.py doctor")
+    return 1
 
 
 # ── commands ──────────────────────────────────────────────────────────────────────────────────
@@ -343,6 +583,7 @@ def _branch() -> str:
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(description="Schema Moderator Service client")
     sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("doctor", help="self-diagnose your setup (run this FIRST)")
     for name in ("review", "loop"):
         sp = sub.add_parser(name)
         sp.add_argument("--staged", action="store_true")
@@ -371,6 +612,8 @@ def main(argv=None) -> int:
     aq = sub.add_parser("apply-queue"); aq.add_argument("--status", default="all")
     sub.add_parser("apply-process")
     args = p.parse_args(argv)
+    if args.cmd == "doctor":
+        return cmd_doctor(args)
     if args.cmd == "review":
         return cmd_review(args)
     if args.cmd == "loop":
