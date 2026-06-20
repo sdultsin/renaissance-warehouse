@@ -127,11 +127,35 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     SLACK_ALERT_CHANNEL="$(grep '^SLACK_ALERT_CHANNEL=' .env | cut -d= -f2- | tr -d '"')"
     export CC_D1_API_TOKEN CLOUDFLARE_RG_ACCOUNT_ID CC_D1_DATABASE_ID SLACK_ALERT_CHANNEL
 
+    # HARD TIMEOUT (2026-06-20): wrap the publish so a hung/slow publish can NEVER
+    # wedge the rest of the nightly. ROOT CAUSE of the 06-17→06-20 staleness: this
+    # step hung indefinitely (lock-wait and/or an unbounded D1 HTTP request), and
+    # because it had no outer bound the WHOLE TAIL after it — Track H
+    # (build_campaign_daily.py → core.campaign_daily) and the cc_* mirror
+    # (raw_cc_*) and every freshness/QA step — NEVER RAN. The read-model going
+    # stale is recoverable; the tail not running is the real damage. A normal
+    # publish is ~37s; we allow 600s then SIGTERM, and SIGKILL 60s later if it
+    # ignores TERM (--kill-after), so the publish is always bounded and the tail
+    # ALWAYS proceeds. A timed-out publish is treated exactly like a failed
+    # publish: loud log + :rotating_light: alert + NIGHTLY_DEGRADED=1, but it does
+    # NOT block Track H / the mirror / the rest of the tail below.
+    # `timeout` exits 124 on TERM-expiry, 137 (128+SIGKILL) if --kill-after fired.
+    # Tunable via PUBLISH_TIMEOUT_S / PUBLISH_KILL_AFTER_S. Reversible: drop the
+    # `timeout ...` prefix (back to a bare "$PYTHON scripts/publish_campaign_data_d1.py").
+    PUBLISH_TIMEOUT_S="${PUBLISH_TIMEOUT_S:-600}"
+    PUBLISH_KILL_AFTER_S="${PUBLISH_KILL_AFTER_S:-60}"
     set +e
-    "$PYTHON" scripts/publish_campaign_data_d1.py 2>&1 | tee -a "$LOG_FILE"
+    timeout --signal=TERM --kill-after="$PUBLISH_KILL_AFTER_S" "$PUBLISH_TIMEOUT_S" \
+        "$PYTHON" scripts/publish_campaign_data_d1.py 2>&1 | tee -a "$LOG_FILE"
     PUBLISH_RC=${PIPESTATUS[0]}
     set -e
-    if [[ "$PUBLISH_RC" -ne 0 ]]; then
+    if [[ "$PUBLISH_RC" -eq 124 || "$PUBLISH_RC" -eq 137 ]]; then
+        echo "ERROR campaign_data_d1_publish_TIMED_OUT (rc=$PUBLISH_RC after ${PUBLISH_TIMEOUT_S}s) — killed so the rest of the nightly (Track H, cc_* mirror, QA) can proceed; CC read-model stays at its last good snapshot" | tee -a "$LOG_FILE"
+        "$PYTHON" scripts/alert_slack.py \
+            ":rotating_light: *campaign_data D1 publish TIMED OUT* (rc=$PUBLISH_RC after ${PUBLISH_TIMEOUT_S}s) — the publish hung and was KILLED so the rest of the nightly could finish. CC's read-model stays at its last good D1 snapshot until the next successful publish. CC self-audit freshness guard will also flag this. Investigate publish_campaign_data_d1.py (D1 HTTP timeout / DuckDB writer-lock wait)." \
+            2>&1 | tee -a "$LOG_FILE" || true
+        NIGHTLY_DEGRADED=1
+    elif [[ "$PUBLISH_RC" -ne 0 ]]; then
         echo "ERROR campaign_data_d1_publish_failed (rc=$PUBLISH_RC) — CC read-model will go stale" | tee -a "$LOG_FILE"
         "$PYTHON" scripts/alert_slack.py \
             ":rotating_light: *campaign_data D1 publish FAILED* (rc=$PUBLISH_RC) — Campaign Control's read-model will go STALE until the next successful nightly. CC self-audit freshness guard will also flag this. Investigate publish_campaign_data_d1.py / DuckDB lock." \
