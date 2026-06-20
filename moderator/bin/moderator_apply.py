@@ -37,9 +37,22 @@ import os
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 
 import moderator_common as mc
+
+# Process-level serialization of apply-now. The service runs route handlers in a threadpool, so two
+# concurrent /apply-now calls (two editors, or the standing retry-every-minute rule) would share the
+# process-global WAREHOUSE_WRITE_LOCK_HELD env and could TOCTOU-race on it — the second call would
+# then re-enter core.db's own flock acquire on a 2nd fd of the same file and SELF-DEADLOCK for the
+# full lock-wait window, re-creating the very nightly-starvation the explicit flock fixed. apply-now
+# is a single serialized writer by intent, so we just serialize it here: a 2nd concurrent call waits
+# (or fails fast) instead of racing. Held for the whole apply (incl. the ~10-min promote) — correct:
+# you never want two concurrent applies/promotes anyway.
+_APPLY_NOW_LOCK = threading.Lock()
+# Max seconds a 2nd concurrent apply-now waits for the first to finish before giving up cleanly.
+_APPLY_NOW_LOCK_WAIT_S = int(os.environ.get("MODERATOR_APPLY_NOW_LOCK_WAIT_S", "1500"))
 
 # The serving-snapshot publisher (the ONE promote mechanism, serving-mcp SP-1). Overridable for
 # the test profile / a relocation. Default = the prod droplet layout.
@@ -338,8 +351,25 @@ def _promote_acceptable(p: dict | None, promote_requested: bool) -> bool:
 
 def apply_now(actor: str, max_items: int = 25, promote: bool = True,
               reason: str | None = None, force_promote: bool = False) -> dict:
+    """Public entry. Serializes apply-now in-process (a 2nd concurrent call waits, then fails fast if
+    the first is still running) so two callers can't race the writer-flock env flag and self-deadlock.
+    Then runs the real apply under the warehouse-writer flock + re-promote."""
+    if not _APPLY_NOW_LOCK.acquire(timeout=_APPLY_NOW_LOCK_WAIT_S):
+        return {"applied": [], "promote": None, "freshness": _snapshot_freshness(), "actor": actor,
+                "ok": False, "error": "another apply-now is already running on the server "
+                f"(waited {_APPLY_NOW_LOCK_WAIT_S}s) — retry shortly"}
+    try:
+        return _apply_now_impl(actor, max_items=max_items, promote=promote, reason=reason,
+                               force_promote=force_promote)
+    finally:
+        _APPLY_NOW_LOCK.release()
+
+
+def _apply_now_impl(actor: str, max_items: int = 25, promote: bool = True,
+                    reason: str | None = None, force_promote: bool = False) -> dict:
     """Drain ledger-approved queued DDLs to the LIVE warehouse under the warehouse-writer flock, then
-    re-promote the serving snapshot. Returns a clear, structured result.
+    re-promote the serving snapshot. Returns a clear, structured result. (Always called with
+    _APPLY_NOW_LOCK held — see apply_now.)
 
     The apply runs inside ONE explicitly-held writer flock (_WriterFlock — acquire-or-wait, then
     RELEASED in a finally; record+apply = one critical section vs the nightly). The flock + the DB
