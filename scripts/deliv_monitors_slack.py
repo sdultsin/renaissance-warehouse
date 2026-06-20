@@ -289,6 +289,20 @@ def main(argv=None) -> int:
         print(msg)
         return 0
 
+    # [cc-sam noise prune 2026-06-20] This is a purely-informational DAILY health
+    # post with no action path (\"reply-lag / human-vs-auto numbers\") -> exactly the
+    # action-less recurring report Sam asked to stop. The numbers are still COMPUTED
+    # and written to this cron log every day (see below); only the Slack post is
+    # suppressed. Re-arm with DELIV_MONITORS_SLACK_ENABLE=1 (or --force) if you want
+    # it back, ideally re-armed as a degrade-only alert rather than a daily post.
+    import os as _os
+    if not args.force and _os.environ.get("DELIV_MONITORS_SLACK_ENABLE") != "1":
+        print("deliv_monitors_slack: cc-sam post DISABLED (action-less daily report). "
+              "Numbers below; set DELIV_MONITORS_SLACK_ENABLE=1 or --force to post.", flush=True)
+        print(msg, flush=True)
+        mark_posted_today()
+        return 0
+
     env = load_env(ENV_PATH)
     out = slack_post(env, msg)
     if out.get("ok"):
