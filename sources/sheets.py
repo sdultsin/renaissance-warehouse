@@ -45,6 +45,7 @@ DEFAULT_STAGING_DIR = "/root/core/sheets_staging"
 DOMAIN_TECH_SHEET_ID = "1bGj5bPyyGHg6eY6nRrkfXzTed44L0qHWhf8-4-gLlqM"
 BLACKLIST_SHEET_ID = "1fKqwQkEy4vRDYIrj7bq13aUZdTxBhjvKVRXbU1bXf6o"
 OTD_SHEET_ID = "1lRbIk1TvQyBkU9W-aTmI9iKIvY4IcnfWqOPxz4pVTm4"  # OTD account statement (billing)
+FUNDING_FORM_SHEET_ID = "1vaExhxu319o2CSoQtjWRV49lq5GowOeJzo1_GHXIIqM"  # Funding-Form: meetings source >= 2026-06-01
 
 # (table_name, spreadsheet_id, tab_name, csv_filename)
 #
@@ -69,6 +70,9 @@ SHEET_TABS = [
     # Producer: scripts/stage_otd_billing.py (run on the Mac; has the google-sheets token).
     ("raw_sheets_otd_account_summary",  OTD_SHEET_ID, "Account Summary",  "otd__Account_Summary.csv"),
     ("raw_sheets_otd_charges_by_batch", OTD_SHEET_ID, "Charges by Batch", "otd__Charges_by_Batch.csv"),
+    # Funding-Form meetings source (added 2026-06-13, WS-E meetings re-platform). Canonical source
+    # for core.meeting >= 2026-06-01. Producer: scripts/stage_funding_form.py (Mac; google-sheets token).
+    ("raw_sheets_funding_form_data",    FUNDING_FORM_SHEET_ID, "Data", "funding_form__Data.csv"),
 ]
 
 
