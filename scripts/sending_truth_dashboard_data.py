@@ -73,21 +73,26 @@ def build_sql(days: int) -> str:
       GROUP BY 1
     ),
     dedup AS (
-      -- The warehouse account-truth table carries (a) ~94k/day duplicate-email rows and
-      -- (b) ~167k/day "Missing Current Inventory" pseudo-accounts (account_status=-999) that
-      -- no longer exist in live inventory. The standalone Lens source has neither: it is scoped
-      -- to current inventory, one row per account. We mirror that here — dedupe to one row per
-      -- (date,email) and drop missing-inventory — so the cube matches what the dashboard shows
-      -- AND the file stays committable to git. No DISPLAYED number changes (the UI already
-      -- excludes the missing_current_inventory bucket from its eligible/audit views).
+      -- The warehouse account-truth table carries ~94k/day duplicate-email rows; we dedupe to
+      -- one row per (date,email) (the standalone Lens source is already one row per account).
+      --
+      -- We DO retain the ~105k/day "Missing Current Inventory" rows (account_status=-999 /
+      -- account_status_label='Missing Current Inventory'). They are NOT dropped here anymore:
+      -- on 2026-06-17 that churned/MCI bucket carries 303,976 actual_sends (~19%% of the day),
+      -- and inner-dropping it made the cube's total actual_sends undercount
+      -- core.sending_account_daily by exactly that amount (1,288,551 vs 1,592,527), with the
+      -- gap concentrated in the funding-CM workspaces leadership tracks (renaissance-4, koi,
+      -- renaissance-5) and the esp=NULL slice (QA-FINDINGS F1/F2/F7). The rows flow into
+      -- `classified` where they are already bucketed eligibility='missing_current_inventory'
+      -- (is_eligible=false), so their actual_sends count toward volume while the
+      -- eligibility/capacity/audit columns are unchanged (expected_sends=0 on these rows).
+      -- The UI already lists these in ELIGIBILITY_EXCLUDED/STATUS_EXCLUDED (app.js:48-49).
       SELECT * FROM (
         SELECT t.*, row_number() OVER (
                  PARTITION BY t.date, lower(t.email)
                  ORDER BY t.actual_sends DESC, t.expected_sends DESC, t.daily_limit DESC) AS _rn
         FROM raw_account_truth_daily_actuals t
         WHERE t.date >= (SELECT max(date) FROM raw_account_truth_daily_actuals) - INTERVAL '%d days'
-          AND coalesce(t.account_status, 0) <> -999
-          AND coalesce(t.account_status_label, '') <> 'Missing Current Inventory'
       ) WHERE _rn = 1
     ),
     base AS (
@@ -185,6 +190,40 @@ def main() -> int:
     if not rows:
         sys.stderr.write("ERROR: 0 rows from raw_account_truth_daily_actuals — refusing to write empty cube\n")
         return 1
+
+    # Conservation assert: the cube's SUM(actual_sends) for the snapshot (latest) date must
+    # reconcile to core.sending_account_daily for that date — they measure the same thing
+    # (total sends that day). The historical undercount (QA-FINDINGS F1) came from inner-dropping
+    # the "Missing Current Inventory" bucket before summing; this guard catches any regression of
+    # that class. WARN-only (does not return nonzero / block the cube) so the conductor keeps its
+    # last-known-good even if the warehouse is mid-backfill or the two surfaces lag differently.
+    try:
+        _di = SCHEMA.index("date")
+        _ai = SCHEMA.index("actual_sends")
+        _snap_date = max(r[_di] for r in rows)
+        _cube_sends = sum((r[_ai] or 0) for r in rows if r[_di] == _snap_date)
+        _wh = con.execute(
+            "SELECT coalesce(sum(actual_sends), 0) FROM core.sending_account_daily WHERE date = ?",
+            [_snap_date],
+        ).fetchone()
+        _wh_sends = (_wh[0] or 0) if _wh else 0
+        if _wh_sends:
+            _drift = abs(_cube_sends - _wh_sends) / _wh_sends
+            _msg = (
+                "reconcile %s: cube actual_sends=%d vs core.sending_account_daily=%d (drift %.3f%%)\n"
+                % (_snap_date, _cube_sends, _wh_sends, _drift * 100.0)
+            )
+            if _drift > 0.005:
+                sys.stderr.write("WARN: " + _msg)
+            else:
+                sys.stderr.write("OK: " + _msg)
+        else:
+            sys.stderr.write(
+                "WARN: reconcile %s: core.sending_account_daily has 0 sends for the snapshot date "
+                "(cube actual_sends=%d) — skipping drift check\n" % (_snap_date, _cube_sends)
+            )
+    except Exception as exc:  # never let the guard itself break the build
+        sys.stderr.write("WARN: reconciliation check skipped (%s: %s)\n" % (type(exc).__name__, exc))
 
     dicts: dict[str, list[str]] = {name: [] for name in DICT_COLS}
     indexes: dict[str, dict[str, int]] = {name: {} for name in DICT_COLS}
