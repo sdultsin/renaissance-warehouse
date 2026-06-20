@@ -291,5 +291,51 @@ if [[ "$NIGHTLY_DEGRADED" -eq 1 && "$EXIT_CODE" -eq 0 ]]; then
     FINAL_EXIT=1
     echo "nightly degraded by a fail-loud post-orchestrator step (publish/parity); exit 1" | tee -a "$LOG_FILE"
 fi
+# ─── Promote the serving snapshot AT NIGHTLY COMPLETION (06-20 stale-serving fix) ───
+# Root cause of the 06-18 stale-serving incident: the snapshot publisher ran ONLY on a
+# FIXED snapshot-publisher.timer at 06:30Z, decoupled from when this nightly actually
+# finishes. The nightly routinely runs until ~06:55-07:30Z (well past 06:30), so the
+# 06:30 timer kept promoting a PRE-COMPLETION build -> serving froze on a half-built DB.
+# Fix: trigger the publisher HERE, as the nightly's final step, gated on a clean
+# build (EXIT_CODE 0=clean or 1=partial -> the warehouse tables WERE rebuilt, matching
+# the dashboard/D1-publish policy above; only exit 2 hard-abort skips). This
+# couples the promote to actual build completion. The 06:30 timer is KEPT as a fallback
+# (covers a nightly that died before reaching this line). The publisher's own flock
+# (publish.lock, LOCK_NB) makes a double-promote impossible — if the 06:30 timer is mid-
+# promote, this one aborts cleanly ("another publish holds the lock"), and vice-versa.
+# The publisher ALSO re-validates server-side (size/verdict gate) before swapping, so it
+# can never promote a bad snapshot regardless of trigger. Non-fatal: a failed promote
+# logs + alerts (the 06:30 fallback + the 07:15/09:00 success-watchdog still cover it)
+# and does NOT change FINAL_EXIT, so it can't mask the orchestrator's own status.
+# Reversible: delete this block to revert to timer-only promotion.
+if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
+    echo "promoting serving snapshot (nightly complete; coupling promote to build completion)" | tee -a "$LOG_FILE"
+    PUBLISHER_BIN="${PUBLISHER_BIN:-/opt/duckdb/bin/publisher.py}"
+    PUBLISHER_PY="${PUBLISHER_PY:-/opt/duckdb/venv/bin/python}"
+    PROMOTE_TIMEOUT_S="${PROMOTE_TIMEOUT_S:-900}"   # serving copy is ~50GiB; allow 15m, then bound
+    if [[ -x "$PUBLISHER_PY" && -f "$PUBLISHER_BIN" ]]; then
+        set +e
+        SERVING_PROFILE=prod SERVING_CONFIG=/opt/duckdb/bin/config.yaml \
+            timeout --signal=TERM --kill-after=60 "$PROMOTE_TIMEOUT_S" \
+            "$PUBLISHER_PY" "$PUBLISHER_BIN" --reason nightly-complete 2>&1 | tee -a "$LOG_FILE"
+        PROMOTE_RC=${PIPESTATUS[0]}
+        set -e
+        if [[ "$PROMOTE_RC" -eq 0 ]]; then
+            echo "serving snapshot promoted at nightly completion (rc=0)" | tee -a "$LOG_FILE"
+        else
+            # rc=1 can be a benign no-op (the 06:30 timer already promoted this same build,
+            # or we landed inside the 03:30-05:45 guard on an unusually fast night) — the
+            # publisher logs the precise reason. Alert anyway so a REAL promote failure is
+            # never silent; the 06:30 fallback + success-watchdog remain the safety net.
+            echo "WARN serving snapshot promote at completion returned rc=$PROMOTE_RC (06:30 timer fallback still armed)" | tee -a "$LOG_FILE"
+            "$PYTHON" scripts/alert_slack.py \
+                ":warning: *serving snapshot promote-at-completion rc=$PROMOTE_RC* — the nightly tried to promote the freshly-built serving snapshot but the publisher returned non-zero (could be a benign no-op if the 06:30 timer already promoted this build; check /opt/duckdb/logs). The 06:30 timer + 07:15/09:00 success-watchdog still cover serving freshness. Investigate /opt/duckdb/bin/publisher.py if serving is stale." \
+                2>&1 | tee -a "$LOG_FILE" || true
+        fi
+    else
+        echo "WARN publisher not found ($PUBLISHER_PY / $PUBLISHER_BIN) — skipping promote-at-completion; 06:30 timer fallback still promotes" | tee -a "$LOG_FILE"
+    fi
+fi
+
 echo "exit=$FINAL_EXIT (orchestrator=$EXIT_CODE degraded=$NIGHTLY_DEGRADED)" | tee -a "$LOG_FILE"
 exit $FINAL_EXIT
