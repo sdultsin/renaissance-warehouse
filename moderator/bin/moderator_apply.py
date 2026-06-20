@@ -337,7 +337,7 @@ def _promote_acceptable(p: dict | None, promote_requested: bool) -> bool:
 
 
 def apply_now(actor: str, max_items: int = 25, promote: bool = True,
-              reason: str | None = None) -> dict:
+              reason: str | None = None, force_promote: bool = False) -> dict:
     """Drain ledger-approved queued DDLs to the LIVE warehouse under the warehouse-writer flock, then
     re-promote the serving snapshot. Returns a clear, structured result.
 
@@ -345,8 +345,9 @@ def apply_now(actor: str, max_items: int = 25, promote: bool = True,
     RELEASED in a finally; record+apply = one critical section vs the nightly). The flock + the DB
     connection are released BEFORE the promote so the publisher copies a writer-idle, fully-committed
     file. Promote runs only when something was NEWLY applied (a pure no-op/blocked batch skips the
-    ~10-min copy); the empty-queue path still honors an explicit promote so "make it live" is never a
-    silent no-op.
+    ~10-min copy). With an EMPTY queue we do NOT auto-fire a ~10-min promote on an accidental re-run;
+    force_promote=True is the explicit "promote-only" path (surface an already-applied-but-unserved
+    change). promote=False skips the promote entirely (advanced).
     """
     t0 = time.time()
     result = {"applied": [], "promote": None, "freshness": None, "actor": actor, "ok": True}
@@ -358,10 +359,12 @@ def apply_now(actor: str, max_items: int = 25, promote: bool = True,
     claimed = _claim_queued(max_items)
     if not claimed:
         result["detail"] = "no queued ledger-approved DDLs to apply"
-        if promote:
+        if promote and force_promote:
             result["promote"] = _run_publisher(reason or f"apply-now ({actor}): promote-only")
+        elif promote:
+            result["detail"] += " (nothing to promote; use --promote-only to force a re-promote)"
         result["freshness"] = _snapshot_freshness()
-        result["ok"] = _promote_acceptable(result["promote"], promote)
+        result["ok"] = _promote_acceptable(result["promote"], promote and force_promote)
         result["elapsed_s"] = round(time.time() - t0, 1)
         return result
 

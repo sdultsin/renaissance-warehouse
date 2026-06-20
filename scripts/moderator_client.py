@@ -579,6 +579,8 @@ def cmd_apply_now(args) -> int:
     body = {"actor": os.environ.get("USER", "?")}
     if getattr(args, "no_promote", False):
         body["promote"] = False
+    if getattr(args, "promote_only", False):
+        body["force_promote"] = True
     if getattr(args, "reason", None):
         body["reason"] = args.reason
     print("apply-now: applying ledger-approved DDLs + re-promoting the serving snapshot "
@@ -673,6 +675,9 @@ def main(argv=None) -> int:
     an = sub.add_parser("apply-now", help="apply ledger-approved enqueued DDLs LIVE now + re-promote (no nightly wait)")
     an.add_argument("--no-promote", dest="no_promote", action="store_true",
                     help="apply to the live DB but skip the serving re-promote (advanced)")
+    an.add_argument("--promote-only", dest="promote_only", action="store_true",
+                    help="force a serving re-promote even when nothing is queued (surface an "
+                         "already-applied change) — triggers the ~10-min snapshot copy")
     an.add_argument("--reason", help="reason string recorded in the publish/apply log")
     args = p.parse_args(argv)
     if args.cmd == "doctor":
