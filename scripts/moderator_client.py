@@ -120,7 +120,8 @@ def token() -> str:
     sys.exit(_TOKEN_MISSING_MSG)
 
 
-def _req(method: str, path: str, body: dict | None = None, params: dict | None = None) -> dict:
+def _req(method: str, path: str, body: dict | None = None, params: dict | None = None,
+         timeout: int = 180) -> dict:
     url = base_url() + path
     if params:
         from urllib.parse import urlencode
@@ -131,7 +132,7 @@ def _req(method: str, path: str, body: dict | None = None, params: dict | None =
     req.add_header("Content-Type", "application/json")
     ctx = ssl.create_default_context()
     try:
-        with urllib.request.urlopen(req, timeout=180, context=ctx) as r:
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
             return json.loads(r.read().decode())
     except urllib.error.HTTPError as e:
         try:
@@ -581,8 +582,12 @@ def cmd_apply_now(args) -> int:
     if getattr(args, "reason", None):
         body["reason"] = args.reason
     print("apply-now: applying ledger-approved DDLs + re-promoting the serving snapshot "
-          "(the snapshot copy can take a few minutes — please wait)…")
-    res = _req("POST", "/apply-now", body)
+          "(the snapshot copy can take several minutes / ~10 — please wait, do not interrupt)…")
+    # The promote copies the ~50GB warehouse (~10 min), far longer than the default 180s socket
+    # timeout — give apply-now a generous window so the client waits for the real result instead of
+    # timing out mid-promote. Overridable via MODERATOR_APPLY_NOW_TIMEOUT_S.
+    an_timeout = int(os.environ.get("MODERATOR_APPLY_NOW_TIMEOUT_S", "1800"))
+    res = _req("POST", "/apply-now", body, timeout=an_timeout)
     if res.get("error") and not res.get("applied"):
         print(f"  apply-now ERROR: {res['error']}")
         return 1
