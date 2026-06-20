@@ -404,8 +404,11 @@ def cmd_doctor(args) -> int:
         print(f"  {OK} ALL CHECKS PASS — you are set up to edit the warehouse. Author your")
         print("     sql/ddl/NN_*.sql (or entities|sources|scripts/*.py) then run:")
         print("       python scripts/moderator_client.py loop --files <your-files>")
-        print("     A 'queued for nightly' / 'recorded' result is CORRECT — changes apply on the")
-        print("     ~03:30 UTC nightly rebuild by design, not instantly.")
+        print("     A 'queued for nightly' / 'recorded' result is CORRECT — by default the change")
+        print("     applies on the ~03:30 UTC nightly rebuild. To make it LIVE NOW instead, run:")
+        print("       python scripts/moderator_client.py apply-enqueue --files <your-files>")
+        print("       python scripts/moderator_client.py apply-now   # applies live + re-promotes")
+        print("     (apply-now waits ~10 min for the serving snapshot copy — that's expected.)")
         return 0
     print(f"  {BAD} {len(fails)} check(s) failed: {', '.join(fails)} — apply the FIX lines above, then")
     print("     re-run:  python scripts/moderator_client.py doctor")
