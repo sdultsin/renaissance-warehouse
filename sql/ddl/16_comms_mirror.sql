@@ -158,7 +158,7 @@ CREATE TABLE IF NOT EXISTS raw_comms_call_opportunity (
     _run_id                     VARCHAR
 );
 
--- comms.phone_enrichment  (phone-enrichment audit; opportunity_id, not conversation_id)
+-- comms.phone_enrichment  (Prospeo enrich audit; opportunity_id, not conversation_id)
 CREATE TABLE IF NOT EXISTS raw_comms_phone_enrichment (
     id              BIGINT,
     opportunity_id  BIGINT,

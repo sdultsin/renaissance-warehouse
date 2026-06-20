@@ -31,6 +31,7 @@ phase (no core/config.py PHASE_ORDER edit).
 from __future__ import annotations
 
 import logging
+import os
 
 from core.config import REPO_ROOT
 from core.registry import Registry, RunContext
@@ -50,22 +51,20 @@ _EMAIL_SOURCES = [
 ]
 
 # ── Scraped-attr enrichment from the lead-DB mirror ───────────────────────────
-# TODO(parent): wire scraped attrs from the lead mirror once its table name/columns are
-# confirmed. The mirror is a local duckdb on the droplet (see memory: lead_mirror.duckdb /
-# `mca_lead` etc.) but no such table/view is declared in this repo's sql/ddl/*, so we cannot
-# confirm a name or column set from the DDL. Until then attrs stay NULL and the join is OFF.
-# To enable: set _ENRICH_MIRROR_TABLE to the confirmed table (e.g. 'lead_mirror' /
-# 'raw_leads_mirror') and map the columns in _MIRROR_COLS, then flip _ENABLE_MIRROR_ENRICH.
-_ENABLE_MIRROR_ENRICH = False
-_ENRICH_MIRROR_TABLE = None  # e.g. "lead_mirror" — must match exactly; never guess.
-_MIRROR_COLS = {
-    # warehouse column : mirror column (only used when _ENABLE_MIRROR_ENRICH is True)
-    "first_name": "first_name",
-    "company": "company",
-    "segment": "segment",
-    "industry": "industry",
-    "lead_source": "lead_source",
-}
+# The lead mirror is a SEPARATE droplet DuckDB (mirror.leads_current, ~27.7M leads, the
+# nightly mirror of the lead DB). We ATTACH it READ-ONLY and LEFT JOIN by email (100% keyed,
+# deterministic) to populate the scraped identity attrs. ATTACH (not copy) = consolidation
+# without duplicating the 21.8 GB file or touching the single-writer lock.
+# Verified columns: first_name/enrich_first_name, company_name, general_industry/
+# specific_industry, source_list_name, source, email, phone.
+_LEAD_MIRROR_DB = os.environ.get(
+    "LEAD_MIRROR_DB", "/root/renaissance-worker/jobs/lead-mirror/lead_mirror.duckdb"
+)
+# Opt-in: the in-line 247k×27.7M cross-ATTACH join is too heavy to hold the nightly writer
+# lock by default. The sustainable delivery is to materialize the mirror into the warehouse
+# (core.lead as the full dimension) so enrichment is a fast in-warehouse join. Until that
+# lands, set LEAD_SPINE_ENRICH=1 to do the cross-ATTACH enrich.
+_ENABLE_MIRROR_ENRICH = os.environ.get("LEAD_SPINE_ENRICH", "0") == "1"
 
 
 def register(registry: Registry) -> None:
@@ -165,36 +164,80 @@ def run(ctx: RunContext) -> PhaseResult:
     # ── Idempotent rebuild ──
     db.execute("DELETE FROM core.lead")
 
-    enriched = (
-        _ENABLE_MIRROR_ENRICH
-        and _ENRICH_MIRROR_TABLE
-        and _table_exists(db, _ENRICH_MIRROR_TABLE)
-    )
-    if enriched:
-        # LEFT JOIN the confirmed lead mirror by exact email (deterministic).
-        m = _MIRROR_COLS
-        db.execute(
-            f"""
-            INSERT INTO core.lead
-              (lead_key, email, phone_e164, first_name, company, segment, industry,
-               lead_source, resolution_confidence, first_seen_at, resolved_at)
-            SELECT
-              s.lead_key, s.email, s.phone_e164,
-              lm.{m['first_name']}, lm.{m['company']}, lm.{m['segment']},
-              lm.{m['industry']}, lm.{m['lead_source']},
-              CASE
-                WHEN s.resolution_confidence = 'phone' THEN 'phone'
-                WHEN lm.{m['first_name']} IS NULL AND lm.{m['company']} IS NULL
-                     THEN 'unmatched'
-                ELSE 'email'
-              END AS resolution_confidence,
-              s.first_seen_at, now()
-            FROM _lead_stage s
-            LEFT JOIN {_ENRICH_MIRROR_TABLE} lm
-              ON s.email IS NOT NULL AND lm.email = s.email
-            """
-        )
-    else:
+    enriched = False
+
+    # Path 1: pre-materialized core.lead_attrs (fast in-warehouse join, no ATTACH).
+    # prebuild_lead_attrs.py populates this before the nightly (cron 02:30 UTC).
+    if not enriched and _table_exists(db, "core.lead_attrs"):
+        n_attrs = db.execute("SELECT count(*) FROM core.lead_attrs").fetchone()[0]
+        if n_attrs > 0:
+            try:
+                db.execute("""
+                    INSERT INTO core.lead
+                      (lead_key, email, phone_e164, first_name, company, segment, industry,
+                       lead_source, resolution_confidence, first_seen_at, resolved_at)
+                    SELECT
+                      s.lead_key, s.email, s.phone_e164,
+                      la.first_name,
+                      la.company_name                                        AS company,
+                      la.source_list_name                                    AS segment,
+                      coalesce(la.specific_industry, la.general_industry)   AS industry,
+                      la.source                                              AS lead_source,
+                      CASE
+                        WHEN s.resolution_confidence = 'phone' THEN 'phone'
+                        WHEN la.email IS NULL THEN 'unmatched'
+                        ELSE 'email'
+                      END                                                    AS resolution_confidence,
+                      s.first_seen_at, now()
+                    FROM _lead_stage s
+                    LEFT JOIN core.lead_attrs la
+                      ON s.email IS NOT NULL AND la.email = s.email
+                """)
+                enriched = True
+                logger.info("lead_spine: enriched via core.lead_attrs (%d rows)", n_attrs)
+            except Exception as exc:
+                logger.warning("lead_attrs enrich failed (%s) — falling back", str(exc)[:160])
+                db.execute("DELETE FROM core.lead")
+
+    # Path 2: direct ATTACH to lead_mirror (heavy; only if lead_attrs absent/empty).
+    if not enriched and _ENABLE_MIRROR_ENRICH and os.path.exists(_LEAD_MIRROR_DB):
+        try:
+            db.execute("DETACH DATABASE IF EXISTS leadmirror")
+            db.execute(f"ATTACH '{_LEAD_MIRROR_DB}' AS leadmirror (READ_ONLY)")
+            # one row per email in the mirror (leads_current is already current-snapshot)
+            db.execute(
+                """
+                INSERT INTO core.lead
+                  (lead_key, email, phone_e164, first_name, company, segment, industry,
+                   lead_source, resolution_confidence, first_seen_at, resolved_at)
+                SELECT
+                  s.lead_key, s.email, s.phone_e164,
+                  coalesce(lm.enrich_first_name, lm.first_name)        AS first_name,
+                  lm.company_name                                       AS company,
+                  lm.source_list_name                                   AS segment,
+                  coalesce(lm.specific_industry, lm.general_industry)   AS industry,
+                  lm.source                                             AS lead_source,
+                  CASE
+                    WHEN s.resolution_confidence = 'phone' THEN 'phone'
+                    WHEN lm.email IS NULL THEN 'unmatched'
+                    ELSE 'email'
+                  END                                                   AS resolution_confidence,
+                  s.first_seen_at, now()
+                FROM _lead_stage s
+                LEFT JOIN leadmirror.mirror.leads_current lm
+                  ON s.email IS NOT NULL AND lm.email = s.email
+                """
+            )
+            db.execute("DETACH DATABASE IF EXISTS leadmirror")
+            enriched = True
+        except Exception as exc:  # mirror locked/missing -> fall back to attrs-NULL, never fail the build
+            logger.warning("lead mirror enrich failed (%s) — attrs NULL this run", str(exc)[:160])
+            db.execute("DELETE FROM core.lead")
+            try:
+                db.execute("DETACH DATABASE IF EXISTS leadmirror")
+            except Exception:
+                pass
+    if not enriched:
         # Mirror not confirmed — attrs NULL, confidence reflects key type only.
         db.execute(
             """

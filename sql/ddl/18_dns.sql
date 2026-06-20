@@ -1,4 +1,4 @@
--- Phase 3: DNS + blacklist sweep raw tables (spec 07).
+-- Phase 3: DNS + blacklist sweep raw tables (spec 07 / 07a).
 -- Applied at schema version 18 by scripts/setup_db.py / orchestrator DDL applier.
 --
 -- TWO raw objects (canonical core.domain is built separately in a later DDL):
@@ -10,10 +10,11 @@
 -- The full merged dict is preserved verbatim in raw_json for fields not promoted to
 -- a scalar column.
 --
--- v1 blocklist set = a small set of domain zones (surbl, spamrl, spamhaus_dbl).
--- IP zones (barracuda/uceprotect/spamcop) + Spamhaus DQS REST are deferred to v1.1.
--- Queries go through a local recursive resolver (some zones return sentinel answers
--- to large shared resolvers; dns.py handles this).
+-- v1 blocklist set = the production "existing 3" domain zones (surbl, spamrl,
+-- spamhaus_dbl) per prep-notes 07a rec #1 ("start with existing 3, measure baseline
+-- before extending"). IP zones (barracuda/uceprotect/spamcop) + Spamhaus DQS REST
+-- are deferred to v1.1. All queries go through the droplet's local recursive resolver
+-- (127.0.0.2) — mandatory, or SURBL/Spamhaus poison the answers (dns.py handles this).
 
 CREATE TABLE IF NOT EXISTS raw_dns_sweep_domain (
     domain                  VARCHAR,

@@ -10,7 +10,7 @@
 
 set -euo pipefail
 
-HOST="${WAREHOUSE_HOST:?set WAREHOUSE_HOST to the droplet ssh host}"
+HOST="${WAREHOUSE_HOST:-renaissance-worker}"
 DB="${CORE_DB_PATH:-/root/core/warehouse.duckdb}"
 
 if [[ $# -eq 0 ]]; then

@@ -12,7 +12,8 @@
 -- raw_close_call    — one row per Close call id (UPSERT on id), typed + api_response_raw.
 -- core.call         — canonical call fact (DELETE+INSERT rebuild from raw).
 -- core.warm_caller  — per-(user) rollups + an aggregate 'ALL' row (MVP entity).
--- core.call_outcome — DETERMINISTIC outcome_class from disposition + rep note (no LLM).
+-- core.call_outcome — disposition-only outcome_class (voicemail/no_answer/answered). Note is
+--                     ground truth for intent; read it directly, do not classify it.
 -- core.call_transcript — EMPTY here; WS-H (local Whisper) fills it. PII -> droplet-only.
 --
 -- Additive only. No ALTER/DROP/rename of any pre-existing table or view.
@@ -68,6 +69,7 @@ CREATE TABLE IF NOT EXISTS core.call (
     warm_caller_id   VARCHAR,        -- 'ALL' (MVP aggregate)
     user_id          VARCHAR,        -- real Close user id (for the later per-rep split)
     user_name        VARCHAR,
+    caller_name      VARCHAR,        -- parsed from note prefix (rep types their first name)
     direction        VARCHAR,
     disposition      VARCHAR,
     duration_seconds INTEGER,
@@ -79,6 +81,8 @@ CREATE TABLE IF NOT EXISTS core.call (
     source_channel   VARCHAR,        -- Close lead custom field (Instantly|Sendivo); id from env CLOSE_CF_SOURCE
     resolved_at      TIMESTAMPTZ
 );
+-- Additive migration: add caller_name to existing deployments.
+ALTER TABLE core.call ADD COLUMN IF NOT EXISTS caller_name VARCHAR;
 
 -- ── CANONICAL: core.warm_caller ──────────────────────────────────────────────
 -- One row per warm_caller_id: the aggregate 'ALL' row AND one row per real Close user.
@@ -95,21 +99,19 @@ CREATE TABLE IF NOT EXISTS core.warm_caller (
 );
 
 -- ── CANONICAL: core.call_outcome ─────────────────────────────────────────────
--- One row per call_id. outcome_class derived DETERMINISTICALLY (no LLM) from
--- disposition + lowercased note keywords. 0 rows may have NULL outcome_class.
---   no_answer               — disposition no-answer/error (not connected, no voicemail)
---   voicemail               — vm-left, voicemail_url, or voicemail_duration > 0
---   answered_not_interested — answered + note ~ 'not interested' / 'no' / 'dnc'
---   answered_appt_set       — answered + note ~ appointment/booked/scheduled/set
---   answered_other          — answered, none of the above (needs_llm = true; WS-H refines)
--- needs_llm flags rows WS-H should refine from the transcript.
+-- One row per call_id. outcome_class is disposition-only — three values:
+--   voicemail  — vm-left disposition, voicemail_url, or voicemail_duration > 0
+--   no_answer  — no-answer, busy, error, canceled (not connected)
+--   answered   — connected in any way
+-- note is the rep's verbatim Close note — the ground truth for intent/outcome.
+-- Read note directly; do not classify it with keywords.
 CREATE TABLE IF NOT EXISTS core.call_outcome (
     call_id       VARCHAR PRIMARY KEY,
-    outcome_class VARCHAR NOT NULL,   -- never NULL (DoD)
-    note          VARCHAR,            -- raw rep note (verbatim)
-    needs_llm     BOOLEAN,            -- true for answered_other (WS-H refine target)
+    outcome_class VARCHAR NOT NULL,
+    note          VARCHAR,            -- verbatim rep note; ground truth for intent
     resolved_at   TIMESTAMPTZ
 );
+ALTER TABLE core.call_outcome DROP COLUMN IF EXISTS needs_llm;
 
 -- ── CANONICAL: core.call_transcript (EMPTY — WS-H fills) ──────────────────────
 -- Created here so the table exists; WS-H (local Whisper on the droplet) populates it.

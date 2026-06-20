@@ -5,20 +5,20 @@
 -- fingerprint of every active sending domain). Enriched with:
 --   - esp / infra_provider / lifecycle aggregated from core.sending_account (the
 --     inboxes hosted on the domain)
---   - ns_provider / registrar / acquisition_batch / acquisition_date from an
---     NS-handoff CSV (seed_data/domains/ns-handoff.csv)
---   - cost_acquisition from the matching batch row in core.cost_ledger
+--   - ns_provider / registrar / acquisition_batch / acquisition_date from the
+--     Lucas/Tomer .co NS-handoff CSV (seed_data/domains/ns-handoff.csv, 2,002 rows)
+--   - cost_acquisition from the .co batch ($1.80) for batch-tagged domains
 --
--- redirect_chain / terminal_redirect are NULL in v1 (redirect probe deferred from the
--- bulk sweep for speed). sheet_status NULL until sheet ingest.
+-- redirect_chain / terminal_redirect are NULL in v1 (factor-5 redirect probe deferred
+-- from the bulk sweep for speed — see GAPS F1). sheet_status NULL until sheet ingest.
 -- Built under the 'canonical' phase, full rebuild each run.
 
 CREATE SCHEMA IF NOT EXISTS core;
 
 CREATE TABLE IF NOT EXISTS core.domain (
     domain                VARCHAR PRIMARY KEY,
-    registrar             VARCHAR,        -- registrar identifier (known only for NS-handoff domains in v1)
-    registrar_account     VARCHAR,        -- registrar account/slot label (NS-handoff)
+    registrar             VARCHAR,        -- 'dynadot' | ... (known only for NS-handoff domains in v1)
+    registrar_account     VARCHAR,        -- e.g. 'Dynadot #11' (NS-handoff slot)
     acquisition_date      DATE,
     acquisition_batch     VARCHAR,        -- FK to core.cost_ledger.attribution_id (attribution_dim='batch')
     brand_prefix          VARCHAR,        -- domain label minus TLD (factor-4 brand clustering)

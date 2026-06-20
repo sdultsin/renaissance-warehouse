@@ -204,6 +204,35 @@ def run_sending_dq(ctx: RunContext) -> PhaseResult:
         FROM deduped
         WHERE rn = 1
     """)
+
+    # [2026-06-16 infra-data-truth] ESP BACKFILL. The CSV's infra_type is 'Missing Current Inventory'
+    # for accounts that sent but aren't in the (cached) account_truth inventory -> esp=NULL above
+    # (~85k rows/day, ~43k of them sending), which broke the by-infra sending split. core.sending_account_vendor
+    # (DDL 72, 100% mapped) is the warehouse vendor truth; project it to esp. Verified mapping (1:1 where
+    # both known): MailIn->outlook, Outreach Today->otd, Reseller->google, Cheap Inboxes->outlook (all
+    # provider_code=3). Recovers ~91% of esp-null rows; the residual (~5-8k/day) are accounts absent from
+    # the vendor table (brand-new / deleted-workspace) and stay NULL. Idempotent; no-op once esp is set.
+    try:
+        db.execute("""
+            UPDATE core.sending_account_daily AS sad
+            SET esp = CASE v.vendor_category
+                          WHEN 'MailIn'         THEN 'outlook'
+                          WHEN 'Outreach Today' THEN 'otd'
+                          WHEN 'Reseller'       THEN 'google'
+                          WHEN 'Cheap Inboxes'  THEN 'outlook'
+                      END
+            FROM core.sending_account_vendor AS v
+            WHERE sad.esp IS NULL
+              AND lower(v.account_email) = lower(sad.account_id)
+              AND v.vendor_category IN ('MailIn', 'Outreach Today', 'Reseller', 'Cheap Inboxes')
+        """)
+        backfilled = db.execute(
+            "SELECT count(*) FROM core.sending_account_daily WHERE esp IS NOT NULL"
+        ).fetchone()[0]
+        logger.info("D3: esp backfilled from sending_account_vendor; %d rows now have esp", backfilled)
+    except Exception as exc:  # core.sending_account_vendor may not exist on a fresh DB -> skip, non-fatal
+        logger.warning("D3: esp backfill skipped (%s)", exc)
+
     canonical_rows = db.execute("SELECT count(*) FROM core.sending_account_daily").fetchone()[0]
     logger.info("D3: core.sending_account_daily rebuilt with %d rows", canonical_rows)
 

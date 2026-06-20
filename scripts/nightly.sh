@@ -188,6 +188,15 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     "$PYTHON" scripts/build_sla_reply_time.py 2>&1 | tee -a "$LOG_FILE" \
         || echo "WARN sla_reply_time_build_failed (continuing)" | tee -a "$LOG_FILE"
 
+    # Deliverability reply-lag monitor (D2): rebuild core.deliv_reply_lag (send->first-reply
+    # latency, the deliverability leading indicator — distinct from the SLA handling metric
+    # above) + re-snapshot the trailing 14d. Reads main.raw_pipeline_conversation_messages.
+    # Pairs with the human-vs-auto tile (pure views over raw_pipeline_campaign_daily_metrics,
+    # no build). Both surfaced to #cc-sam by the 07:00Z deliv-monitors cron. (deliv-monitors)
+    echo "building core.deliv_reply_lag (deliverability reply-lag monitor)" | tee -a "$LOG_FILE"
+    "$PYTHON" scripts/build_deliv_reply_lag.py 2>&1 | tee -a "$LOG_FILE" \
+        || echo "WARN deliv_reply_lag_build_failed (continuing)" | tee -a "$LOG_FILE"
+
     # Instantly credits: pull per-workspace lead-list quota from the Instantly billing
     # API (read-only) and UPSERT a daily snapshot into core.instantly_credit (drops the
     # "The Eagles" free-trial junk row). Self-contained (runs portal_credits.py internally).

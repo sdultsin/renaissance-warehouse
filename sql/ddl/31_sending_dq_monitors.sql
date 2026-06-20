@@ -56,16 +56,6 @@ WHERE sa.is_active
 -- D2: tag coverage gaps (LIVE — uses core.sending_account_tag from SPEC A)
 -- Surfaces active accounts whose ESP has no matching vendor tag.
 -- ============================================================================
-CREATE TABLE IF NOT EXISTS core.sending_account_tag (
-    email          VARCHAR NOT NULL,
-    workspace_slug VARCHAR,
-    tag_id         VARCHAR,
-    tag_label      VARCHAR NOT NULL,
-    first_seen_at  TIMESTAMPTZ,
-    last_seen_at   TIMESTAMPTZ,
-    PRIMARY KEY (email, tag_label)
-);
-
 CREATE OR REPLACE VIEW v_tag_coverage_gaps AS
 WITH vendor_tags AS (
     SELECT tag_label FROM (VALUES
@@ -140,7 +130,7 @@ CREATE TABLE IF NOT EXISTS core.sending_account_daily (
 -- D4: Freshness signal — add _snapshot_date to core.sending_account
 -- (ALTER TABLE is idempotent via TRY; DuckDB doesn't have IF NOT EXISTS for columns)
 -- ============================================================================
-ALTER TABLE core.sending_account ADD COLUMN _snapshot_date DATE;
+-- Column addition handled in entity code (ALTER TABLE ADD COLUMN pattern).
 
 CREATE OR REPLACE VIEW v_sending_account_freshness AS
 SELECT

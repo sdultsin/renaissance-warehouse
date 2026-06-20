@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Run the 2026-06-08 warehouse-hardening DoD checks (read-only) and post a PASS/FAIL
-summary to the configured alert channel. Called at the end of the write batch so the
-autonomous landing self-reports.
+summary to #cc-sam. Called at the end of the write batch so the autonomous landing
+self-reports.
 
 Usage:
     python scripts/verify_hardening_dod.py            # check + post summary
@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 import urllib.request
 from pathlib import Path
@@ -20,8 +19,7 @@ import duckdb
 
 from core.config import DB_PATH, REPO_ROOT
 
-# Alert channel id from env (set via SLACK_ALERT_CHANNEL); alert is skipped if unset.
-SLACK_CHANNEL = os.environ.get("SLACK_ALERT_CHANNEL", "")
+SLACK_CHANNEL = "C0AR0EA21C1"
 
 
 def slack_post(text: str) -> dict:
@@ -33,10 +31,9 @@ def slack_post(text: str) -> dict:
                 k, _, v = line.partition("=")
                 env[k.strip()] = v.strip().strip('"').strip("'")
     token, cookie = env.get("SLACK_TOKEN"), env.get("SLACK_COOKIE")
-    channel = SLACK_CHANNEL or env.get("SLACK_ALERT_CHANNEL", "")
-    if not token or not channel:
-        return {"ok": False, "error": "no_token_or_channel"}
-    body = json.dumps({"channel": channel, "text": text}).encode()
+    if not token:
+        return {"ok": False, "error": "no_token"}
+    body = json.dumps({"channel": SLACK_CHANNEL, "text": text}).encode()
     req = urllib.request.Request("https://slack.com/api/chat.postMessage", data=body,
         headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json; charset=utf-8",
                  **({"Cookie": f"d={cookie}"} if cookie else {})}, method="POST")

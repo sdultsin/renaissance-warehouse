@@ -25,6 +25,16 @@ logger = logging.getLogger("entities.sendivo")
 BACKFILL_DAYS = int(os.environ.get("SENDIVO_BACKFILL_DAYS", "7"))
 
 
+def _as_str(v):
+    """Coerce a maybe-scalar/maybe-collection API field to a VARCHAR-safe value.
+    Lists/dicts (e.g. tags, an array vetting_score) -> JSON; scalars -> str; None -> None."""
+    if v is None:
+        return None
+    if isinstance(v, (list, dict)):
+        return json.dumps(v)
+    return str(v)
+
+
 def register(registry: Registry) -> None:
     registry.add_phase("sendivo", "mirror", run_sendivo_mirror)
     registry.add_phase("canonical", "sendivo_cost", run_sendivo_cost)
@@ -77,34 +87,68 @@ def run_sendivo_mirror(ctx: RunContext) -> PhaseResult:
         per["delivery_metrics_days"] = len(dm_rows)
         rows_total += len(dm_rows)
 
+        # --- brands (snapshot) — fetched BEFORE campaigns so we can recover a campaign's
+        #     sub_account_id from its brand (the /campaigns payload dropped top-level
+        #     sub_account_id around 2026-06; without this the column silently goes all-NULL). ---
+        conn.execute("DELETE FROM raw_sendivo_brands WHERE _run_id = ?", [run_id])
+        brands = cli.brands()
+        brand_sub = {b.get("id"): b.get("sub_account_id") for b in brands if b.get("id")}
+        if brands:
+            conn.executemany(
+                "INSERT INTO raw_sendivo_brands (brand_id, name, legal_company_name, verification_status, "
+                "registration_state, campaigns_count, sub_account_id, created_at, dba_name, country, "
+                "vertical_type, website, vetting_score, brand_identity_status, _loaded_at, _run_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now(), ?)",
+                [(b.get("id"), b.get("name"), b.get("legal_company_name"), b.get("verification_status"),
+                  b.get("registration_state"), b.get("campaigns_count"), b.get("sub_account_id"),
+                  b.get("created_at"), b.get("dba_name"), b.get("country"), b.get("vertical_type"),
+                  b.get("website"), _as_str(b.get("vetting_score")), b.get("brand_identity_status"),
+                  run_id) for b in brands])
+        per["brands"] = len(brands)
+        rows_total += len(brands)
+
         # --- campaigns (snapshot) ---
         conn.execute("DELETE FROM raw_sendivo_campaigns WHERE _run_id = ?", [run_id])
         camps = cli.campaigns()
         if camps:
             conn.executemany(
                 "INSERT INTO raw_sendivo_campaigns (campaign_id, name, status, brand_id, brand_name, "
-                "phone_numbers, sub_account_id, created_at, _loaded_at, _run_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, now(), ?)",
+                "phone_numbers, sub_account_id, created_at, description, tcr_status, campaign_type, "
+                "use_case, is_default, registered_on, expiration_date, auto_renew, _loaded_at, _run_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now(), ?)",
                 [(c.get("id"), c.get("name"), c.get("status"),
                   (c.get("brand") or {}).get("id"), (c.get("brand") or {}).get("name"),
-                  json.dumps(c.get("phone_numbers")), c.get("sub_account_id"),
-                  c.get("created_at"), run_id) for c in camps])
+                  json.dumps(c.get("phone_numbers")),
+                  c.get("sub_account_id") or brand_sub.get((c.get("brand") or {}).get("id")),
+                  c.get("created_at"), c.get("description"), c.get("tcr_status"), c.get("campaign_type"),
+                  json.dumps(c.get("use_case")), c.get("is_default"), _as_str(c.get("registered_on")),
+                  _as_str(c.get("expiration_date")), c.get("auto_renew"), run_id) for c in camps])
         per["campaigns"] = len(camps)
         rows_total += len(camps)
 
-        # --- brands (snapshot) ---
-        conn.execute("DELETE FROM raw_sendivo_brands WHERE _run_id = ?", [run_id])
-        brands = cli.brands()
-        if brands:
+        # --- phone numbers (snapshot) — sending-asset inventory (audit G2). ---
+        conn.execute("DELETE FROM raw_sendivo_phone_numbers WHERE _run_id = ?", [run_id])
+        try:
+            numbers = cli.phone_numbers()
+        except Exception as exc:  # noqa: BLE001 — new endpoint; never let it fail the whole mirror
+            logger.warning("phone_numbers skipped: %s", exc)
+            numbers = []
+        if numbers:
             conn.executemany(
-                "INSERT INTO raw_sendivo_brands (brand_id, name, legal_company_name, verification_status, "
-                "registration_state, campaigns_count, sub_account_id, created_at, _loaded_at, _run_id) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, now(), ?)",
-                [(b.get("id"), b.get("name"), b.get("legal_company_name"), b.get("verification_status"),
-                  b.get("registration_state"), b.get("campaigns_count"), b.get("sub_account_id"),
-                  b.get("created_at"), run_id) for b in brands])
-        per["brands"] = len(brands)
-        rows_total += len(brands)
+                "INSERT INTO raw_sendivo_phone_numbers (phone_number_id, phone_number, friendly_name, "
+                "number_status, messaging_status, phone_number_type, is_default, campaign_id, campaign_name, "
+                "campaign_status, brand_id, brand_name, sub_account_id, tags, purchase_date, renewal_date, "
+                "created_at, updated_at, _loaded_at, _run_id) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now(), ?)",
+                [(n.get("id"), n.get("phone_number"), n.get("friendly_name"),
+                  n.get("number_status"), n.get("messaging_status"), n.get("phone_number_type"),
+                  n.get("is_default"), (n.get("campaign") or {}).get("id"),
+                  (n.get("campaign") or {}).get("name"), (n.get("campaign") or {}).get("status"),
+                  (n.get("brand") or {}).get("id"), (n.get("brand") or {}).get("name"),
+                  n.get("sub_account_id"), _as_str(n.get("tags")), n.get("purchase_date"),
+                  n.get("renewal_date"), n.get("created_at"), n.get("updated_at"), run_id) for n in numbers])
+        per["phone_numbers"] = len(numbers)
+        rows_total += len(numbers)
 
         # --- billing: current + prior month, per sub-account ---
         conn.execute("DELETE FROM raw_sendivo_billing WHERE _run_id = ?", [run_id])

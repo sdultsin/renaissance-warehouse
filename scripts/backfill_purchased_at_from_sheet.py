@@ -25,8 +25,8 @@ from core import db as db_module
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("scripts.backfill_purchased_at_from_sheet")
 
-# Account domain columns in the positional row_json: 3, 6, ... (every 3rd). The range
-# covers all current registrar accounts across our registrar vendors.
+# Account domain columns in the positional row_json: 3, 6, ... (every 3rd). 102 covers
+# all current accounts (Porkbun #1-8, Spaceship #1-6, Dynadot #1-17, ...).
 UNPIVOT = """
 WITH idx AS (SELECT unnest(generate_series(3, 120, 3)) AS i),
 dom AS (

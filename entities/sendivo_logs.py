@@ -38,6 +38,26 @@ CREATE TABLE IF NOT EXISTS raw_sendivo_campaign_daily (
     sub_account_id BIGINT, sub_account_name VARCHAR, status_group VARCHAR,
     n_messages BIGINT, segments BIGINT, cost_usd DOUBLE,
     _loaded_at TIMESTAMPTZ NOT NULL, _run_id VARCHAR);
+
+-- G1 (2026-06-14): the granular status/error breakdown the day-rollup above collapses away.
+-- One row per (day, sub, campaign, status, status_group, status_name, error_description). Kept
+-- separate from raw_sendivo_campaign_daily so the dashboard rollup stays lean (this table only
+-- fans out on the handful of distinct failure reasons). `error_description` is the actionable
+-- account-health signal ("End user out of prepay credit", "Account not provisioned ...").
+CREATE TABLE IF NOT EXISTS raw_sendivo_failure_daily (
+    metric_date DATE, sub_account_id BIGINT, sub_account_name VARCHAR,
+    campaign_id BIGINT, campaign_name VARCHAR,
+    status VARCHAR, status_group VARCHAR, status_name VARCHAR, error_description VARCHAR,
+    n_messages BIGINT, segments BIGINT, cost_usd DOUBLE,
+    _loaded_at TIMESTAMPTZ NOT NULL, _run_id VARCHAR);
+
+-- G3 (2026-06-14): intraday OUTBOUND grain for the send-by-hour view / best-send-time. Lean
+-- (<= 24 x campaigns x subs rows/day). Reply-by-hour comes free from raw_sendivo_inbound.received_at.
+CREATE TABLE IF NOT EXISTS raw_sendivo_hourly (
+    metric_date DATE, hour_utc INTEGER, sub_account_id BIGINT, sub_account_name VARCHAR,
+    campaign_id BIGINT, campaign_name VARCHAR,
+    n_messages BIGINT, delivered_messages BIGINT, segments BIGINT,
+    _loaded_at TIMESTAMPTZ NOT NULL, _run_id VARCHAR);
 """
 
 
@@ -152,6 +172,11 @@ class _BodyCapture:
 
 
 def _target_days(today) -> list[str]:
+    # Explicit-day override (process env, set by the E1/E2 watchdog's --heal re-pull or a manual
+    # backfill): pull exactly these days instead of the trailing window. e.g. "2026-06-11,2026-06-13".
+    explicit = os.environ.get("SENDIVO_LOGS_TARGET_DAYS")
+    if explicit:
+        return [d.strip() for d in explicit.split(",") if d.strip()]
     return [(today - timedelta(days=i)).isoformat() for i in range(BACKFILL_DAYS, 0, -1)]
 
 
@@ -171,25 +196,41 @@ def run_sms_logs(ctx: RunContext) -> PhaseResult:
           # Per-day isolation: a flaky-endpoint failure on one day must NOT raise — that would
           # mark the whole ingest failed and block nightly.sh's dashboard/serving publish.
           try:
-            # key -> [n_messages, segments, cost]
-            agg: dict[tuple, list] = defaultdict(lambda: [0, 0, 0.0])
+            # All three aggregators are folded in the SAME single pass over the day's pages.
+            agg: dict[tuple, list] = defaultdict(lambda: [0, 0, 0.0])       # main daily rollup
+            fail_agg: dict[tuple, list] = defaultdict(lambda: [0, 0, 0.0])  # G1 status/error detail
+            hour_agg: dict[tuple, list] = defaultdict(lambda: [0, 0, 0])    # G3 [n, delivered, seg]
 
             def fold(logs):
                 for x in logs:
                     c = x.get("campaign") or {}
-                    key = (
-                        (x.get("created_at") or "")[:10],
-                        c.get("id"), c.get("name"),
-                        x.get("sub_account_id"), x.get("sub_account_name"),
-                        x.get("status_group_name"),
-                    )
-                    a = agg[key]
-                    a[0] += 1
-                    a[1] += int(x.get("segments") or 0)
+                    cid, cname = c.get("id"), c.get("name")
+                    said, saname = x.get("sub_account_id"), x.get("sub_account_name")
+                    created = x.get("created_at") or ""
+                    day_s = created[:10]
+                    sg = x.get("status_group_name")
+                    seg = int(x.get("segments") or 0)
                     try:
-                        a[2] += float(x.get("price_per_message") or 0)
+                        price = float(x.get("price_per_message") or 0)
                     except (TypeError, ValueError):
-                        pass
+                        price = 0.0
+                    # 1) main daily rollup (grain UNCHANGED — keeps v_sms_campaign_performance lean)
+                    a = agg[(day_s, cid, cname, said, saname, sg)]
+                    a[0] += 1; a[1] += seg; a[2] += price
+                    # 2) G1 status/error detail
+                    fa = fail_agg[(day_s, said, saname, cid, cname,
+                                   x.get("status"), sg, x.get("status_name"), x.get("error_description"))]
+                    fa[0] += 1; fa[1] += seg; fa[2] += price
+                    # 3) G3 hourly outbound (UTC hour from created_at)
+                    try:
+                        hour = int(created[11:13]) if len(created) >= 13 else None
+                    except ValueError:
+                        hour = None
+                    h = hour_agg[(day_s, hour, said, saname, cid, cname)]
+                    h[0] += 1
+                    if sg == "DELIVERED":
+                        h[1] += 1
+                    h[2] += seg
 
             d = cli.sms_logs_page(day, 1, PER_PAGE)
             pg = d.get("pagination") or {}
@@ -219,8 +260,49 @@ def run_sms_logs(ctx: RunContext) -> PhaseResult:
                     "_loaded_at, _run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, now(), ?)",
                     recs,
                 )
+
+            # G1 — status/error detail
+            conn.execute(
+                "DELETE FROM raw_sendivo_failure_daily WHERE metric_date = ? AND _run_id = ?",
+                [day, run_id],
+            )
+            frecs = [
+                (md, said, saname, cid, cname, st, sg, sn, err, n, seg, round(cost, 6), run_id)
+                for (md, said, saname, cid, cname, st, sg, sn, err), (n, seg, cost) in fail_agg.items()
+            ]
+            if frecs:
+                conn.executemany(
+                    "INSERT INTO raw_sendivo_failure_daily (metric_date, sub_account_id, sub_account_name, "
+                    "campaign_id, campaign_name, status, status_group, status_name, error_description, "
+                    "n_messages, segments, cost_usd, _loaded_at, _run_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now(), ?)",
+                    frecs,
+                )
+
+            # G3 — hourly outbound
+            conn.execute(
+                "DELETE FROM raw_sendivo_hourly WHERE metric_date = ? AND _run_id = ?",
+                [day, run_id],
+            )
+            hrecs = [
+                (md, hr, said, saname, cid, cname, n, deliv, seg, run_id)
+                for (md, hr, said, saname, cid, cname), (n, deliv, seg) in hour_agg.items()
+            ]
+            if hrecs:
+                conn.executemany(
+                    "INSERT INTO raw_sendivo_hourly (metric_date, hour_utc, sub_account_id, sub_account_name, "
+                    "campaign_id, campaign_name, n_messages, delivered_messages, segments, _loaded_at, _run_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, now(), ?)",
+                    hrecs,
+                )
+
             msgs = sum(r[6] for r in recs)
-            per[day] = {"pages": last_page, "api_total": total, "groups": len(recs), "msgs": msgs}
+            # E1/E2 reconciliation: committed vs the API's full-table count. delta!=0 => silent
+            # drop (a mid-run page failure under-counted). The watchdog reads these notes + the
+            # committed sum and re-pulls/alerts; surfacing here also lands it in the nightly log.
+            delta = (total - msgs) if isinstance(total, int) else None
+            per[day] = {"pages": last_page, "api_total": total, "groups": len(recs), "msgs": msgs,
+                        "delta": delta, "reconciled": (delta == 0)}
             rows_out += len(recs)
             logger.info("sms_logs %s: %s", day, per[day])
           except Exception as exc:  # noqa: BLE001 — never let one flaky day fail the whole nightly

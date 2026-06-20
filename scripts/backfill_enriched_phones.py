@@ -4,14 +4,14 @@
 Today, enriched mobile numbers for Instantly/Sendivo opportunities live ONLY in the
 comms Supabase (``comms.phone_enrichment.mobile_e164``, pushed to Close) and are NEVER
 written back to the lead database. They die there. This job lands them in the lead DB
-(``public.leads``, via LEADS_DB_URL) as an ADDITIVE SIDECAR so the nightly
+(``edpyqbiqzduabtjhwfaa``, ``public.leads``) as an ADDITIVE SIDECAR so the nightly
 lead-mirror picks them up — single source, no double-sync, canonical lead fields untouched.
 
 WHAT IT DOES
   1. READ comms Supabase (COMMS_SUPABASE_DB_URL, psycopg2 over pooler:6543):
        latest ``comms.phone_enrichment`` row per opportunity WHERE mobile_e164 IS NOT NULL
-       (a found mobile_status always carries a number; UNAVAILABLE / NULL never do —
-        the NOT-NULL filter is the robust criterion),
+       (mobile_status = found: 'leadmagic_verified' / 'VERIFIED' both carry a number;
+        UNAVAILABLE / NULL never do — the NOT-NULL filter is the robust criterion),
        JOINed to its ``comms.call_opportunity`` (carries email, source, source_lead_id,
        phone_e164).
   2. RESOLVE each enriched phone to a lead in the lead DB (public.leads) by the §1
@@ -20,7 +20,7 @@ WHAT IT DOES
           -> on miss, phone match on DIGITS (hits idx_leads_phone_digits =
              regexp_replace(phone,'[^0-9]','','g'); E.164 won't hit that index)
           -> if NEITHER matches: FLAG (collected to a flag log, NEVER silently dropped).
-     If a phone matches MULTIPLE lead rows -> ALERT the alert channel and SKIP (no auto-pick).
+     If a phone matches MULTIPLE lead rows -> ALERT #cc-sam and SKIP (no auto-pick).
      (Email is UNIQUE so an email match is always 0 or 1; only phone can be multi.)
   3. WRITE the enriched phone into NEW additive sidecar columns on public.leads:
         enriched_phone, enriched_phone_source, enriched_phone_at
@@ -34,7 +34,7 @@ SAFETY — this touches a 27M-row PRODUCTION table:
     reports how many enrichments WOULD match by email vs phone vs flag vs multi-match,
     prints sample rows. Writes NOTHING. Does NOT run ADD COLUMN.
   --apply (explicit opt-in): runs ADD COLUMN IF NOT EXISTS, then the upserts. Multi-match
-    rows are alerted to the alert channel and skipped. No-match rows go to the flag log only.
+    rows are alerted to #cc-sam and skipped. No-match rows go to the flag log only.
 
 USAGE
     # from repo root (env auto-loaded from the Renaissance parent .env):
@@ -42,11 +42,10 @@ USAGE
     python scripts/backfill_enriched_phones.py --apply     # real backfill (after sign-off)
     python scripts/backfill_enriched_phones.py --flag-log /tmp/enriched_phone_flags.csv
 
-CREDENTIALS (repo-root .env — the Renaissance parent dir, matches core/config.py):
+CREDENTIALS (repo-root .env = /Users/sam/Documents/Claude Code/Renaissance/.env):
     COMMS_SUPABASE_DB_URL              comms Supabase pooler URL (read)
-    LEADS_DB_URL                       lead DB connection (read/write)
-    SLACK_* (token + optional cookie)  for the multi-match alert
-    SLACK_ALERT_CHANNEL                alert channel id (optional; alert skipped if unset)
+    LEADS_DB_URL                       lead DB (edpyqbiqzduabtjhwfaa) connection (read/write)
+    SLACK_* (token + optional cookie)  for the #cc-sam multi-match alert
 """
 
 from __future__ import annotations
@@ -54,7 +53,6 @@ from __future__ import annotations
 import argparse
 import csv
 import json
-import os
 import re
 import sys
 import urllib.request
@@ -68,10 +66,9 @@ import psycopg2
 REPO_ROOT = Path(__file__).resolve().parents[1]
 ENV_CANDIDATES = [
     REPO_ROOT / ".env",
-    REPO_ROOT.parent / ".env",
+    Path("/Users/sam/Documents/Claude Code/Renaissance/.env"),
 ]
-# Alert channel id from env (set via SLACK_ALERT_CHANNEL); the alert is skipped if unset.
-SLACK_CHANNEL = os.environ.get("SLACK_ALERT_CHANNEL", "")
+SLACK_CHANNEL = "C0AR0EA21C1"  # #cc-sam (same as scripts/warehouse_qa.py)
 SOURCE_TAG = "comms_phone_enrichment"
 DEFAULT_FLAG_LOG = Path("/tmp/enriched_phone_flags.csv")
 
@@ -100,7 +97,7 @@ def load_env() -> dict[str, str]:
 
 
 def slack_post(env: dict[str, str], text: str) -> dict:
-    """Post to the alert channel. Mirrors scripts/warehouse_qa.py; tolerant of token-key naming.
+    """Post to #cc-sam. Mirrors scripts/warehouse_qa.py; tolerant of token-key naming.
 
     Droplet .env uses SLACK_TOKEN/SLACK_COOKIE; the local repo-root .env uses
     SLACK_BROWSER_TOKEN/SLACK_BROWSER_COOKIE (and CC_SLACK_BOT_TOKEN). Try in order.
@@ -111,11 +108,10 @@ def slack_post(env: dict[str, str], text: str) -> dict:
         or env.get("CC_SLACK_BOT_TOKEN")
     )
     cookie = env.get("SLACK_COOKIE") or env.get("SLACK_BROWSER_COOKIE")
-    channel = SLACK_CHANNEL or env.get("SLACK_ALERT_CHANNEL", "")
-    if not token or not channel:
-        print("backfill_enriched_phones: no Slack token/channel, skipping alert", flush=True)
-        return {"ok": False, "error": "no_token_or_channel"}
-    body = json.dumps({"channel": channel, "text": text}).encode("utf-8")
+    if not token:
+        print("backfill_enriched_phones: no Slack token, skipping alert", flush=True)
+        return {"ok": False, "error": "no_token"}
+    body = json.dumps({"channel": SLACK_CHANNEL, "text": text}).encode("utf-8")
     req = urllib.request.Request(
         "https://slack.com/api/chat.postMessage",
         data=body,
@@ -271,7 +267,7 @@ def main(argv: list[str] | None = None) -> int:
     print("\n--- resolution breakdown ---")
     print(f"  matched by EMAIL : {n_email}")
     print(f"  matched by PHONE : {n_phone}")
-    print(f"  MULTI-match phone: {n_multi}  (ALERT the alert channel + SKIP)")
+    print(f"  MULTI-match phone: {n_multi}  (ALERT #cc-sam + SKIP)")
     print(f"  FLAGGED (no match): {n_flag}  (-> flag log, never dropped)")
     print(f"  total            : {n_email + n_phone + n_multi + n_flag} / {len(rows)}")
 
@@ -290,7 +286,7 @@ def main(argv: list[str] | None = None) -> int:
                             r["source_lead_id"], r["mobile_e164"], r["mobile_status"]])
         print(f"\nWrote {len(flags)} no-match flag rows -> {args.flag_log}")
 
-    # 4) multi-match -> the alert channel alert (skip writes for these).
+    # 4) multi-match -> #cc-sam alert (skip writes for these).
     if multi:
         lines = [
             f":rotating_light: *Enriched-phone backfill: {len(multi)} phone multi-match* "
@@ -302,11 +298,11 @@ def main(argv: list[str] | None = None) -> int:
                 f"email={r['email'] or '-'} mobile={r['mobile_e164']}"
             )
         if dry_run:
-            print("\n[dry-run] WOULD alert the alert channel about "
+            print("\n[dry-run] WOULD alert #cc-sam about "
                   f"{len(multi)} multi-match phone(s).")
         else:
             out = slack_post(env, "\n".join(lines))
-            print(f"\nthe alert channel multi-match alert posted: ok={out.get('ok')} "
+            print(f"\n#cc-sam multi-match alert posted: ok={out.get('ok')} "
                   f"error={out.get('error')}")
 
     if dry_run:

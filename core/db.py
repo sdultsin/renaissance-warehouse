@@ -51,6 +51,81 @@ _WRITE_LOCK_WAIT_S = int(os.environ.get("WAREHOUSE_WRITE_LOCK_WAIT_S", "1800"))
 _held_lock_fd: int | None = None  # module-level so the fd (and the lock) outlive connect()
 
 
+def _pid_alive(pid: int) -> bool:
+    """True if `pid` is a live process. kill -0 semantics (signal 0 = existence probe)."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        # Exists but owned by another user we can't signal — treat as ALIVE (do not clear).
+        return True
+    except OSError:
+        return True
+
+
+def _read_lockfile_pid(lock_path: Path) -> int | None:
+    """Parse `pid=N` out of the lockfile marker, or None if absent/unparseable."""
+    try:
+        txt = lock_path.read_text(errors="replace")
+    except OSError:
+        return None
+    for tok in txt.split():
+        if tok.startswith("pid="):
+            try:
+                return int(tok.split("=", 1)[1])
+            except ValueError:
+                return None
+    return None
+
+
+def _clear_stale_lock_marker(lock_path: Path) -> bool:
+    """STALE-LOCK-ON-START guard (warehouse-writer wlock hardening, 2026-06-17).
+
+    The warehouse-writer lock is a kernel flock on `lock_path` (auto-released by the
+    kernel when the holder dies), but the file ALSO carries a `pid=N` marker. A run
+    that was kill -9'd mid-write leaves the flock released (kernel) yet the marker
+    lying about a now-DEAD pid, which (a) misleads operators/the success-watchdog
+    and (b) on some failure modes blocks the next run. This guard, on acquire:
+    if the marker's recorded pid is NOT alive (kill -0/ /proc check), backs the
+    stale marker up (`<lock>.stale-bak-<UTC>`) and clears the file content, then
+    lets the normal flock acquire proceed. Idempotent & race-safe: we only ever
+    REWRITE marker content (never unlink the inode another writer may hold an flock
+    on), so two racing starters either both find a dead pid (one backup wins; the
+    flock still serializes the actual write) or one finds a LIVE pid and skips.
+    Returns True if it cleared a stale marker. Never raises.
+    """
+    try:
+        pid = _read_lockfile_pid(lock_path)
+        if pid is None or _pid_alive(pid):
+            return False  # no marker, or a live holder — do NOT touch
+        # Dead pid in the marker -> stale. Preserve evidence, then clear the content.
+        ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+        bak = lock_path.with_name(lock_path.name + f".stale-bak-{ts}")
+        try:
+            data = lock_path.read_bytes()
+            bak.write_bytes(data)
+        except OSError:
+            pass
+        try:
+            # Truncate in place (keep the inode so a concurrent flock holder is unaffected).
+            with open(lock_path, "r+b") as fh:
+                fh.truncate(0)
+        except OSError:
+            return False
+        log.warning(
+            "cleared STALE warehouse-writer lock marker (dead pid=%s) on %s; backup=%s",
+            pid, lock_path, bak.name,
+        )
+        return True
+    except Exception:
+        # A stale-lock guard must never be the thing that breaks the run.
+        return False
+
+
 def _acquire_write_lock() -> None:
     """Acquire the box-local warehouse-writer flock unless already held upstream.
 
@@ -75,6 +150,10 @@ def _acquire_write_lock() -> None:
         # No writable lock location (e.g. local dev without /root/core) — skip the
         # safety net rather than block a developer. The on-disk DB lock still applies.
         return
+
+    # STALE-LOCK-ON-START: if the marker names a DEAD pid, back it up + clear it before
+    # we try to flock. Safe even when nobody holds the flock (no-op if pid is alive/absent).
+    _clear_stale_lock_marker(lock_path)
 
     deadline = None if _WRITE_LOCK_WAIT_S <= 0 else (time.monotonic() + _WRITE_LOCK_WAIT_S)
     waited = False

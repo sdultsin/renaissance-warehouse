@@ -1,16 +1,18 @@
 """DNS + blacklist sweep -> raw_dns_sweep_domain + raw_blacklist_check.
 
 Registry = DISTINCT active sending domains from core.sending_account (continuously
-refreshed upstream). Engine = sources/dns.py (pure functions; all the resolver/
-false-positive/error-handling logic lives there). This entity is the DB glue: fan out
-the sweep, stream results into DuckDB in batches.
+refreshed upstream — no separate cached domain_registry.json, per prep-notes 07a §6.5).
+Engine = sources/dns.py (pure functions; all the resolver/false-positive/error-handling
+gotchas live there). This entity is the DB glue: fan out the sweep, stream results into
+DuckDB in batches.
 
-v1 blocklist set: a small set of domain zones (surbl, spamrl, spamhaus_dbl). IP zones +
-Spamhaus DQS REST deferred to v1.1.
+v1 blocklist set: the production "existing 3" domain zones (surbl, spamrl, spamhaus_dbl)
+per prep-notes 07a rec #1. IP zones + Spamhaus DQS REST deferred to v1.1.
 
-This is a long-running phase at scale and holds the DuckDB write lock for the duration
-(single-writer). Run it in the background BEFORE the nightly window, not during cron:
-    nohup python -m core.orchestrator --phase dns_sweep > dns_sweep.log 2>&1 &
+Runtime: ~60-90 min for ~52k domains at qps=20 (prod baseline: 66 min / 51,832 domains).
+Run in the background BEFORE the 03:30 UTC nightly window:
+    nohup python -m core.orchestrator --phase dns_sweep > /root/dns_sweep.log 2>&1 &
+Holds the DuckDB write lock for the duration (single-writer) — don't run during cron.
 
 Registers under the 'dns_sweep' phase.
 """

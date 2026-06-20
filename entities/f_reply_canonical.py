@@ -102,33 +102,50 @@ def run(ctx: RunContext) -> PhaseResult:
     auto_pipeline = _auto_reply_sql("subject", "reply_text")
 
     # --- rebuild ---
+    # NOTE: the `eaccount` column is added by sql/ddl/48_reply_eaccount.sql (a SEPARATE
+    # connection, via setup_db) — NOT here. Doing ALTER ADD COLUMN + bulk INSERT in the same
+    # DuckDB connection trips an internal "ColumnData::Append" assertion, so it must be split.
     db.execute("DELETE FROM core.reply")
 
-    # Instantly side (PRIMARY). reply_id = email_id. Dedup within Instantly on the 3-tuple,
-    # keeping the newest-loaded email_id per key (QUALIFY row_number).
+    # Instantly side (PRIMARY). reply_id = email_id (the true message id) — dedup on email_id
+    # ONLY, never on text/sender (a lead can reply the same words to many campaigns; those are
+    # distinct rows). step + variant are decoded from Instantly's composite `.step` field
+    # ("subsequence_step_variant", e.g. "0_0_8"): the MIDDLE component is the sequence step,
+    # the LAST is the variant INDEX (0-based) -> letter (0='A' ... 19='T'), matching
+    # raw_pipeline_variant_copy.variant. Verified against variant_copy (campaign 8e698:
+    # max step=3, max variant='T'=index 19). Falls back to the flattened i.step if the raw
+    # composite is absent. eaccount = the inbox that sent the message the lead replied to.
     db.execute(
         f"""
         INSERT INTO core.reply
+            (reply_id, lead_email, campaign_id, workspace_id, step, variant, eaccount,
+             subject, reply_text, reply_timestamp, is_auto_reply, source, _loaded_at, _run_id)
         WITH inst AS (
             SELECT
                 i.email_id,
                 lower(trim(i.lead_email))                       AS lead_email,
-                i.campaign_id, i.workspace_id, i.step,
-                i.subject, i.reply_text, i.reply_timestamp, i.thread_id,
-                {variant_expr}                                  AS variant,
+                i.campaign_id, i.workspace_id,
+                -- composite middle component is 0-based; variant_copy.step is 1-based -> +1
+                TRY_CAST(split_part(json_extract_string(i.api_response_raw, '$.step'), '_', 2) AS INT) + 1
+                                                                AS step,
+                CASE
+                    WHEN TRY_CAST(split_part(json_extract_string(i.api_response_raw, '$.step'), '_', 3) AS INT) IS NOT NULL
+                    THEN chr(65 + TRY_CAST(split_part(json_extract_string(i.api_response_raw, '$.step'), '_', 3) AS INT))
+                    ELSE NULL
+                END                                             AS variant,
+                i.eaccount,
+                i.subject, i.reply_text, i.reply_timestamp,
                 {auto_instantly}                                AS is_auto_reply
             FROM raw_instantly_email i
-            {variant_join}
             WHERE i.lead_email IS NOT NULL AND trim(i.lead_email) <> ''
             QUALIFY row_number() OVER (
-                PARTITION BY lower(trim(i.lead_email)), i.thread_id, i.reply_timestamp
-                ORDER BY i._loaded_at DESC, i.email_id
+                PARTITION BY i.email_id ORDER BY i._loaded_at DESC
             ) = 1
         )
         SELECT
-            email_id AS reply_id, lead_email, campaign_id, workspace_id, step, variant,
+            email_id, lead_email, campaign_id, workspace_id, step, variant, eaccount,
             subject, reply_text, reply_timestamp, is_auto_reply,
-            'instantly' AS source, now() AS _loaded_at, ? AS _run_id
+            'instantly', now(), ?
         FROM inst
         """,
         [ctx.run_id],
@@ -141,6 +158,8 @@ def run(ctx: RunContext) -> PhaseResult:
     db.execute(
         f"""
         INSERT INTO core.reply
+            (reply_id, lead_email, campaign_id, workspace_id, step, variant, eaccount,
+             subject, reply_text, reply_timestamp, is_auto_reply, source, _loaded_at, _run_id)
         WITH pipe AS (
             SELECT
                 lower(trim(p.lead_email))                       AS lead_email,
@@ -162,9 +181,9 @@ def run(ctx: RunContext) -> PhaseResult:
         )
         SELECT
             md5(lead_email || '|' || coalesce(CAST(reply_timestamp AS VARCHAR), '')) AS reply_id,
-            lead_email, campaign_id, workspace_id, step, variant,
+            lead_email, campaign_id, workspace_id, step, variant, NULL AS eaccount,
             subject, reply_text, reply_timestamp, is_auto_reply,
-            'pipeline' AS source, now() AS _loaded_at, ? AS _run_id
+            'pipeline', now(), ?
         FROM pipe
         """,
         [ctx.run_id],

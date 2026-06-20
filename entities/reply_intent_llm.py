@@ -108,6 +108,18 @@ Return ONLY a JSON array, one object per reply, in the SAME ORDER as the input, 
 No prose, no markdown fences — just the JSON array."""
 
 
+# DISABLED 2026-06-14 (Sam source-of-truth decision, memory
+# reference_warehouse_reply_and_tag_truth_20260614): the LLM reply-intent classifier
+# (and the deterministic is_auto_reply pass it drives) was NEVER funded — it produced
+# a broken ~3.5% auto-rate vs the ~63% native truth. We do NOT compute reply intent /
+# auto-vs-human in the warehouse anymore. Reply truth comes ONLY from Instantly native
+# (unique_replies / unique_replies_automatic in raw_pipeline_campaign_daily_metrics).
+# Belt-and-suspenders: the `intent` phase is already removed from PHASE_ORDER, AND run()
+# short-circuits below, so even re-adding the phase is a no-op. Reversible: set
+# WAREHOUSE_ENABLE_REPLY_INTENT_LLM=1 (and re-add the phase) to restore.
+ENABLE_REPLY_INTENT_LLM = os.environ.get("WAREHOUSE_ENABLE_REPLY_INTENT_LLM", "0") == "1"
+
+
 def register(registry: Registry) -> None:
     registry.add_phase("intent", "reply_intent_llm", run)
 
@@ -193,6 +205,13 @@ def _classify_batch(client, batch: list[dict]) -> dict[int, dict]:
 
 
 def run(ctx: RunContext) -> PhaseResult:
+    if not ENABLE_REPLY_INTENT_LLM:
+        logger.info(
+            "reply_intent_llm DISABLED (never-funded broken classifier; reply truth = "
+            "Instantly native unique_replies/unique_replies_automatic). Skipping — no-op."
+        )
+        return PhaseResult(notes={"disabled": True, "reason": "never_funded_broken_classifier"})
+
     db = ctx.db
     db.execute(_DDL.read_text())  # idempotent
 

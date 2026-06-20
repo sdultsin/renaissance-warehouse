@@ -1,10 +1,10 @@
 -- Workstream F: add core.meeting.partner_key + backfill from core.funding_partner aliases.
 -- Applied at schema version 26 by scripts/setup_db.py / orchestrator DDL applier.
 --
--- core.meeting.partner is the raw Slack-channel-derived string (plus some likely-
--- misattributed person names, plus NULL). partner_key resolves it to the canonical
--- core.funding_partner.partner_key via the alias array. Unmatched partner strings and
--- NULL partner both leave partner_key = NULL — that is correct.
+-- core.meeting.partner is the raw Slack-channel-derived string (GreenBridge, BTC, Qualifi,
+-- Llama, plus the likely-misattributed Jehoon/Etay, plus NULL). partner_key resolves it to
+-- the canonical core.funding_partner.partner_key via the alias array. Unmatched partners
+-- (Jehoon, Etay) and NULL partner both leave partner_key = NULL — that is correct.
 --
 -- DEPENDS ON sql/ddl/25_funding_partner.sql (must be applied + seeded first).
 --
@@ -23,8 +23,8 @@ FROM core.funding_partner fp
 WHERE m.partner IS NOT NULL
   AND list_contains(fp.aliases, m.partner);
 
--- Defensive: any meeting whose partner did NOT match an alias (a misattributed name or a
--- future new partner not yet seeded) keeps partner_key = NULL. We do NOT guess.
+-- Defensive: any meeting whose partner did NOT match an alias (Jehoon, Etay, or a future
+-- new partner not yet seeded) keeps partner_key = NULL. We do NOT guess.
 -- (No statement needed — partner_key defaults to NULL — but documented for the reader.)
 
 -- Optional index for partner-keyed rollups in the dashboard.

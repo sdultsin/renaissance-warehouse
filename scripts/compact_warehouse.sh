@@ -16,6 +16,20 @@ EXP=/root/core/compact_export_tmp
 LOCK=/root/core/.warehouse_write.lock
 THRESHOLD_BYTES=$((18*1024*1024*1024))   # only compact when primary > 18GB
 DUCKDB=$(command -v duckdb)
+# Bound DuckDB memory so the EXPORT/IMPORT cannot OOM the 16GB box (root cause of the 2026-06-12
+# nightly oom-kill: the IMPORT hit ~12.9GB RSS at the default ~80%-RAM limit). Spill to disk instead.
+MEMLIMIT="${COMPACT_MEMORY_LIMIT:-8GB}"
+TMPDIR=/root/core/duckdb_tmp
+mkdir -p "$TMPDIR"
+# preserve_insertion_order=false is REQUIRED for EXPORT/IMPORT of a large DB under a memory_limit:
+# order-preserving EXPORT buffers rows and cannot fully spill -> OOMs even at 8GB (observed
+# 2026-06-14). Row ORDER within a table is not semantically meaningful here (queries use ORDER BY)
+# and compaction reorders anyway; exact COUNT(*) verification below proves data identity.
+SET_PRELUDE="SET preserve_insertion_order=false; SET memory_limit='$MEMLIMIT'; SET temp_directory='$TMPDIR';"
+# Disk guard factor (free >= SIZE * NUM/10). Default 7 (conservative). Override for a one-time
+# compaction on a tight-but-sufficient disk: COMPACT_FREE_FACTOR_NUM=4 (the real export+import
+# peak is ~30GB for a high-bloat DB, well under the default 0.7*SIZE).
+FREE_FACTOR_NUM="${COMPACT_FREE_FACTOR_NUM:-7}"
 LOG(){ echo "[compact $(date -u +%FT%TZ)] $*"; }
 
 SIZE=$(stat -c%s "$DB" 2>/dev/null || echo 0)
@@ -28,8 +42,8 @@ echo "compact $(date -u +%FT%TZ)" > "$LOCK"
 trap 'rm -f "$LOCK"' EXIT
 
 FREE=$(df --output=avail -B1 /root | tail -1)
-if [ "$FREE" -lt $((SIZE*7/10)) ]; then
-  LOG "ABORT: insufficient disk (free=$((FREE/1024/1024/1024))GB, need ~$((SIZE*7/10/1024/1024/1024))GB)"; exit 1
+if [ "$FREE" -lt $((SIZE*FREE_FACTOR_NUM/10)) ]; then
+  LOG "ABORT: insufficient disk (free=$((FREE/1024/1024/1024))GB, need ~$((SIZE*FREE_FACTOR_NUM/10/1024/1024/1024))GB, factor=${FREE_FACTOR_NUM}/10)"; exit 1
 fi
 
 rm -rf "$NEW" "$EXP"
@@ -40,10 +54,10 @@ CQ=$("$DUCKDB" -readonly "$DB" -noheader -list \
 "$DUCKDB" -readonly "$DB" -csv "$CQ ORDER BY t" > /tmp/compact_pre.csv 2>/dev/null
 VIEWS_OLD=$("$DUCKDB" -readonly "$DB" -noheader -list "SELECT count(*) FROM duckdb_views() WHERE NOT internal")
 
-LOG "exporting primary ($((SIZE/1024/1024/1024))GB)..."
-"$DUCKDB" -readonly "$DB" "EXPORT DATABASE '$EXP' (FORMAT PARQUET)" || { LOG "ABORT: export failed"; rm -rf "$EXP"; exit 1; }
-LOG "importing into fresh DB..."
-"$DUCKDB" "$NEW" "IMPORT DATABASE '$EXP'" || { LOG "ABORT: import failed"; rm -rf "$EXP" "$NEW"; exit 1; }
+LOG "exporting primary ($((SIZE/1024/1024/1024))GB, memory_limit=$MEMLIMIT)..."
+"$DUCKDB" -readonly "$DB" "$SET_PRELUDE EXPORT DATABASE '$EXP' (FORMAT PARQUET)" || { LOG "ABORT: export failed"; rm -rf "$EXP"; exit 1; }
+LOG "importing into fresh DB (memory_limit=$MEMLIMIT)..."
+"$DUCKDB" "$NEW" "$SET_PRELUDE IMPORT DATABASE '$EXP'" || { LOG "ABORT: import failed"; rm -rf "$EXP" "$NEW"; exit 1; }
 
 "$DUCKDB" -readonly "$NEW" -csv "$CQ ORDER BY t" > /tmp/compact_post.csv 2>/dev/null
 VIEWS_NEW=$("$DUCKDB" -readonly "$NEW" -noheader -list "SELECT count(*) FROM duckdb_views() WHERE NOT internal")

@@ -65,7 +65,7 @@ CREATE TABLE IF NOT EXISTS core.sending_account (
 
     -- Classification
     esp                 VARCHAR,                -- 'google' | 'outlook' | 'otd' | NULL (unknown/missing)
-    infra_provider      VARCHAR,                -- 'OTD' resolvable here; other vendor brands need domain/tag resolution -> NULL for now
+    infra_provider      VARCHAR,                -- 'OTD' resolvable here; vendor brand (MailIn/Reseller/...) needs domain/tag resolution -> NULL for now
 
     -- Lifecycle state machine (spec 06)
     lifecycle_state     VARCHAR NOT NULL,       -- created | warming | warmed | ramping | active | paused | retired

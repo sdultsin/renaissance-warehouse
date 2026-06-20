@@ -82,13 +82,23 @@ def run_instantly_replies_ingest(ctx: RunContext) -> PhaseResult:
         return PhaseResult(notes={"reason": "no_keys"})
 
     # Incremental watermark: latest reply already stored, minus overlap.
-    row = ctx.db.execute(
-        "SELECT max(reply_timestamp) FROM raw_instantly_email"
-    ).fetchone()
-    since = None
-    if row and row[0] is not None:
-        since = (row[0] - _OVERLAP).astimezone(timezone.utc).isoformat()
-    logger.info("Reply ingest watermark since=%s", since or "(full backfill)")
+    # FULL-BACKFILL MODE (Step 2a, reversible/env-gated): when
+    # WAREHOUSE_REPLIES_FULL_BACKFILL=1, force since=None so EVERY workspace pulls
+    # its complete received-email history. Required because the watermark below is
+    # GLOBAL (max over the whole table): once one workspace reaches "now", the
+    # derived `since` would skip the full history of workspaces never backfilled.
+    # Upserts are idempotent on email_id, so repeated full passes are safe.
+    if os.environ.get("WAREHOUSE_REPLIES_FULL_BACKFILL") == "1":
+        since = None
+        logger.info("Reply ingest watermark since=(FULL BACKFILL forced)")
+    else:
+        row = ctx.db.execute(
+            "SELECT max(reply_timestamp) FROM raw_instantly_email"
+        ).fetchone()
+        since = None
+        if row and row[0] is not None:
+            since = (row[0] - _OVERLAP).astimezone(timezone.utc).isoformat()
+        logger.info("Reply ingest watermark since=%s", since or "(full backfill)")
 
     now = datetime.now(timezone.utc)
     rows_out = 0

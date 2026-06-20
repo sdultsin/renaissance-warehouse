@@ -56,8 +56,8 @@ CREATE TABLE IF NOT EXISTS core.campaign (
   status           INTEGER,
   status_label     VARCHAR,
   -- regex-derived attributes
-  cm               VARCHAR,                  -- campaign manager token (regex-derived); NULL if no match
-  offer            VARCHAR,                  -- offer category (regex-derived); NULL if no match
+  cm               VARCHAR,                  -- SAM | SAMUEL | LEO | IDO | EYVER | TOUKIR | TOMER | LUCAS | MAX | NULL
+  offer            VARCHAR,                  -- HELOC | Tariffs | s125 | R&D | Funding | NULL
   is_mca           BOOLEAN NOT NULL,
   email_gap        INTEGER,
   random_wait_max  INTEGER,

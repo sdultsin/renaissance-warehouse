@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -50,12 +51,40 @@ _RAW_UPSERT_SQL = (
     f"ON CONFLICT (id) DO UPDATE SET {_RAW_UPDATE_SET}"
 )
 
-# Keyword buckets for deterministic outcome classification (note is lower-cased).
-_NOT_INTERESTED_KW = ("not interested", "dnc", "do not call", "wrong number", "remove")
-_APPT_KW = ("appointment", "booked", "scheduled", "schedule", "set")
+# Separators that end a caller name in the note prefix.
+_CALLER_SEP = re.compile(r"[\s\-—–:|,;]+")
+
+# Tokens that look like names but are outcome keywords, not caller names.
+_NOT_NAMES = frozenset({
+    "not", "no", "yes", "dnc", "wrong", "remove", "interested", "appointment",
+    "booked", "scheduled", "schedule", "set", "callback", "voicemail", "vm",
+    "answer", "answered", "busy", "left", "message", "number", "hang", "hung",
+    "follow", "call", "called", "calling", "this", "cant", "cannot", "dead",
+    "grabbed", "for", "send", "sent", "spoke", "spoke", "talked", "says",
+    "said", "will", "wants", "asked", "need", "needs", "seems", "very",
+    "already", "still", "just", "said", "good", "bad", "great", "maybe",
+})
 
 
 # ── pure helpers (unit-testable; no DB) ───────────────────────────────────────
+
+def parse_caller_name(note: str | None) -> str | None:
+    """Extract the warm caller's first name from the start of a Close call note.
+
+    Callers are instructed to begin every note with their first name.
+    Handles bare names ("Jamie"), name + separator + details ("Elle - set appt"),
+    and case variants ("jamie", "ELLE"). Returns None for blank notes or tokens
+    that don't look like a name (non-alpha or single character).
+    """
+    if not note:
+        return None
+    token = _CALLER_SEP.split(note.strip(), maxsplit=1)[0]
+    if not token or not token.isalpha() or len(token) < 2:
+        return None
+    if token.lower() in _NOT_NAMES:
+        return None
+    return token.title()
+
 
 def _to_int(v) -> int | None:
     try:
@@ -121,35 +150,23 @@ def resolve_lead_attrs(lead: dict | None) -> dict:
     }
 
 
-def classify_outcome(disposition: str | None, note: str | None,
-                     voicemail_duration: int | None, voicemail_url: str | None) -> tuple[str, bool]:
-    """Deterministic outcome_class + needs_llm flag. NEVER returns NULL/None for the class.
+def classify_outcome(disposition: str | None,
+                     voicemail_duration: int | None, voicemail_url: str | None) -> str:
+    """Disposition-only outcome_class. Note is ground truth — not parsed here.
 
-    Order matters: voicemail and no-answer are decided before the answered branch so a
-    'vm-left'/'no-answer'/'error' disposition can never fall through to NULL.
+    Three classes only:
+      voicemail   — vm-left disposition or voicemail_url/voicemail_duration present
+      no_answer   — no-answer, busy, error, canceled
+      answered    — anything else (connected in some way)
     """
     disp = (disposition or "").strip().lower()
-    n = (note or "").strip().lower()
     vm = (voicemail_duration or 0) > 0 or bool(voicemail_url)
 
-    # Voicemail first (a vm-left call may also carry a note).
     if disp in ("vm-left", "voicemail") or vm:
-        return "voicemail", False
-    # Not connected.
+        return "voicemail"
     if disp in ("no-answer", "no_answer", "busy", "failed", "error", "canceled", "cancelled"):
-        return "no_answer", False
-    # Answered (or anything not explicitly no-answer/voicemail) → inspect the note.
-    if any(kw in n for kw in _APPT_KW):
-        return "answered_appt_set", False
-    if any(kw in n for kw in _NOT_INTERESTED_KW) or n == "no":
-        return "answered_not_interested", False
-    if disp == "answered":
-        return "answered_other", True  # WS-H should refine from the transcript
-    # Unknown/blank disposition with no informative note: classify by note presence,
-    # but still never NULL. Treat as no_answer (not connected enough to have a note).
-    if n:
-        return "answered_other", True
-    return "no_answer", False
+        return "no_answer"
+    return "answered"
 
 
 # ── DB transform (shared by run() and the local test) ─────────────────────────
@@ -235,7 +252,8 @@ def rebuild_core(conn, lead_cache: dict, now: datetime) -> dict:
 
         call_rows.append([
             rec["id"], rec["lead_id"], attrs["lead_email"], phone,
-            "ALL", rec["user_id"], rec["user_name"], rec["direction"], rec["disposition"],
+            "ALL", rec["user_id"], rec["user_name"], parse_caller_name(rec["note"]),
+            rec["direction"], rec["disposition"],
             _to_int(rec["duration"]), bool(rec["has_recording"]), rec["recording_url"],
             _to_float(rec["cost"]), occurred, attrs["source_campaign"],
             attrs["source_channel"], now,
@@ -243,10 +261,8 @@ def rebuild_core(conn, lead_cache: dict, now: datetime) -> dict:
         if attrs["source_campaign"]:
             campaign_present += 1
 
-        oc, needs_llm = classify_outcome(
-            rec["disposition"], rec["note"], rec["voicemail_duration"], rec["voicemail_url"]
-        )
-        outcome_rows.append([rec["id"], oc, rec["note"], needs_llm, now])
+        oc = classify_outcome(rec["disposition"], rec["voicemail_duration"], rec["voicemail_url"])
+        outcome_rows.append([rec["id"], oc, rec["note"], now])
 
         _bump("ALL", None, None, connected)
         _bump(uid, rec["user_id"], rec["user_name"], connected)
@@ -256,10 +272,10 @@ def rebuild_core(conn, lead_cache: dict, now: datetime) -> dict:
     if call_rows:
         conn.executemany(
             "INSERT INTO core.call (call_id, close_lead_id, lead_email, phone_e164, "
-            "warm_caller_id, user_id, user_name, direction, disposition, duration_seconds, "
-            "has_recording, recording_url, cost, occurred_at, source_campaign, "
-            "source_channel, resolved_at) VALUES "
-            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "warm_caller_id, user_id, user_name, caller_name, direction, disposition, "
+            "duration_seconds, has_recording, recording_url, cost, occurred_at, "
+            "source_campaign, source_channel, resolved_at) VALUES "
+            "(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             call_rows,
         )
 
@@ -267,8 +283,8 @@ def rebuild_core(conn, lead_cache: dict, now: datetime) -> dict:
     conn.execute("DELETE FROM core.call_outcome")
     if outcome_rows:
         conn.executemany(
-            "INSERT INTO core.call_outcome (call_id, outcome_class, note, needs_llm, resolved_at) "
-            "VALUES (?,?,?,?,?)",
+            "INSERT INTO core.call_outcome (call_id, outcome_class, note, resolved_at) "
+            "VALUES (?,?,?,?)",
             outcome_rows,
         )
 

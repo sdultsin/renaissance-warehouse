@@ -26,14 +26,16 @@ complete, self-consistent set (freeze-on-delete in the warehouse means deleted
 campaigns keep their last-known rows; we mirror that as-is).
 
 Required environment (read from the repo .env via core.config or the process env):
-  CLOUDFLARE_RG_ACCOUNT_ID   - Cloudflare account id
+  CLOUDFLARE_RG_ACCOUNT_ID   - Renaissance Cloudflare account id (84ebd910...)
   CC_D1_DATABASE_ID          - CC state D1 database id
+                               (default: 25a32aa3-9d95-42a3-9e9e-8cd3a9e3f3eb)
   CC_D1_API_TOKEN            - Cloudflare API token with D1:Edit on that account.
-                               NOTE: a token must carry D1 scope. Mint a token
-                               scoped to Account > D1 > Edit for the account and
-                               set CC_D1_API_TOKEN before this runs in prod. Until
-                               then, use --dry-run or --sql-out to exercise the
-                               snapshot locally.
+                               NOTE (2026-06-07): none of the existing tokens in
+                               the repo .env carry D1 scope. Sam must mint a token
+                               scoped to Account > D1 > Edit for the Renaissance
+                               account and set CC_D1_API_TOKEN before this runs in
+                               prod. Until then, use --dry-run or --sql-out to
+                               exercise the snapshot locally.
 
 Usage:
     # On the droplet, after the nightly orchestrator:
@@ -60,8 +62,124 @@ from datetime import datetime, timezone
 import duckdb
 
 DEFAULT_DB = os.environ.get("CORE_DB_PATH", "/root/core/warehouse.duckdb")
-# CC state D1 database id — from env (account-specific id; not committed).
-DEFAULT_D1_DATABASE_ID = os.environ.get("CC_D1_DATABASE_ID", "")
+DEFAULT_D1_DATABASE_ID = "25a32aa3-9d95-42a3-9e9e-8cd3a9e3f3eb"
+
+# ---------------------------------------------------------------------------
+# WLOCK-SERIALIZE THE PUBLISH (warehouse-writer wlock hardening, 2026-06-17).
+#
+# ROOT CAUSE of the 06-16/06-17 nightly deaths: this publisher opens the
+# warehouse DuckDB even though it is a READ-only consumer. DuckDB blocks a
+# read-only open while another process holds the read-WRITE lock on the same
+# file ("Could not set lock on file ... Conflicting lock is held in ... PID N"),
+# so when an ad-hoc hand-launched writer (e.g. a `core.orchestrator --phase ...`
+# re-pull) overlapped the nightly's publish step, this open died immediately —
+# the publish step is NOT serialized by the warehouse-writer lock the rebuild
+# uses. Fix: take the SAME box-local warehouse-writer flock (acquire-or-WAIT)
+# before opening DuckDB, so the publish QUEUES behind a live writer instead of
+# colliding. We acquire under the writer lock even for our read-only open
+# precisely because DuckDB's RW lock excludes RO opens.
+#
+# Implemented via the canonical helpers in core.db when importable (so there is
+# ONE lock mechanism on the box); falls back to a self-contained flock with the
+# same semantics + the same stale-marker clear if core is not on the path.
+# Honors WAREHOUSE_WRITE_LOCK_HELD=1 (an outer flock wrapper already serialized
+# us) and the existing WAREHOUSE_WRITE_LOCK_PATH / WAREHOUSE_WRITE_LOCK_WAIT_S
+# / WAREHOUSE_DISABLE_INPROC_LOCK knobs. Reversible: delete this block + the
+# `_acquire_warehouse_write_lock()` call in fetch_rows().
+# ---------------------------------------------------------------------------
+def _acquire_warehouse_write_lock() -> None:
+    """Acquire the box-local warehouse-writer lock (acquire-or-wait) before the
+    DuckDB open, so the publish can never collide with a concurrent writer.
+
+    Prefers core.db's helper (single source of truth). Falls back to an inline
+    flock with stale-marker clearing if core is not importable. Never raises on a
+    missing/unwritable lock dir (local dev) — only on a genuine wait-timeout,
+    which the caller surfaces as a real publish failure.
+    """
+    if os.environ.get("WAREHOUSE_DISABLE_INPROC_LOCK") == "1":
+        return
+    if os.environ.get("WAREHOUSE_WRITE_LOCK_HELD") == "1":
+        return  # an outer flock wrapper already holds the writer lock
+    try:
+        # Make the repo root importable so `core.db` resolves when run as
+        # `python scripts/publish_campaign_data_d1.py` from anywhere.
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from core.db import _acquire_write_lock as _core_acquire  # type: ignore
+        _core_acquire()
+        return
+    except Exception:
+        pass  # fall through to the inline implementation
+
+    # --- inline fallback (mirror of core.db semantics) ---------------------
+    import fcntl
+
+    lock_path = os.environ.get("WAREHOUSE_WRITE_LOCK_PATH", "/root/core/warehouse.write.lock")
+    wait_s = int(os.environ.get("WAREHOUSE_WRITE_LOCK_WAIT_S", "1800"))
+    try:
+        os.makedirs(os.path.dirname(lock_path), exist_ok=True)
+        fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o644)
+    except OSError:
+        return  # no writable lock location — skip (DuckDB's own lock still applies)
+
+    # STALE-LOCK-ON-START: clear a marker whose recorded pid is dead.
+    try:
+        with open(lock_path, "r", errors="replace") as fh:
+            txt = fh.read()
+        pid = next((int(t.split("=", 1)[1]) for t in txt.split()
+                    if t.startswith("pid=") and t.split("=", 1)[1].isdigit()), None)
+        if pid is not None:
+            alive = True
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                alive = False
+            except OSError:
+                alive = True
+            if not alive:
+                ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+                try:
+                    with open(lock_path + f".stale-bak-{ts}", "w") as b:
+                        b.write(txt)
+                except OSError:
+                    pass
+                try:
+                    os.ftruncate(fd, 0)
+                except OSError:
+                    pass
+                print(f"[publish_campaign_data_d1] cleared STALE writer-lock marker "
+                      f"(dead pid={pid})", file=sys.stderr)
+    except OSError:
+        pass
+
+    deadline = None if wait_s <= 0 else (time.monotonic() + wait_s)
+    waited = False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            break
+        except OSError:
+            if not waited:
+                print(f"[publish_campaign_data_d1] warehouse writer lock held by another "
+                      f"process; waiting (max {wait_s or 'inf'}s) on {lock_path}", file=sys.stderr)
+                waited = True
+            if deadline is not None and time.monotonic() >= deadline:
+                os.close(fd)
+                raise RuntimeError(
+                    f"could not acquire warehouse writer lock within {wait_s}s "
+                    f"({lock_path}) — a writer is holding it; publish aborted")
+            time.sleep(2)
+
+    try:
+        os.ftruncate(fd, 0)
+        os.write(fd, f"pid={os.getpid()} acquired_by=publish_campaign_data_d1\n".encode())
+    except OSError:
+        pass
+    os.environ["WAREHOUSE_WRITE_LOCK_HELD"] = "1"
+    globals()["_PUBLISH_LOCK_FD"] = fd  # keep the fd alive (and the lock) for the process
+    if waited:
+        print("[publish_campaign_data_d1] warehouse writer lock acquired after wait", file=sys.stderr)
 
 # The exact column set CC reads (order matters for the INSERT). v_disabled is
 # emitted as 0/1 so it lands in SQLite as INTEGER (CC's d1-client decodes it back
@@ -148,6 +266,12 @@ SELECT_SQL_STALE = SELECT_SQL.rstrip() + (
 
 def fetch_rows(db_path: str, max_stale_days: int | None = None) -> list[tuple]:
     sql = SELECT_SQL if max_stale_days is None else SELECT_SQL_STALE.format(days=int(max_stale_days))
+    # Serialize behind the warehouse-writer lock BEFORE opening DuckDB: a read-only
+    # open still collides with a held read-write lock, which is exactly what killed
+    # this step on 06-16/06-17. Acquire-or-wait so we QUEUE behind a live writer.
+    # No-op for --dry-run/--sql-out? No — those still open DuckDB here, so they wait
+    # too (correct: a dry-run during a live writer would otherwise die identically).
+    _acquire_warehouse_write_lock()
     conn = duckdb.connect(db_path, read_only=True)
     try:
         return conn.execute(sql).fetchall()
@@ -297,7 +421,6 @@ def main() -> int:
         name
         for name, val in (
             ("CLOUDFLARE_RG_ACCOUNT_ID", account_id),
-            ("CC_D1_DATABASE_ID", database_id),
             ("CC_D1_API_TOKEN", token),
         )
         if not val
@@ -305,7 +428,7 @@ def main() -> int:
     if missing:
         print(
             f"[publish_campaign_data_d1] ERROR: missing env {', '.join(missing)}. "
-            f"Mint a D1:Edit token for the account and set CC_D1_API_TOKEN. "
+            f"Mint a D1:Edit token for the Renaissance account and set CC_D1_API_TOKEN. "
             f"Use --dry-run / --sql-out to test without it.",
             file=sys.stderr,
         )

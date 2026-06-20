@@ -10,7 +10,7 @@
 --   We do NOT split each tab into typed columns. These sheets are ragged
 --   (variable column count per row, merged cells, dashboard formulas, sparse
 --   grids). Instead each sheet ROW is stored as a single JSON array string in
---   row_json (e.g. '["example.tld","RegistrarName","active",...]'). This is the
+--   row_json (e.g. '["rena-grow01.co","Dynadot","active",...]'). This is the
 --   simplest robust option:
 --     * tolerant of ragged rows / added columns / reordered columns over time
 --     * never coerces types (everything is text as it appears in the cell)
@@ -25,7 +25,7 @@
 CREATE SCHEMA IF NOT EXISTS core;
 
 -- ---------------------------------------------------------------------------
--- Domain Tech Sheet (spreadsheet ID via env)
+-- Domain Tech Sheet (spreadsheet 1bGj5bPyyGHg6eY6nRrkfXzTed44L0qHWhf8-4-gLlqM)
 -- ---------------------------------------------------------------------------
 
 -- 'MAIN' — dashboard / summary tab (sparse, merged cells, formula-driven).
@@ -76,9 +76,10 @@ CREATE TABLE IF NOT EXISTS raw_sheets_domain_tech_admin_renaissance (
 );
 
 -- ---------------------------------------------------------------------------
--- Blacklist sheet (spreadsheet ID via env). The real tabs are Summary / All
--- Domains / All Blocklisted Domains / Unflagged Blocklisted Domains /
--- All Outlook Domains. We snapshot the
+-- Blacklist sheet (spreadsheet 1fKqwQkEy4vRDYIrj7bq13aUZdTxBhjvKVRXbU1bXf6o,
+-- title "Renaissance - Domains"). The spec's "Master Blacklist" tab does NOT
+-- exist; the real tabs are Summary / All Domains / All Blocklisted Domains /
+-- Unflagged Blocklisted Domains / All Outlook Domains (MailIn). We snapshot the
 -- two operationally useful ones.
 -- ---------------------------------------------------------------------------
 

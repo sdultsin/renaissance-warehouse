@@ -40,3 +40,19 @@ Thumbs.db
 # Logs
 logs/
 *.log
+
+# Box-local edit/deploy artifacts (never commit; result of direct-on-box edits).
+# Added 2026-06-17 as part of the warehouse deploy-discipline conversion.
+*.bak
+*.bak-*
+*.bak.*
+*.bak2-*
+*.staged-*
+*.stale-*
+*.pre-*.bak
+.staged-*
+_deploy_tmp/
+backups/
+
+# Drift-guard machine state (warehouse_drift_guard.sh). Not source.
+.drift_baseline

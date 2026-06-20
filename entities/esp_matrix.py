@@ -8,6 +8,14 @@ into each recipient ESP (Google/Microsoft/Yahoo/...). Pure aggregation, no new s
   sends         = SUM(contact_frequency_campaign_daily.sent_count)  via postgres_scanner
   human_replies = canonical reply intent rows (is_auto_reply = false), attributed lead_email→domain→recipient_esp
 
+⚠ 2026-06-14 (Sam source-of-truth, memory reference_warehouse_reply_and_tag_truth_20260614):
+the human_replies / auto_replies / total_replies / positive_replies columns here derive from the
+BROKEN core.reply.is_auto_reply heuristic (~3.5% auto vs ~63% native truth) and the unfunded
+reply-intent classifier. They are NON-CANONICAL and must NOT be surfaced as reply counts anywhere
+(dashboard_data.py was updated to drop them). The ONLY trustworthy reply numbers are Instantly
+native: unique_replies / unique_replies_automatic in raw_pipeline_campaign_daily_metrics. This mv's
+`sends` column is fine; treat the reply columns as a deprecated internal artifact only.
+
 Built as a materialized table (not a view) because it aggregates an attached-Postgres
 source (postgres_scanner can't live inside a VIEW). Registers under the 'derived' phase,
 AFTER recipient_domain (dns_sweep phase) has classified the recipient side.

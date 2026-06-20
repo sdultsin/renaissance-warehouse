@@ -51,7 +51,12 @@ CREATE TABLE IF NOT EXISTS raw_pipeline_campaigns (
   _run_id                VARCHAR NOT NULL
 );
 
--- public.campaign_data (full mirror, per campaign × step × variant)
+-- public.campaign_data (UPSERT mirror, per campaign × step × variant)
+-- Spec 15 amendment (2026-06-06): campaign_data carries the daily metric rollup
+-- (emails_sent/opportunities/v_disabled/total_leads…) alongside copy, so it upserts
+-- on the natural key (campaign_id|step|variant) — NOT insert_hash. Metrics change
+-- daily; the old content-hashed key froze them (ON CONFLICT DO NOTHING). No
+-- content_hash column here: copy-version history lives in raw_pipeline_variant_copy.
 CREATE TABLE IF NOT EXISTS raw_pipeline_campaign_data (
   _key                       VARCHAR NOT NULL,
   campaign_id                VARCHAR,
@@ -97,7 +102,6 @@ CREATE TABLE IF NOT EXISTS raw_pipeline_campaign_data (
   leads_bounced              INTEGER,
   leads_unsubscribed         INTEGER,
   lead_sequence_started      INTEGER,
-  content_hash               VARCHAR,
   _loaded_at                 TIMESTAMPTZ NOT NULL,
   _run_id                    VARCHAR NOT NULL
 );
@@ -260,6 +264,43 @@ CREATE TABLE IF NOT EXISTS raw_pipeline_bounce_suppression (
   _run_id           VARCHAR NOT NULL
 );
 
+-- public.conversation_messages (full Instantly email thread bodies, ~17.1M rows)
+-- Immutable events: insert-once, keyed on the Instantly message id, pulled
+-- incrementally by a message_timestamp watermark.
+-- LINEAGE: source today is pipeline-supabase, which mirrors Instantly Unibox.
+-- Post pipeline-supabase retirement, swap this source to a direct Instantly
+-- conversation sync feeding the same shape. See entities/pipeline_mirror.py.
+CREATE TABLE IF NOT EXISTS raw_pipeline_conversation_messages (
+  _key              VARCHAR NOT NULL,
+  id                VARCHAR,
+  thread_id         VARCHAR,
+  campaign_id       VARCHAR,
+  workspace_id      VARCHAR,
+  lead_email        VARCHAR,
+  sender_email      VARCHAR,
+  sender_name       VARCHAR,
+  recipient_email   VARCHAR,
+  recipient_name    VARCHAR,
+  direction         VARCHAR,
+  ue_type           INTEGER,
+  body_text         VARCHAR,
+  body_html         VARCHAR,
+  subject           VARCHAR,
+  message_timestamp TIMESTAMPTZ,
+  step_raw          VARCHAR,
+  step              INTEGER,
+  variant           VARCHAR,
+  is_unread         BOOLEAN,
+  interest_status   INTEGER,
+  ai_interest_value INTEGER,
+  content_preview   VARCHAR,
+  eaccount          VARCHAR,
+  subsequence_id    VARCHAR,
+  synced_at         TIMESTAMPTZ,
+  _loaded_at        TIMESTAMPTZ NOT NULL,
+  _run_id           VARCHAR NOT NULL
+);
+
 -- Unique _key indexes back ON CONFLICT (_key) in entities/pipeline_mirror.py.
 CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_campaigns_key                 ON raw_pipeline_campaigns               (_key);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_campaign_data_key             ON raw_pipeline_campaign_data           (_key);
@@ -271,6 +312,7 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_reply_auto_recon_key          
 CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_lead_events_key               ON raw_pipeline_lead_events             (_key);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_variant_copy_key              ON raw_pipeline_variant_copy            (_key);
 CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_bounce_suppression_key        ON raw_pipeline_bounce_suppression      (_key);
+CREATE UNIQUE INDEX IF NOT EXISTS ux_raw_pipeline_conversation_messages_key      ON raw_pipeline_conversation_messages   (_key);
 
 -- Helper indexes for common joins and watermarks.
 CREATE INDEX IF NOT EXISTS ix_raw_pipeline_campaigns_campaign                  ON raw_pipeline_campaigns               (campaign_id);
@@ -288,3 +330,7 @@ CREATE INDEX IF NOT EXISTS ix_raw_pipeline_meetings_booked_raw_posted_at ON raw_
 CREATE INDEX IF NOT EXISTS ix_raw_pipeline_reply_data_reply_ts           ON raw_pipeline_reply_data              (reply_timestamp);
 CREATE INDEX IF NOT EXISTS ix_raw_pipeline_lead_events_event_ts          ON raw_pipeline_lead_events             (event_timestamp);
 CREATE INDEX IF NOT EXISTS ix_raw_pipeline_bounce_suppression_last_seen  ON raw_pipeline_bounce_suppression      (last_seen_at);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_conversation_messages_campaign ON raw_pipeline_conversation_messages   (campaign_id);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_conversation_messages_ts       ON raw_pipeline_conversation_messages   (message_timestamp);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_conversation_messages_thread   ON raw_pipeline_conversation_messages   (thread_id);
+CREATE INDEX IF NOT EXISTS ix_raw_pipeline_conversation_messages_lead     ON raw_pipeline_conversation_messages   (lead_email);

@@ -3,7 +3,7 @@
 --
 -- WHY A DERIVED VIEW, NOT core.cost_ledger:
 --   Per Sam (cost-seed v2, 2026-05-30) core.cost_ledger is DIRECT INFRASTRUCTURE
---   ONLY — the per-lead enrichment providers were explicitly dropped from it ("if we
+--   ONLY — leadmagic/findymail/prospeo were explicitly dropped from it ("if we
 --   track these we have to track the other 50 platforms too"). Phone-enrichment
 --   spend is a measured per-lead consumption cost of the warm-call pipeline, so
 --   it lives here in the derived layer instead. THIS is the canonical surface for
@@ -16,12 +16,10 @@
 --   (instantly | sendivo). All three are full-refresh snapshots, so we pin each to
 --   its latest _run_id (same pattern as core.domain's sweep dedup).
 --
--- COST MODEL: per-provider $/credit rates are NOT inlined here (vendor identities +
---   rates are out-of-band, not committed to a public repo). They are the single
---   source of truth in comms.enrichment_vendor_pricing (mirrored at runtime), and
---   are additionally bootstrapped from an EXTERNAL, gitignored seed file
---   (seed_data/enrichment_vendor_pricing.csv) so a fresh clone can still dollarize
---   before the live mirror runs. SMS opps arrive WITH a phone -> zero enrichment cost.
+-- COST MODEL (rates editable in comms.enrichment_vendor_pricing):
+--   prospeo   = $0 (free 60k credits/mo plan); leadmagic = $0.02/credit
+--   (5 cr/hit ~= $0.10/phone); findymail = ~$0.02/credit (10 cr/hit); both pay
+--   on success only. Sendivo opps arrive WITH a phone -> $0 enrichment.
 
 CREATE SCHEMA IF NOT EXISTS derived;
 
@@ -37,18 +35,6 @@ CREATE TABLE IF NOT EXISTS raw_comms_enrichment_vendor_pricing (
     _loaded_at                  TIMESTAMPTZ NOT NULL,
     _run_id                     VARCHAR
 );
-
--- Bootstrap the pricing table from the EXTERNAL, gitignored seed file so a fresh
--- clone (no live mirror yet) can still dollarize. Guarded so a missing seed file is
--- a no-op (the warehouse still builds); the live mirror's _run_id rows always win in
--- the views below (they pin to the latest _run_id, and seed rows carry _run_id=NULL).
--- Idempotent: clear prior seed (NULL _run_id) rows before re-seeding.
-DELETE FROM raw_comms_enrichment_vendor_pricing WHERE _run_id IS NULL;
-INSERT INTO raw_comms_enrichment_vendor_pricing
-  (provider, usd_per_credit, plan_note, updated_at, _loaded_at, _run_id)
-SELECT provider, usd_per_credit, plan_note, now(), now(), NULL
-FROM read_csv_auto('seed_data/enrichment_vendor_pricing.csv', header=true, nullstr='')
-WHERE (SELECT count(*) FROM glob('seed_data/enrichment_vendor_pricing.csv')) > 0;
 
 -- ---------------------------------------------------------------------------
 -- derived.enrichment_cost — one dollarized row per enrichment attempt.
@@ -107,8 +93,8 @@ GROUP BY 1, 2, 3;
 -- ---------------------------------------------------------------------------
 -- derived.enrichment_cost_per_lead — headline cost-per-lead by opportunity source.
 -- "in_close" lead count comes from the latest call_opportunity snapshot (close_lead_id
--- populated, non-duplicate). cost_per_lead_in_close = total enrichment cost / leads
--- actually delivered to Close. SMS opps = zero cost (arrive with phone).
+-- populated, non-duplicate). cost_per_lead_in_close = total enrichment $ / leads
+-- actually delivered to Close. Sendivo = $0 (arrives with phone).
 -- ---------------------------------------------------------------------------
 CREATE OR REPLACE VIEW derived.enrichment_cost_per_lead AS
 WITH opp AS (

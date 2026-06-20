@@ -206,16 +206,19 @@ data["meetings"] = {
 # Frontend computes RR% from raw counts. Sender 'unknown' → 'otd' (only unknown infra we run);
 # recipient yahoo/isp/apple/other → 'other'. Re-aggregated after remap so cells merge.
 if table_exists("mv_esp_send_matrix") and (one("SELECT COUNT(*) FROM mv_esp_send_matrix") or 0) > 0:
+    # NOTE 2026-06-14 (Sam source-of-truth decision, memory
+    # reference_warehouse_reply_and_tag_truth_20260614): the human/auto/total/positive
+    # reply columns in mv_esp_send_matrix derive from the BROKEN core.reply.is_auto_reply
+    # heuristic (~3.5% auto vs ~63% native truth) and the never-funded intent classifier.
+    # Do NOT surface them. Only `sends` here is a trustworthy native number. Reply truth
+    # comes ONLY from Instantly native (unique_replies / unique_replies_automatic), surfaced
+    # via the email-performance blocks above — never from this matrix.
     matrix = q("""
         SELECT
           CASE WHEN sender_esp = 'unknown' THEN 'otd' ELSE sender_esp END        AS sender_esp,
           CASE WHEN recipient_esp IN ('yahoo','isp','apple','other') THEN 'other'
                ELSE recipient_esp END                                            AS recipient_esp,
-          SUM(sends)            AS sends,
-          SUM(human_replies)    AS human_replies,
-          SUM(total_replies)    AS total_replies,
-          SUM(auto_replies)     AS auto_replies,
-          SUM(positive_replies) AS positive_replies
+          SUM(sends)            AS sends
         FROM mv_esp_send_matrix
         GROUP BY 1, 2
         ORDER BY sends DESC""")
@@ -231,23 +234,15 @@ else:
     data["esp_matrix"] = None
 
 # ---------------------------------------------------------------- Reply / Intent (cross-channel)
-# Unified email + SMS reply substrate (derived.reply_intent). Inbound-only intent mix, last 30d.
-data["reply_intent"] = {
-    "by_channel": q("""
-        SELECT channel,
-               COUNT(*) AS replies,
-               COUNT(*) FILTER (WHERE intent = 'positive') AS positive,
-               COUNT(*) FILTER (WHERE intent = 'negative') AS negative,
-               COUNT(*) FILTER (WHERE intent = 'unsubscribe') AS unsubscribe
-        FROM derived.reply_intent
-        WHERE direction = 'inbound' AND replied_at >= current_date - 30
-        GROUP BY 1 ORDER BY replies DESC"""),
-    "by_channel_intent": q("""
-        SELECT channel, COALESCE(intent,'(unclassified)') AS intent, COUNT(*) AS n
-        FROM derived.reply_intent
-        WHERE direction = 'inbound' AND replied_at >= current_date - 30
-        GROUP BY 1, 2 ORDER BY channel, n DESC"""),
-}
+# DISABLED 2026-06-14 (Sam source-of-truth decision, memory
+# reference_warehouse_reply_and_tag_truth_20260614). The EMAIL leg of derived.reply_intent
+# is the broken/never-funded reply-intent classifier (~3.5% auto vs ~63% native truth); we do
+# NOT surface email reply intent / auto-vs-human in the warehouse. Email reply truth comes ONLY
+# from Instantly native (unique_replies / unique_replies_automatic), already surfaced in the
+# email-performance blocks above. We emit null so any consumer falls back rather than reads a
+# wrong number. (SMS intent is a separate coarse conversation-state proxy; if an SMS-only intent
+# tile is ever wanted, query derived.reply_intent WHERE channel='sms' explicitly — never email.)
+data["reply_intent"] = None
 
 # ---------------------------------------------------------------- SMS Opportunities (AIM-classified)
 # Sendivo has no native booking webhook — opportunities are AIM-surfaced into call_opportunity.

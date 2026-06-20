@@ -49,17 +49,67 @@ class SendivoClient:
             return resp.json()
         raise SendivoError(f"GET {path} {params} -> repeated 5xx/429")
 
+    def _get_list(self, path: str, params: dict | None = None) -> list[dict]:
+        """GET a list endpoint, transparently following pagination IF the API exposes it.
+
+        Validated 2026-06-14 against the live key: /campaigns (60), /brands (65) and
+        /phone-numbers (262) each return the FULL set in ONE un-paginated response — the
+        `page`/`per_page` params are ignored and there is no `meta`/`links` block. This guard
+        is purely DEFENSIVE: if Sendivo ever switches on Laravel-style pagination we follow
+        `meta.last_page` (or `links.next`) instead of silently truncating to page 1 (audit E3).
+        """
+        params = dict(params or {})
+        payload = self._get(path, params)
+        data = payload.get("data")
+        if not isinstance(data, list):
+            return data or []
+        meta = payload.get("meta") or {}
+        last_page = meta.get("last_page")
+        if isinstance(last_page, int) and last_page > 1:
+            for page in range(2, last_page + 1):
+                more = self._get(path, {**params, "page": page}).get("data")
+                if not isinstance(more, list) or not more:
+                    break
+                data.extend(more)
+            return data
+        # links.next style (only if there IS a next link — absent today)
+        nxt = (payload.get("links") or {}).get("next")
+        page = 2
+        while nxt and page <= 100:  # hard stop so a malformed `next` can't loop forever
+            p = self._get(path, {**params, "page": page})
+            more = p.get("data")
+            if not isinstance(more, list) or not more:
+                break
+            data.extend(more)
+            nxt = (p.get("links") or {}).get("next")
+            page += 1
+        return data
+
     # --- endpoints -------------------------------------------------------
-    def delivery_metrics(self, start_date: str, end_date: str) -> dict:
-        """Aggregate funnel for a date range (<=30 days). Returns the `data` dict."""
-        payload = self._get("/delivery-metrics", {"start_date": start_date, "end_date": end_date})
+    def delivery_metrics(self, start_date: str, end_date: str, sub_account_id: int | None = None) -> dict:
+        """Aggregate funnel for a date range (<=30 days). Returns the `data` dict.
+
+        Pass sub_account_id for the PER-SUB-ACCOUNT funnel (validated 2026-06-14: the param is
+        honoured — agency vs sub return different totals); omit it for the agency aggregate.
+        """
+        params = {"start_date": start_date, "end_date": end_date}
+        if sub_account_id is not None:
+            params["sub_account_id"] = sub_account_id
+        payload = self._get("/delivery-metrics", params)
         return payload.get("data") or {}
 
     def campaigns(self) -> list[dict]:
-        return (self._get("/campaigns").get("data")) or []
+        return self._get_list("/campaigns")
 
     def brands(self) -> list[dict]:
-        return (self._get("/brands").get("data")) or []
+        return self._get_list("/brands")
+
+    def phone_numbers(self) -> list[dict]:
+        """/phone-numbers — full sending-asset inventory snapshot (audit G2). One row per number:
+        id, phone_number, friendly_name, tags, number_status, messaging_status, phone_number_type,
+        is_default, campaign{id,name,status}, brand{id,name}, sub_account_id, purchase/renewal_date.
+        """
+        return self._get_list("/phone-numbers")
 
     def billing_report(self, start_date: str, end_date: str) -> list[dict]:
         """Per-sub-account billing for a period. Returns the `data` list."""

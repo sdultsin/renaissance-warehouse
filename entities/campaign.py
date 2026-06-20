@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 
@@ -35,14 +36,45 @@ from sources.instantly import InstantlyClient, InstantlyError
 
 logger = logging.getLogger("entities.campaign")
 
+# Campaign-tag sync is DISABLED by default as of 2026-06-14 (Sam source-of-truth
+# decision, memory reference_warehouse_reply_and_tag_truth_20260614): we no longer
+# pull Instantly campaign tags into raw_instantly_campaign_sending_tag /
+# core.campaign_sending_tag going forward. Tags are not a trustworthy attribution
+# surface, so the nightly stops fetching them. EXISTING synced tags are KEPT (the
+# resolution passes only touch last_seen_at on rows they re-see; with the fetch off
+# no new raw rows arrive, so the existing core.campaign_sending_tag rows are left
+# intact as fallback hints). Reversible: set WAREHOUSE_SYNC_CAMPAIGN_TAGS=1 to
+# restore the old behavior.
+SYNC_CAMPAIGN_TAGS = os.environ.get("WAREHOUSE_SYNC_CAMPAIGN_TAGS", "0") == "1"
+
 
 # ---------------------------------------------------------------------
 # Regex resolution rules for campaign-manager / offer / is_mca classification.
 # ---------------------------------------------------------------------
 _RE_MCA = re.compile(r"\b(isaac|mca|cheap leads)\b", re.IGNORECASE)
 
-_CM_TOKENS = ["SAM", "SAMUEL", "LEO", "IDO", "EYVER", "TOUKIR", "TOMER", "LUCAS", "MAX"]
-_RE_CM = re.compile(r"\b(" + "|".join(_CM_TOKENS) + r")\b", re.IGNORECASE)
+# Canonical CM token list — kept in sync with data-pipeline-v2/src/transforms.ts
+# (CANONICAL_CMS + CM_ALIAS_MAP), the upstream source of truth that fills
+# public.campaigns.cm_name (mirrored here as raw_pipeline_campaigns.cm_name, the
+# PRIMARY cm source in v_kpi_email). This warehouse-native derivation is the
+# COALESCE *fallback*; it must recognize the same 13 CMs so the fallback can't
+# disagree with the primary. SAMUEL is kept distinct from SAM (separate CMs
+# upstream). MARCO->MARCOS, ANDRE->ANDRES folded in. (2026-06-14: previously the
+# list was {SAM,SAMUEL,LEO,IDO,EYVER,TOUKIR,TOMER,LUCAS,MAX} — missing 8 active
+# historical CMs and carrying 4 tokens that never appear in any campaign name.)
+_CM_ALIAS = {
+    "MARCO": "MARCOS",
+    "ANDRE": "ANDRES",
+}
+_CM_TOKENS = [
+    "SAMUEL", "SAM", "LEO", "IDO", "EYVER", "ALEX", "ANDRES", "ANDRE",
+    "BRENDAN", "CARLOS", "LAUTARO", "MARCOS", "MARCO", "SHAAN", "TOMI",
+]
+# Longest-first so SAMUEL wins over SAM, MARCOS over MARCO, ANDRES over ANDRE.
+_RE_CM = re.compile(
+    r"\b(" + "|".join(sorted(_CM_TOKENS, key=len, reverse=True)) + r")\b",
+    re.IGNORECASE,
+)
 
 _RE_HELOC = re.compile(r"\bHELOC\b", re.IGNORECASE)
 _RE_TARIFFS = re.compile(r"\bTariff(s)?\b", re.IGNORECASE)
@@ -52,10 +84,11 @@ _RE_FUNDING = re.compile(r"\bFunding\b|\bMCA\b|\bIsaac\b", re.IGNORECASE)
 
 
 def _derive_cm(name: str | None) -> str | None:
-    """Uppercase the matched token. Multiple distinct matches in one name -> None."""
+    """Match a canonical CM token (whole word, case-insensitive), alias-normalized.
+    Multiple DISTINCT CMs in one name -> None (ambiguous)."""
     if not name:
         return None
-    matches = {m.group(1).upper() for m in _RE_CM.finditer(name)}
+    matches = {_CM_ALIAS.get(m.group(1).upper(), m.group(1).upper()) for m in _RE_CM.finditer(name)}
     if len(matches) != 1:
         return None
     return matches.pop()
@@ -161,12 +194,15 @@ def run_campaign_ingest(ctx: RunContext) -> PhaseResult:
                 seen_workspace_ids.add(workspace_id)
 
                 # 1. Tags first — small set, used to look up labels for email_tag_list refs.
+                #    DISABLED by default (see SYNC_CAMPAIGN_TAGS): skip the /custom-tags
+                #    fetch entirely so the nightly no longer pulls campaign tags.
                 tag_id_to_label: dict[str, str] = {}
-                for tag in client.list_tags(workspace_id):
-                    tid = tag.get("id")
-                    label = tag.get("label")
-                    if tid and label:
-                        tag_id_to_label[tid] = label
+                if SYNC_CAMPAIGN_TAGS:
+                    for tag in client.list_tags(workspace_id):
+                        tid = tag.get("id")
+                        label = tag.get("label")
+                        if tid and label:
+                            tag_id_to_label[tid] = label
 
                 # 2. Campaigns
                 w_campaigns = 0
@@ -208,6 +244,11 @@ def run_campaign_ingest(ctx: RunContext) -> PhaseResult:
                     rows_out += 1
 
                     # Sending tags from email_tag_list. See module docstring.
+                    # DISABLED by default (SYNC_CAMPAIGN_TAGS) — with tag fetch off,
+                    # tag_id_to_label is empty so every ref would be skipped anyway;
+                    # the explicit guard makes the stop intentional + cheap (no lookups).
+                    if not SYNC_CAMPAIGN_TAGS:
+                        continue
                     for tid in camp.get("email_tag_list") or []:
                         label = tag_id_to_label.get(tid)
                         if not label:

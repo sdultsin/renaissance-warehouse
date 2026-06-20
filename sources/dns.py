@@ -1,34 +1,58 @@
-"""Shared DNS + blacklist lookup library.
+"""Shared DNS + blacklist sweep library.
 
-PURE LIBRARY — no DB writes, no ``register(registry)`` hook. Entity builders
-import these functions to resolve DNS records and query DNS-based blocklists.
+PURE LIBRARY — no DB writes, no ``register(registry)`` hook. The ``domain`` and
+``recipient_domain`` entities (specs 07 / 08) import these functions to build
+``raw_dns_sweep_domain`` and ``raw_blacklist_check`` rows.
 
-Implementation notes:
+Design notes / gotchas (from specs/07-entity-domain-dns-sweep.md +
+specs/07a-blocklist-surveillance-prep-notes.md + the production code at
+/root/renaissance-worker/jobs/blocklist-surveillance/{checker,config}.py):
 
-  * **Resolver configuration.** ``DNS_RESOLVER`` is read from the environment
-    (``$DNS_RESOLVER``) with a local-resolver default. Some DNS blocklist zones
-    decline or return sentinel answers to queries from large shared resolvers, so
-    the resolver host matters for correct results.
+  * **Local recursive resolver is MANDATORY.** ``DNS_RESOLVER`` defaults to
+    ``$BLS_DNS_RESOLVER`` or ``127.0.0.2``. SURBL / Spamhaus / URIBL refuse or
+    poison queries arriving from large public resolvers (8.8.8.8, 1.1.1.1): they
+    return sentinel "you are using a public/abusive resolver" A-records that look
+    exactly like real listings. The droplet runs a local recursive resolver on
+    127.0.0.2; any host running this sweep MUST too, or every blacklist result is
+    garbage. (prep-notes §2, §6.3)
 
-  * **FALSE_POSITIVE_IPS guard.** Some DNS blocklists answer with sentinel
-    loopback addresses (e.g. 127.0.0.1, 127.255.255.254/255) to signal a
-    non-listing condition rather than a real listing. Those answers are dropped.
+  * **FALSE_POSITIVE_IPS guard.** Some DNSBLs answer with 127.0.0.1 /
+    127.255.255.254 / 127.255.255.255 to signal "blocked resolver" / "deprecated
+    mirror" / "rate exceeded", NOT a real listing. We drop those. This set matches
+    the production checker.py byte-for-byte.
 
-  * **Timeout / SERVFAIL == 'error', NEVER 'clean'.** A DNS timeout, SERVFAIL, or
-    sentinel-only answer on a blocklist zone is recorded as an error and the zone
-    is NOT added to ``listed_on``. The caller decides how to treat a domain that
+  * **Timeout / SERVFAIL == 'error', NEVER 'clean'.** The existing cron recorded
+    timeouts as ``listed=False`` (clean), producing silent false-negatives
+    (prep-notes §3: 92 Spamhaus 504s swallowed). Here a DNS timeout / SERVFAIL /
+    sentinel-only answer on a blacklist zone goes into ``errors`` and the zone is
+    NOT added to ``listed_on``. The caller decides how to treat a domain that
     errored on a given blocklist; we never assume clean on error.
 
-  * **DNSBL query shape differs by blocklist family.**
-      - *Domain / URI blocklists* are queried as ``<domain>.<zone>``.
-      - *IP blocklists* expect the reversed A-record IP ``<d.c.b.a>.<zone>``.
+  * **DNSBL query shape differs by blocklist family.** Two conventions:
+      - *Domain / URI blocklists* (SURBL, URIBL, Spamhaus DBL, SORBS DBL, Spamrl)
+        are queried as ``<domain>.<zone>`` — the registered domain appended verbatim.
+      - *IP blocklists* (Barracuda, UCEPROTECT, SpamCop) expect the **reversed
+        A-record IP** ``<d.c.b.a>.<zone>``, not the domain. Feeding a bare domain
+        to an IP zone just NXDOMAINs (looks clean) and is semantically wrong.
     ``check_blacklists`` honors this via each entry's ``kind`` ('domain' | 'ip').
+    NOTE: this deviates from the existing cron, which queries ALL zones as
+    ``<domain>.<zone>``. The existing cron only configures domain-zones (spamrl,
+    surbl) so it never hit this; once Barracuda/UCEPROTECT/SpamCop (IP zones) are
+    added the reversed-IP form is required for correct results.
 
-  * **DKIM CNAME resolution.** ``resolve_dkim`` chases the CNAME on
-    ``selector1._domainkey.<domain>`` to capture the provider/tenant target.
+  * **MailIn tenant fingerprint (factor 3).** ``resolve_dkim`` chases the CNAME on
+    ``selector1._domainkey.<domain>``; if it lands on ``*.onmicrosoft.com`` we
+    capture the tenant prefix. Homogeneous tenant prefixes across many domains are
+    the homogeneous-provisioning signal (memory: reference_mailin_tenant_fingerprint).
 
-This module depends only on ``dnspython`` (DNS) and ``requests`` (redirect chain).
-No DuckDB, no psycopg2.
+  * **spamrl is moribund.** db.spamrl.com returned zero listings across 51k prod
+    queries (prep-notes §3) — kept in DEFAULT_DNSBLS for continuity but flagged
+    dead; treat its results with suspicion. SORBS (dbl.sorbs.net) was largely shut
+    down in 2024 and may NXDOMAIN everything — also flagged.
+
+This module depends only on ``dnspython`` (DNS) and ``requests`` (redirect chain +
+optional Spamhaus DQS REST). No DuckDB, no psycopg2. dnspython 2.34.2 confirmed
+present on the droplet (python3.12).
 """
 
 from __future__ import annotations
@@ -303,6 +327,13 @@ DEFAULT_DKIM_SELECTORS: list[str] = [
 # Any *.onmicrosoft.com CNAME target — capture the tenant label.
 _ONMICROSOFT_TENANT_RE = re.compile(r"([a-z0-9-]+)\.onmicrosoft\.com", re.IGNORECASE)
 
+# Modern M365 DKIM CNAME target shape, e.g.
+#   selector1-<domain-dashed>._domainkey.<tenant>.<region>-v1.dkim.mail.microsoft
+# capture the <tenant> label that sits immediately after `._domainkey.`.
+_MS_DKIM_TENANT_RE = re.compile(
+    r"\._domainkey\.([a-z0-9]+)\.[^.]+\.dkim\.mail\.microsoft", re.IGNORECASE
+)
+
 
 def resolve_dkim(
     domain: str,
@@ -316,8 +347,9 @@ def resolve_dkim(
     dkim_error}.
 
     dkim_tenant_prefix: if selector1._domainkey.<domain> is a CNAME pointing at
-    ``*.onmicrosoft.com`` we capture the onmicrosoft tenant label. The Microsoft
-    pattern is typically selector1-<domain-dashed>._domainkey.<tenant>.onmicrosoft.com.
+    ``*.onmicrosoft.com`` we capture the onmicrosoft tenant label — the MailIn /
+    M365 homogeneous-provisioning fingerprint (factor 3). The Microsoft pattern is
+    typically selector1-<domain-dashed>._domainkey.<tenant>.onmicrosoft.com.
     """
     sels = selectors if selectors is not None else DEFAULT_DKIM_SELECTORS
     present: list[str] = []
@@ -335,9 +367,9 @@ def resolve_dkim(
         if has_cname or has_txt:
             present.append(sel)
 
-        if sel == "selector1" and has_cname and tenant_prefix is None:
+        if sel in ("selector1", "selector2") and has_cname and tenant_prefix is None:
             target = str(cname_ans[0].target).rstrip(".") if cname_ans else ""
-            m = _ONMICROSOFT_TENANT_RE.search(target)
+            m = _ONMICROSOFT_TENANT_RE.search(target) or _MS_DKIM_TENANT_RE.search(target)
             if m:
                 tenant_prefix = m.group(1)
 
@@ -425,23 +457,38 @@ class Blocklist:
     note: str
 
 
-# Standard public DNS blocklist zones. Mix of domain/URI blocklists (queried as
-# <domain>.<zone>) and IP blocklists (queried as reversed A-record IP). Some zones
-# return sentinel answers to queries from large shared resolvers (handled by
-# FALSE_POSITIVE_IPS); Spamhaus DBL is most reliable via the DQS REST endpoint
-# (check_spamhaus_dqs) rather than the public DNS zone.
+# The 8 blocklists from spec 07 §"Blacklist sweep".
+#   Existing 3 (blocklist-surveillance config.py):
+#     - spamrl   : MORIBUND. 0 listings across 51k prod queries (prep-notes §3).
+#                  db.spamrl.com is a DOMAIN blocklist. Kept for continuity.
+#     - surbl    : multi.surbl.org — DOMAIN/URI blocklist. 99.9% of all our
+#                  listings (prep-notes §3); carpet-bombs cheap .co/.info TLDs.
+#                  High noise — measure baseline before acting.
+#     - spamhaus : Spamhaus DBL is a DOMAIN blocklist. The public DNS zone
+#                  dbl.spamhaus.org poisons queries from non-DQS resolvers; the
+#                  reliable path is the DQS REST endpoint (check_spamhaus_dqs).
+#                  Plain dbl.spamhaus.org is included but flagged: without a DQS
+#                  key it returns the "blocked resolver" sentinel (FALSE_POSITIVE_IPS).
+#   New 5 (deliverability handoff):
+#     - barracuda  : b.barracudacentral.org — IP blocklist (reversed A record).
+#     - sorbs      : dbl.sorbs.net — DOMAIN blocklist. WARNING: SORBS largely shut
+#                    down 2024; may NXDOMAIN everything. Verify alive.
+#     - uceprotect : dnsbl-1.uceprotect.net — IP blocklist (level 1).
+#     - spamcop    : bl.spamcop.net — IP blocklist.
+#     - uribl      : multi.uribl.com — DOMAIN/URI blocklist. Public resolvers get
+#                    127.0.0.1 "query refused"; local resolver required.
 DEFAULT_DNSBLS: list[Blocklist] = [
     Blocklist("spamrl", "db.spamrl.com", "domain",
-              "Spamrl domain BL. Frequently returns no listings; treat as low-signal."),
+              "Spamrl domain BL. MORIBUND: 0 listings in 51k prod queries (prep-notes §3)."),
     Blocklist("surbl", "multi.surbl.org", "domain",
-              "SURBL multi URI BL. High-volume domain/URI blocklist."),
+              "SURBL multi URI BL. 99.9% of our listings; heavy .co/.info noise."),
     Blocklist("spamhaus_dbl", "dbl.spamhaus.org", "domain",
-              "Spamhaus DBL (domain). Public zone may return sentinels to shared "
-              "resolvers; prefer DQS REST (check_spamhaus_dqs). Guarded by FALSE_POSITIVE_IPS."),
+              "Spamhaus DBL (domain). Public zone poisons non-DQS resolvers; "
+              "prefer DQS REST (check_spamhaus_dqs). Guarded by FALSE_POSITIVE_IPS."),
     Blocklist("barracuda", "b.barracudacentral.org", "ip",
               "Barracuda Reputation BL. IP-based: queries reversed A-record IP."),
     Blocklist("sorbs", "dbl.sorbs.net", "domain",
-              "SORBS domain BL. May NXDOMAIN; verify alive before relying on it."),
+              "SORBS domain BL. WARNING: SORBS largely shut down 2024; verify alive."),
     Blocklist("uceprotect", "dnsbl-1.uceprotect.net", "ip",
               "UCEPROTECT level-1. IP-based: queries reversed A-record IP."),
     Blocklist("spamcop", "bl.spamcop.net", "ip",
@@ -544,9 +591,11 @@ def check_blacklists(
 def check_spamhaus_dqs(domain: str, dqs_key: str | None = None) -> dict[str, Any]:
     """Optional Spamhaus DBL check via the DQS/WQS REST endpoint.
 
-    The API key is read from the ``BLS_SPAMHAUS_DQS_KEY`` environment variable (or
-    passed explicitly). The request hits ``apibl.spamhaus.net/lookup/v1/dbl/<domain>``
-    (200 = listed, 404 = clean).
+    Per prep-notes §4 + production checker.py the working key in prod is the
+    ``.env`` BLS_SPAMHAUS_DQS_KEY and it hits
+    ``apibl.spamhaus.net/lookup/v1/dbl/<domain>`` (200 = listed, 404 = clean) —
+    NOT the documented <key>.dbl.dq.spamhaus.net DNS zone (the config.py comment is
+    wrong, and its hardcoded fallback key is dead/HTTP-500).
 
     Returns {listed: bool|None, status: int|None, error: str|None}. listed=None
     means we couldn't determine (no key / transient error) — NEVER assume clean.

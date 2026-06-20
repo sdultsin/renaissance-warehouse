@@ -211,6 +211,9 @@ def run(ctx: RunContext) -> PhaseResult:
 
 
 def register(registry: Registry) -> None:
-    # Ride the existing `close` phase (no PHASE_ORDER edit). MUST follow close_calls so
-    # core.call exists/is fresh — see module docstring on alphabetical discovery ordering.
-    registry.add_phase("close", "call_transcription", run)
+    # NOT registered into the nightly orchestrator. Transcription is slow I/O+CPU and would
+    # hold the single DuckDB writer lock for the whole batch, blocking reads + the nightly
+    # window. It runs as a STANDALONE daily cron instead — scripts/transcribe_calls.py — which
+    # whispers WITHOUT holding the warehouse lock and batch-writes results. (The run()/helpers
+    # in this module are still imported by that script.) No-op here on purpose.
+    return

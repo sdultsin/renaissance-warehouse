@@ -3,13 +3,13 @@
 # warehouse (raw_cc_*), for consolidation/BI. Droplet-native: uses the D1 export
 # HTTP API (no wrangler on the droplet) -> SQLite -> DuckDB sqlite scanner.
 #
-# Requires env: CC_D1_API_TOKEN, CLOUDFLARE_RG_ACCOUNT_ID, CC_D1_DATABASE_ID
-# (the live campaign-control-state db id).
+# Requires env: CC_D1_API_TOKEN, CLOUDFLARE_RG_ACCOUNT_ID. CC_D1_DATABASE_ID
+# defaults to the live campaign-control-state db.
 set -euo pipefail
 
 ACCT="${CLOUDFLARE_RG_ACCOUNT_ID:?missing CLOUDFLARE_RG_ACCOUNT_ID}"
 TOKEN="${CC_D1_API_TOKEN:?missing CC_D1_API_TOKEN}"
-DBID="${CC_D1_DATABASE_ID:?missing CC_D1_DATABASE_ID}"
+DBID="${CC_D1_DATABASE_ID:-25a32aa3-9d95-42a3-9e9e-8cd3a9e3f3eb}"
 WAREHOUSE="${CORE_DB_PATH:-/root/core/warehouse.duckdb}"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

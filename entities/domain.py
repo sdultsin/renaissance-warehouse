@@ -2,9 +2,9 @@
 
 Spine = raw_dns_sweep_domain (latest sweep). Enriched with:
   - esp / infra_provider / lifecycle / inbox_count aggregated from core.sending_account
-  - ns_provider / registrar / acquisition_date / acquisition_batch from an
-    NS-handoff CSV (seed_data/domains/ns-handoff.csv)
-  - cost_acquisition derived from the matching batch row in core.cost_ledger
+  - ns_provider / registrar / acquisition_date / acquisition_batch from the Lucas/Tomer
+    .co NS-handoff CSV (seed_data/domains/ns-handoff.csv, 2,002 rows)
+  - cost_acquisition derived from the .co batch row in core.cost_ledger ($1.80/domain)
 
 Registers under the 'canonical' phase, AFTER the dns_sweep phase has written
 raw_dns_sweep_domain. No-op if the sweep table is empty (e.g. canonical run before
@@ -34,7 +34,13 @@ SWEEP = "raw_dns_sweep_domain"
 NS_CSV = os.environ.get(
     "DOMAIN_NS_CSV", str(REPO_ROOT / "seed_data" / "domains" / "ns-handoff.csv")
 )
-CO_BATCH_ID = "bulk_domain_acquisition_2026-05-19"
+CO_BATCH_ID = "dynadot_2026-05-19_co_sale_14978"
+# Full row-level .co-sale batch (14,978 domains across Dynadot #9-15), derived from
+# the registrar registry. Drives $1.80/domain cost + batch tagging for the WHOLE
+# purchase — not just the 2,002 NS-handoff subset given to Tomer/Lucas.
+BATCH_CSV = os.environ.get(
+    "DOMAIN_CO_BATCH_CSV", str(REPO_ROOT / "seed_data" / "domains" / "co-sale-batch.csv")
+)
 
 
 def register(registry: Registry) -> None:
@@ -61,7 +67,19 @@ def run_domain(ctx: RunContext) -> PhaseResult:
              "NULL::VARCHAR AS registrar_account, NULL::DATE AS acquisition_date WHERE FALSE"
     )
     if not ns_exists:
-        logger.warning("NS handoff CSV not found at %s — ns_provider/batch will be NULL", NS_CSV)
+        logger.warning("NS handoff CSV not found at %s — ns_provider will be NULL", NS_CSV)
+
+    batch_exists = os.path.exists(BATCH_CSV)
+    batch_cte = (
+        f"SELECT lower(trim(domain)) AS domain, registrar_account, "
+        f"TRY_CAST(acquisition_date AS DATE) AS acquisition_date "
+        f"FROM read_csv_auto('{BATCH_CSV}')"
+        if batch_exists
+        else "SELECT NULL::VARCHAR AS domain, NULL::VARCHAR AS registrar_account, "
+             "NULL::DATE AS acquisition_date WHERE FALSE"
+    )
+    if not batch_exists:
+        logger.warning("co-sale batch CSV not found at %s — only NS-handoff domains get batch cost", BATCH_CSV)
 
     db.execute("DELETE FROM core.domain")
     db.execute(
@@ -93,16 +111,17 @@ def run_domain(ctx: RunContext) -> PhaseResult:
           GROUP BY domain
         ),
         ns AS ({ns_cte}),
+        batch AS ({batch_cte}),
         batch_rate AS (
           SELECT total_usd / NULLIF(unit_count, 0) AS per_domain
           FROM core.cost_ledger WHERE attribution_id = '{CO_BATCH_ID}' LIMIT 1
         )
         SELECT
           sw.domain,
-          NULL                                                        AS registrar,
-          ns.registrar_account,
-          ns.acquisition_date,
-          CASE WHEN ns.domain IS NOT NULL THEN '{CO_BATCH_ID}' END    AS acquisition_batch,
+          CASE WHEN batch.domain IS NOT NULL THEN 'dynadot' END        AS registrar,
+          COALESCE(batch.registrar_account, ns.registrar_account)      AS registrar_account,
+          COALESCE(batch.acquisition_date, ns.acquisition_date)        AS acquisition_date,
+          CASE WHEN batch.domain IS NOT NULL THEN '{CO_BATCH_ID}' END  AS acquisition_batch,
           regexp_replace(sw.domain, '\\.[a-z0-9]+$', '')              AS brand_prefix,
           acct.esp,
           acct.infra_provider,
@@ -121,22 +140,24 @@ def run_domain(ctx: RunContext) -> PhaseResult:
           NULL                                                        AS sheet_status,
           sw.blacklist_count, sw.any_blacklist_active, sw.listed_on,
           COALESCE(acct.inbox_count, 0)                               AS inbox_count,
-          CASE WHEN ns.domain IS NOT NULL THEN (SELECT per_domain FROM batch_rate) END AS cost_acquisition_usd_estimated,
+          CASE WHEN batch.domain IS NOT NULL THEN (SELECT per_domain FROM batch_rate) END AS cost_acquisition_usd_estimated,
           NULL                                                        AS cost_renewal_annual_usd_estimated,
           TRUE                                                        AS is_active,
           now(), now(), now()
         FROM sw
-        LEFT JOIN acct ON acct.domain = sw.domain
-        LEFT JOIN ns   ON ns.domain   = sw.domain
+        LEFT JOIN acct  ON acct.domain  = sw.domain
+        LEFT JOIN ns    ON ns.domain    = sw.domain
+        LEFT JOIN batch ON batch.domain = sw.domain
         """
     )
 
-    # Second source: owned-but-not-yet-sending batch domains from the NS-handoff CSV.
-    # These have NO inboxes yet (not in the account_truth snapshot) so they're absent from
-    # the sweep spine — but they belong in core.domain at lifecycle_state='acquired'
-    # with their NS/registrar/cost attribution. DNS fingerprint is NULL until they're swept.
-    # Batch defaults for this cohort: esp=outlook, infra_provider per the handoff.
-    if ns_exists:
+    # Second source: owned-but-not-yet-sending .co-sale batch domains (the whole 14,978,
+    # not just the 2,002 Tomer/Lucas NS-handoff). These have NO inboxes yet (absent from
+    # the sweep spine) but per spec 07 belong in core.domain at lifecycle_state='acquired'
+    # with their registrar/cost attribution. DNS fingerprint is NULL until they're swept.
+    # NS-handoff subset (Tomer/Lucas) keeps esp=outlook/infra=MailIn + ns_provider; the
+    # rest are owned-but-unprovisioned (esp/infra/ns NULL until configured).
+    if batch_exists:
         db.execute(
             f"""
             INSERT INTO core.domain (
@@ -147,21 +168,25 @@ def run_domain(ctx: RunContext) -> PhaseResult:
               is_active, first_seen_at, last_seen_at, resolved_at
             )
             WITH ns AS ({ns_cte}),
+            batch AS ({batch_cte}),
             batch_rate AS (
               SELECT total_usd / NULLIF(unit_count, 0) AS per_domain
               FROM core.cost_ledger WHERE attribution_id = '{CO_BATCH_ID}' LIMIT 1
             )
             SELECT
-              ns.domain, NULL, ns.registrar_account, ns.acquisition_date,
-              '{CO_BATCH_ID}', regexp_replace(ns.domain, '\\.[a-z0-9]+$', ''),
-              'outlook'                      AS esp,
-              NULL                           AS infra_provider,
+              batch.domain, 'dynadot',
+              COALESCE(batch.registrar_account, ns.registrar_account),
+              COALESCE(batch.acquisition_date, ns.acquisition_date),
+              '{CO_BATCH_ID}', regexp_replace(batch.domain, '\\.[a-z0-9]+$', ''),
+              CASE WHEN ns.domain IS NOT NULL THEN 'outlook' END AS esp,
+              CASE WHEN ns.domain IS NOT NULL THEN 'MailIn'  END AS infra_provider,
               ns.ns_provider, 'acquired'     AS lifecycle_state,
               NULL, NULL, NULL, NULL, 0,
               (SELECT per_domain FROM batch_rate), NULL,
               TRUE, now(), now(), now()
-            FROM ns
-            WHERE ns.domain NOT IN (SELECT domain FROM core.domain)
+            FROM batch
+            LEFT JOIN ns ON ns.domain = batch.domain
+            WHERE batch.domain NOT IN (SELECT domain FROM core.domain)
             """
         )
 
