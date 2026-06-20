@@ -90,7 +90,7 @@ rm -f "$CP_DIR"/unmapped-campaigns-*.md 2>/dev/null || true
 # 2c) Per-workspace dataset for the campaign-performance Workspaces tab (full totals,
 #     all workspaces, no active-CM filter) from Pipeline (= Instantly) + email meetings.
 #     Non-fatal: keep last-known-good on failure.
-if "" "/scripts/gen_workspaces.py" >>/root/lens_feeds.err 2>&1; then
+if "$PY" "$WH/scripts/gen_workspaces.py" >>/root/lens_feeds.err 2>&1; then
   echo "  ok lens-campaign-performance/workspaces.json"
 else
   echo "  WARN gen_workspaces.py failed — keeping last-known-good" >&2
