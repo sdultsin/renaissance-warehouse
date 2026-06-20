@@ -272,7 +272,19 @@ def fetch_rows(db_path: str, max_stale_days: int | None = None) -> list[tuple]:
     # No-op for --dry-run/--sql-out? No — those still open DuckDB here, so they wait
     # too (correct: a dry-run during a live writer would otherwise die identically).
     _acquire_warehouse_write_lock()
-    conn = duckdb.connect(db_path, read_only=True)
+    # MEMORY CAP (2026-06-20): this publisher only READS a ~46k-row table, so it
+    # needs almost no memory -- but on the 15 GiB box it was OOM-killed during the
+    # nightly tail on 06-18 AND 06-19 (the whole `python | tee` died mid-publish,
+    # so the in-shell PUBLISH_RC guard could not even fire -> SILENT ~66h staleness).
+    # Cap DuckDB so this step can never be the thing that tips the box over (or get
+    # picked off by the OOM reaper). Overridable via env for ops. Reversible: drop
+    # the config= dict (back to a plain read_only connect).
+    mem_limit = os.environ.get("PUBLISH_DUCKDB_MEMORY_LIMIT", "2GB")
+    threads = os.environ.get("PUBLISH_DUCKDB_THREADS", "2")
+    conn = duckdb.connect(
+        db_path, read_only=True,
+        config={"memory_limit": mem_limit, "threads": threads},
+    )
     try:
         return conn.execute(sql).fetchall()
     finally:
@@ -366,6 +378,59 @@ def publish(account_id: str, database_id: str, token: str, statements: list[str]
                 time.sleep(2 ** attempt)
 
 
+def assert_d1_fresh(account_id: str, database_id: str, token: str,
+                    expected_published_at: str, max_skew_s: int = 600) -> None:
+    """Positively ASSERT the publish actually LANDED in D1, fail-LOUD otherwise.
+
+    After publish() returns, re-read campaign_data_publish_meta.published_at from
+    D1 and require it to equal what we just wrote (within a small skew). This is a
+    publisher-level self-check so a partial / swallowed publish failure surfaces
+    here as a non-zero exit (which nightly.sh's PUBLISH_RC guard then alerts on)
+    rather than looking like success. It is COMPLEMENTARY to the independent
+    nightly_success_watchdog.sh D1-freshness check, which is the SIGKILL-proof
+    backstop for the case where this whole process is OOM-killed before reaching
+    this line. Reversible: delete this function + its call in main()."""
+    res = d1_query(account_id, database_id, token,
+                   "SELECT published_at FROM campaign_data_publish_meta WHERE id = 1")
+    rows = (res.get("result") or [{}])[0].get("results") or []
+    if not rows or not rows[0].get("published_at"):
+        raise RuntimeError(
+            "post-publish freshness assertion FAILED: campaign_data_publish_meta "
+            "has no published_at row in D1 after publish (the snapshot did not land).")
+    got = str(rows[0]["published_at"])
+    if got != expected_published_at:
+        # Fast path (exact byte-for-byte echo of what we wrote) is the normal
+        # case. Only reach here if the stored string diverges (e.g. a manual
+        # UPDATE wrote a naive SQLite-format timestamp). Parse tolerantly: treat
+        # a naive timestamp as UTC so we never raise a naive-vs-aware TypeError,
+        # and if BOTH values are genuinely unparseable, do NOT fail a publish that
+        # demonstrably landed (the row exists) -- just warn, since a non-zero exit
+        # here would spam the #cc-sam alert on a healthy publish.
+        from datetime import datetime as _dt, timezone as _tz
+
+        def _aware(x: str):
+            d = _dt.fromisoformat(str(x).replace("Z", "+00:00"))
+            return d if d.tzinfo is not None else d.replace(tzinfo=_tz.utc)
+
+        try:
+            skew = abs((_aware(got) - _aware(expected_published_at)).total_seconds())
+        except Exception:
+            print(
+                f"[publish_campaign_data_d1] WARN: could not parse published_at for "
+                f"skew check (D1={got!r} vs written={expected_published_at!r}); the "
+                f"publish row EXISTS so treating as landed.",
+                file=sys.stderr,
+            )
+            skew = 0.0
+        if skew > max_skew_s:
+            raise RuntimeError(
+                f"post-publish freshness assertion FAILED: D1 published_at={got!r} "
+                f"!= just-written {expected_published_at!r} (skew {skew:.0f}s > {max_skew_s}s) "
+                f"-- the publish did not land as expected.")
+    print(f"[publish_campaign_data_d1] post-publish freshness assertion OK "
+          f"(D1 published_at={got})", file=sys.stderr)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--db", default=DEFAULT_DB, help="warehouse DuckDB path")
@@ -435,6 +500,10 @@ def main() -> int:
         return 2
 
     publish(account_id, database_id, token, statements)
+    # Fail-LOUD self-check: positively assert the snapshot landed in D1 (advances
+    # campaign_data_publish_meta.published_at). A non-zero exit here is what
+    # nightly.sh's PUBLISH_RC guard alerts on. (2026-06-20)
+    assert_d1_fresh(account_id, database_id, token, published_at)
     print(
         f"[publish_campaign_data_d1] published {len(rows)} rows to D1 {database_id} @ {published_at}",
         file=sys.stderr,
