@@ -367,7 +367,7 @@ async def feedback(request):
 
 
 # POST /apply/enqueue (editor) — add to the serialized apply FIFO. GET /apply/queue (reader) — status.
-# POST /apply/process (admin) — drain the queue under the apply-lock, re-reviewing each on dequeue.
+# POST /apply/process (editor) — drain the queue under the apply-lock, re-reviewing each on dequeue.
 async def apply_enqueue(request):
     deny = require_scope(request, "editor")
     if deny is not None:
@@ -389,7 +389,7 @@ async def apply_queue(request):
 
 
 async def apply_process(request):
-    deny = require_scope(request, "admin")
+    deny = require_scope(request, "editor")
     if deny is not None:
         return deny
     body = await _json_body(request)

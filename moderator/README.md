@@ -26,7 +26,7 @@ Renaissance repo). Phase-1 substrate: branch `schema-gate-phase1`.
 `/opt/duckdb/allowed_tokens.txt` — `token<TAB>email[<TAB>scope]`, reloaded per request. Scope is a
 3rd column; lines without it default to `reader`. `reader` ⊂ `editor` ⊂ `admin`.
 - `reader` — `/catalog` `/ledger` `/issues` `/rules` (GET)
-- `editor` — `/review` `/record-pass` `/judge-advisory`
+- `editor` — `/review` `/record-pass` `/judge-advisory` `/apply/enqueue` `/apply/process`
 - `admin`  — `POST /rules`
 
 `/healthz` is unauthenticated.
