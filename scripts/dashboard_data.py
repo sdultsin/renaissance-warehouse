@@ -26,17 +26,36 @@ REVENUE_PER_MEETING = float(os.environ.get("REVENUE_PER_MEETING", "0"))
 ACTIVE_CMS = ("SAMUEL", "EYVER", "LEO", "IDO", "SAM")
 _CM_IN = "UPPER(cm) IN ('SAMUEL','EYVER','LEO','IDO','SAM')"
 
-# Channel of a booked meeting, classified from the Slack booking post (core.meeting.raw_text).
-# This is the correct source for SMS/WhatsApp booked counts — the upstream SMS provider's
-# calendly_event_uri funnel is dead (always NULL).
-# NOTE: daily channel precision is approximate — some SMS lines are posted without an explicit
-# tag, so counts won't tie out exactly to the team's manual daily tally. (bookmark: tighten.)
-CHANNEL_CASE = (
-    "CASE WHEN lower(raw_text) LIKE '%whatsapp%' THEN 'whatsapp' "
-    "WHEN lower(raw_text) LIKE '%sendivo%' OR lower(raw_text) LIKE '%sms%' THEN 'sms' "
-    "WHEN lower(raw_text) LIKE '%linkedin%' THEN 'linkedin' "
-    "WHEN lower(raw_text) LIKE '%sdr%' THEN 'sdr' ELSE 'email' END"
+# Channel of a booked meeting. AUTHORITATIVE source = the curated core.meeting.channel column
+# (sheet rows carry an explicit channel; SMS/Call/WhatsApp/LinkedIn are tagged there). The old
+# raw_text LIKE heuristic (dumped every untagged row into 'email', counted email ~2x and SMS ~3x
+# under) is RETIRED — it ignored the channel column entirely. Consumers below read the channel
+# column directly (NULL/blank -> '(unknown)' bucket, or channel='SMS' for the SMS funnel).
+
+# Hybrid EMAIL filter ported verbatim from scripts/portal_data.py (EMAIL_IS / EMAIL_WHERE).
+# For source='sheet' rows (>=Jun-1) the explicit channel column is the truth (channel='Email').
+# For Slack-era rows (no channel) fall back to the SMS-exclusion raw_text regex. This is the
+# canonical email-meeting filter (v_kpi_email / warehouse-query-prompt.md); without it the
+# email leaderboards count SMS/Call/WhatsApp (nearly all hard-assigned cm='IDO'). `m` = alias.
+_REGEX_EMAIL = (
+    "NOT regexp_matches(lower(COALESCE(m.campaign_name_raw,'')||' '||COALESCE(m.raw_text,'')),"
+    "'sendivo|\\bsms\\b|whatsapp|iskra')"
 )
+EMAIL_IS = (
+    "(CASE WHEN m.source = 'sheet' THEN m.channel = 'Email' "
+    f"ELSE {_REGEX_EMAIL} END)"
+)
+EMAIL_WHERE = EMAIL_IS  # alias for readability in WHERE clauses
+
+# Partner-label normalization. core.meeting.partner_key is NOT reliably populated, so we
+# normalize via the curated core.funding_partner.aliases array (display_name <- any alias),
+# falling back to partner_key when present. This merges BTC/Big Think, Qualifi/GoQualifi,
+# GreenBridge/GreenBridge Capital into one canonical display_name. `m`/`fp` = aliases.
+PARTNER_JOIN = (
+    "LEFT JOIN core.funding_partner fp "
+    "ON (m.partner_key = fp.partner_key OR list_contains(fp.aliases, m.partner))"
+)
+PARTNER_NAME = "COALESCE(fp.display_name, m.partner, '(none)')"
 
 conn = duckdb.connect(DB, read_only=True)
 
@@ -59,22 +78,45 @@ def table_exists(name: str) -> bool:
 data: dict = {"generated_at": datetime.now(timezone.utc).isoformat()}
 
 # ---------------------------------------------------------------- Performance (email)
+# Window = stable trailing-4-weeks (incl. the current partial week), anchored to the start of
+# the current week so the bucket count doesn't drift day-to-day (B8). `sends`/`replies` are this
+# windowed volume from v_campaign_opportunities; OPPS is the cumulative ABSOLUTE from
+# v_campaign_metrics (G6) — v_campaign_opportunities.opportunities is a per-week TREND and must
+# never be SUM'd as a total. opp_per_1k therefore = absolute_opps / windowed_sends (a mixed-grain
+# efficiency ratio, intentional). by_cm/by_offer are Funding-5-scoped; by_offer is also pinned to
+# offer='FUNDING' so its sub-rows reconcile to by_cm (B9). by_infra is account-grain ESP (B1/G1).
+_PERF_WINDOW = "week_start >= date_trunc('week', current_date) - INTERVAL 21 DAY"
 data["performance"] = {
     "by_cm": q(f"""
-        SELECT cm, SUM(sends) sends, SUM(unique_replies) replies,
-               SUM(opportunities) opps,
-               ROUND(SUM(opportunities)*1000.0/NULLIF(SUM(sends),0),2) opp_per_1k
-        FROM v_campaign_opportunities WHERE week_start >= current_date - 30 AND {_CM_IN}
-        GROUP BY 1 ORDER BY opps DESC NULLS LAST"""),
-    "by_offer": q("""
-        SELECT COALESCE(offer,'(unmatched)') offer, SUM(sends) sends, SUM(opportunities) opps,
-               ROUND(SUM(opportunities)*1000.0/NULLIF(SUM(sends),0),2) opp_per_1k
-        FROM v_campaign_opportunities WHERE week_start >= current_date - 30
-        GROUP BY 1 ORDER BY opps DESC NULLS LAST"""),
+        WITH abs_opp AS (
+          SELECT cm_name cm, SUM(opportunities) opps FROM v_campaign_metrics
+          WHERE UPPER(cm_name) IN ('SAMUEL','EYVER','LEO','IDO','SAM') GROUP BY 1
+        )
+        SELECT o.cm, SUM(o.sends) sends, SUM(o.unique_replies) replies,
+               a.opps,
+               ROUND(a.opps*1000.0/NULLIF(SUM(o.sends),0),2) opp_per_1k
+        FROM v_campaign_opportunities o LEFT JOIN abs_opp a ON a.cm = o.cm
+        WHERE o.{_PERF_WINDOW} AND UPPER(o.cm) IN ('SAMUEL','EYVER','LEO','IDO','SAM')
+        GROUP BY o.cm, a.opps ORDER BY a.opps DESC NULLS LAST"""),
+    "by_offer": q(f"""
+        WITH abs_opp AS (
+          SELECT COALESCE(offer,'(unmatched)') offer, SUM(opportunities) opps FROM v_campaign_metrics
+          WHERE UPPER(cm_name) IN ('SAMUEL','EYVER','LEO','IDO','SAM') AND offer = 'FUNDING' GROUP BY 1
+        )
+        SELECT COALESCE(o.offer,'(unmatched)') offer, SUM(o.sends) sends,
+               a.opps,
+               ROUND(a.opps*1000.0/NULLIF(SUM(o.sends),0),2) opp_per_1k
+        FROM v_campaign_opportunities o
+        LEFT JOIN abs_opp a ON a.offer = COALESCE(o.offer,'(unmatched)')
+        WHERE o.{_PERF_WINDOW} AND {_CM_IN} AND o.offer = 'FUNDING'
+        GROUP BY COALESCE(o.offer,'(unmatched)'), a.opps ORDER BY a.opps DESC NULLS LAST"""),
+    # By Sender ESP — account-grain ESP + actual_sends (core.sending_account_daily), the ONLY
+    # OTD-splittable source. Campaign infra_type lumped OTD into google (B1/G1). No opps column:
+    # account grain is not joinable to opportunities by campaign. ~19% esp=NULL -> 'unknown';
+    # source lags ~2 days behind the email-perf window.
     "by_infra": q("""
-        SELECT COALESCE(infra_type,'(unknown)') sender_esp, SUM(sends) sends, SUM(opportunities) opps,
-               ROUND(SUM(opportunities)*1000.0/NULLIF(SUM(sends),0),2) opp_per_1k
-        FROM v_campaign_opportunities WHERE week_start >= current_date - 30
+        SELECT COALESCE(esp,'unknown') sender_esp, SUM(actual_sends) sends
+        FROM core.sending_account_daily WHERE date >= current_date - 30
         GROUP BY 1 ORDER BY sends DESC"""),
     "weekly": q("""
         SELECT week_start::VARCHAR AS "week", SUM(sends) sends, SUM(unique_replies) replies, SUM(opportunities) opps
@@ -100,20 +142,37 @@ data["sending_truth"] = {
     "by_lifecycle": q("""
         SELECT lifecycle_state, COUNT(*) inboxes FROM core.sending_account
         WHERE is_active GROUP BY 1 ORDER BY inboxes DESC"""),
-    # Daily send ACTIVITY (real history from the pipeline daily metrics). This is the
-    # day-by-day "actual sends" series; infra split via campaign→infra_type join
-    # (unknown/NULL → otd, the only unclassified infra we run). Last 45 days.
+    # Daily send ACTIVITY (real history). The day TOTAL is the pipeline daily metric
+    # (raw_pipeline_campaign_daily_metrics.sent); the google/outlook/otd SPLIT is the
+    # account-grain ESP proportion from core.sending_account_daily for that date (B2). The old
+    # campaign→infra_type join lumped OTD into google (~4.3x google inflation, ~75% OTD undercount)
+    # because infra_type has no 'otd' value. outlook+microsoft -> outlook. CRITICAL: ESP data lags
+    # ~2 days, so we INNER-JOIN on the date — trailing dates with no ESP rows (e.g. the partial
+    # generation day) are OMITTED rather than emitting a false 100%-google bar. Last 45 days.
     "daily": q("""
-        WITH camp AS (
-          SELECT campaign_id, infra_type FROM raw_pipeline_campaigns
-          WHERE _run_id = (SELECT _run_id FROM raw_pipeline_campaigns ORDER BY _loaded_at DESC LIMIT 1)
-        )
-        SELECT m.date::VARCHAR d, SUM(m.sent) sends,
-               SUM(m.sent) FILTER (WHERE lower(c.infra_type)='google') google,
-               SUM(m.sent) FILTER (WHERE lower(c.infra_type)='outlook') outlook,
-               SUM(m.sent) FILTER (WHERE lower(c.infra_type) NOT IN ('google','outlook') OR c.infra_type IS NULL) otd
-        FROM raw_pipeline_campaign_daily_metrics m LEFT JOIN camp c ON c.campaign_id = m.campaign_id
-        WHERE m.date >= current_date - 45 GROUP BY 1 ORDER BY 1"""),
+        WITH tot AS (
+          SELECT date, SUM(sent) total_sent
+          FROM raw_pipeline_campaign_daily_metrics
+          WHERE date >= current_date - 45 GROUP BY 1
+        ),
+        esp AS (
+          SELECT date,
+                 CASE WHEN lower(COALESCE(esp,''))='google' THEN 'google'
+                      WHEN lower(COALESCE(esp,'')) IN ('outlook','microsoft') THEN 'outlook'
+                      WHEN lower(COALESCE(esp,''))='otd' THEN 'otd' ELSE 'other' END bucket,
+                 SUM(actual_sends) s
+          FROM core.sending_account_daily WHERE date >= current_date - 45 GROUP BY 1, 2
+        ),
+        espday AS (SELECT date, SUM(s) day_total FROM esp GROUP BY 1)
+        SELECT t.date::VARCHAR d, t.total_sent sends,
+               ROUND(t.total_sent * COALESCE(SUM(e.s) FILTER (WHERE e.bucket='google'),0)  / ed.day_total)::BIGINT google,
+               ROUND(t.total_sent * COALESCE(SUM(e.s) FILTER (WHERE e.bucket='outlook'),0) / ed.day_total)::BIGINT outlook,
+               ROUND(t.total_sent * COALESCE(SUM(e.s) FILTER (WHERE e.bucket='otd'),0)     / ed.day_total)::BIGINT otd
+        FROM tot t
+        JOIN espday ed ON ed.date = t.date
+        LEFT JOIN esp e ON e.date = t.date
+        WHERE ed.day_total > 0
+        GROUP BY t.date, t.total_sent, ed.day_total ORDER BY 1"""),
     "daily_by_workspace": q("""
         SELECT date::VARCHAR d, COALESCE(workspace_name,'(unknown)') workspace, SUM(sent) sends
         FROM raw_pipeline_campaign_daily_metrics
@@ -128,24 +187,30 @@ data["esp_distribution"] = q("""
     GROUP BY 1, 2 ORDER BY 1, inboxes DESC""")
 
 # ---------------------------------------------------------------- SMS Performance (Sendivo send-side)
-# Real send funnel from the Sendivo API (v_sms_performance). Rates are VOLUME-WEIGHTED
-# (Σ(sent×rate)/Σsent) — the true period rate, NOT a naive average of daily rates.
+# CANON send-side source = v_sms_campaign_performance (per-campaign, mapped sends — the same view
+# v_kpi_sms + lens-sms build on). The old v_sms_performance read raw_sendivo_delivery_metrics (all
+# sends) and disagreed with lens-sms by ~830K/30d (G4). delivery_rate is recomputed from counts
+# (SUM(delivered)/SUM(sent)); opt_out_rate = opt_outs/sent. inbound/response_rate are dropped: this
+# view has no inbound_sms_received, and its `replies` carries the upstream duplicate-webhook blowup
+# (G3, a separate DDL fix) so it must not be surfaced as an inbound count here.
 data["sms"] = {
     "send_30d": q("""
-        SELECT SUM(sms_sent) sent, SUM(segments_sent) segments, SUM(inbound_sms_received) inbound,
-               ROUND(SUM(sms_sent*delivery_rate)/NULLIF(SUM(sms_sent),0),1) delivery_rate,
-               ROUND(SUM(sms_sent*opt_out_rate)/NULLIF(SUM(sms_sent),0),2) opt_out_rate,
-               ROUND(SUM(sms_sent*response_rate)/NULLIF(SUM(sms_sent),0),2) response_rate
-        FROM v_sms_performance WHERE metric_date >= current_date - 30""")[0],
-    "daily": q("""SELECT metric_date::VARCHAR d, sms_sent, delivery_rate
-                  FROM v_sms_performance WHERE metric_date >= current_date - 30 ORDER BY metric_date"""),
+        SELECT SUM(sent) sent, SUM(segments) segments,
+               ROUND(100.0*SUM(delivered)/NULLIF(SUM(sent),0),1) delivery_rate,
+               ROUND(100.0*SUM(opt_outs)/NULLIF(SUM(sent),0),2) opt_out_rate
+        FROM v_sms_campaign_performance WHERE metric_date >= current_date - 30""")[0],
+    "daily": q("""SELECT metric_date::VARCHAR d, SUM(sent) sms_sent,
+                         ROUND(100.0*SUM(delivered)/NULLIF(SUM(sent),0),1) delivery_rate
+                  FROM v_sms_campaign_performance WHERE metric_date >= current_date - 30
+                  GROUP BY 1 ORDER BY 1"""),
     "spend_billed": one("SELECT ROUND(SUM(total_usd),2) FROM core.cost_ledger WHERE vendor='sendivo'"),
-    # Outcomes (Slack-sourced): booked meetings attributed to the SMS channel.
-    "booked_30d": one(f"SELECT COUNT(*) FROM core.meeting WHERE {CHANNEL_CASE} = 'sms' AND posted_at >= current_date - 30"),
-    "booked_7d": one(f"SELECT COUNT(*) FROM core.meeting WHERE {CHANNEL_CASE} = 'sms' AND posted_at >= current_date - 7"),
-    "weekly_booked": q(f"""
+    # Outcomes (curated): booked meetings on the SMS channel via the authoritative
+    # core.meeting.channel column (the old raw_text 'sms' heuristic undercounted ~3x).
+    "booked_30d": one("SELECT COUNT(*) FROM core.meeting WHERE channel = 'SMS' AND posted_at >= current_date - 30"),
+    "booked_7d": one("SELECT COUNT(*) FROM core.meeting WHERE channel = 'SMS' AND posted_at >= current_date - 7"),
+    "weekly_booked": q("""
         SELECT date_trunc('week', posted_at)::VARCHAR AS "week", COUNT(*) booked
-        FROM core.meeting WHERE {CHANNEL_CASE} = 'sms' AND posted_at >= current_date - 90
+        FROM core.meeting WHERE channel = 'SMS' AND posted_at >= current_date - 90
         GROUP BY 1 ORDER BY 1"""),
     "opportunities_unique": one("SELECT COUNT(*) FROM core.opportunity WHERE source='sendivo' AND state <> 'duplicate'"),
 }
@@ -179,12 +244,22 @@ data["meetings"] = {
     "booked_30d": one("SELECT COUNT(*) FROM core.meeting WHERE posted_at >= current_date - 30"),
     "booked_7d": one("SELECT COUNT(*) FROM core.meeting WHERE posted_at >= current_date - 7"),
     "revenue_30d": (one("SELECT COUNT(*) FROM core.meeting WHERE posted_at >= current_date - 30") or 0) * REVENUE_PER_MEETING,
+    # Email-CM leaderboard — MUST apply the hybrid EMAIL filter (B3/G2). Without it the count
+    # included SMS/Call/WhatsApp meetings, nearly all hard-assigned cm='IDO' (IDO 2,567 -> 1,173
+    # email-only, 30d). channel='Email' for sheet rows; SMS-exclusion regex for Slack-era rows.
     "by_cm": q(f"""
-        SELECT cm, COUNT(*) meetings, COUNT(*)*{REVENUE_PER_MEETING} revenue
-        FROM core.meeting WHERE {_CM_IN} AND posted_at >= current_date - 30 GROUP BY 1 ORDER BY meetings DESC"""),
-    "by_partner": q("""
-        SELECT COALESCE(partner,'(none)') partner, COUNT(*) meetings
-        FROM core.meeting WHERE posted_at >= current_date - 30 GROUP BY 1 ORDER BY meetings DESC LIMIT 20"""),
+        SELECT m.cm, COUNT(*) meetings, COUNT(*)*{REVENUE_PER_MEETING} revenue
+        FROM core.meeting m
+        WHERE UPPER(m.cm) IN ('SAMUEL','EYVER','LEO','IDO','SAM')
+              AND m.posted_at >= current_date - 30 AND {EMAIL_WHERE}
+        GROUP BY 1 ORDER BY meetings DESC"""),
+    # Partner rollup — normalized to one canonical display_name via the curated
+    # core.funding_partner.aliases array (BTC/Big Think, Qualifi/GoQualifi, GreenBridge variants
+    # merge). partner_key is unreliably populated so the alias-array match carries the join (G8).
+    "by_partner": q(f"""
+        SELECT {PARTNER_NAME} partner, COUNT(*) meetings
+        FROM core.meeting m {PARTNER_JOIN}
+        WHERE m.posted_at >= current_date - 30 GROUP BY 1 ORDER BY meetings DESC LIMIT 20"""),
     # Partner rollup (30d) with commercial-model / tier labels from core.funding_partner.
     # LEFT JOIN keeps unmatched partners / NULL visible as '(unattributed)'. No revenue math.
     "by_partner_labeled": q("""
@@ -194,8 +269,12 @@ data["meetings"] = {
         LEFT JOIN core.funding_partner fp ON m.partner_key = fp.partner_key
         WHERE m.posted_at >= current_date - 30
         GROUP BY 1, 2, 3 ORDER BY meetings DESC"""),
-    "by_channel": q(f"""
-        SELECT {CHANNEL_CASE} channel, COUNT(*) meetings
+    # Channel mix — AUTHORITATIVE core.meeting.channel column (Email 2,023 / SMS 1,161 /
+    # Call 95 / WhatsApp 91 / LinkedIn 2, 30d). The old raw_text heuristic dumped SMS/Call/
+    # WhatsApp + all NULL-channel rows into 'email' (~2x over) and mis-bucketed SMS ~3x under
+    # (B5). NULL/blank channel is surfaced as its own '(unknown)' bucket, not reclassified.
+    "by_channel": q("""
+        SELECT COALESCE(NULLIF(channel,''),'(unknown)') channel, COUNT(*) meetings
         FROM core.meeting WHERE posted_at >= current_date - 30 GROUP BY 1 ORDER BY 2 DESC"""),
     "weekly": q("""
         SELECT date_trunc('week', posted_at)::VARCHAR AS "week", COUNT(*) meetings

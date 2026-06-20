@@ -88,7 +88,10 @@ WINDOW_START = os.environ.get("PORTAL_WINDOW_START", "2026-06-01")
 _wm = datetime.strptime(WINDOW_START, "%Y-%m-%d")
 WINDOW_LABEL = f"since {_wm.strftime('%b')} {_wm.day}"  # e.g. "since Jun 1"
 # SQL fragment: meeting m is in the clean window. `m` must be the table alias.
-WINDOW_WHERE = f"m.posted_at >= DATE '{WINDOW_START}'"
+# Upper-clamp included for symmetry with the MTD queries (QA A5). No future-dated rows
+# exist today (MAX(posted_at::DATE)=2026-06-19, zero future rows), so this is pure
+# symmetry hardening — it changes nothing about the current numbers.
+WINDOW_WHERE = f"m.posted_at >= DATE '{WINDOW_START}' AND m.posted_at < current_date + 1"
 
 # ── Org sends/replies WINDOW (Instantly-native reply scorecard) ────────────────────
 # The org-wide sends/replies scorecard is sourced from the SAME Instantly-native daily
@@ -97,6 +100,13 @@ WINDOW_WHERE = f"m.posted_at >= DATE '{WINDOW_START}'"
 # (reference_warehouse_reply_and_tag_truth_20260614: Instantly NATIVE is the SOLE truth
 # for human/auto/total reply + positive(=opps÷human, >= May-15)). Kept as an env knob.
 SENDS_REPLIES_WINDOW_START = os.environ.get("PORTAL_SENDS_REPLIES_WINDOW_START", "2026-05-15")
+# Self-labelling window for the org sends/replies block. The GLOBAL window
+# (WINDOW_LABEL, "since Jun 1") labels the ATTRIBUTION leaderboards; the org
+# sends/replies block uses its OWN canonical positive-reply window (May-15), so it must
+# NOT inherit the global "since Jun 1" label. This per-block label (QA G5) lets any
+# future renderer self-label the block as "since May 15" rather than mislabel it Jun-1.
+_srm = datetime.strptime(SENDS_REPLIES_WINDOW_START, "%Y-%m-%d")
+SENDS_REPLIES_WINDOW_LABEL = f"since {_srm.strftime('%b')} {_srm.day}"  # e.g. "since May 15"
 
 # ── CM leaderboard logic: FACT-DRIVEN per time-window (not a static allowlist) ─────
 # RULE (Sam, 2026-06-14): a CM appears in a leaderboard window IFF they have meetings
@@ -614,19 +624,69 @@ data["trend"] = safe("trend", lambda: q(f"""
 
 # Monthly rollup (the portal's monthlyData replacement: month, booked, sent, ratio).
 # Drives Overview O4 + Business ▸ Overview/Volume/Insights. Period ratio per month.
+# PARTIAL-MONTH / PRE-COVERAGE HARDENING (QA H2/H3/H8):
+#   • sends coverage begins at MIN(date) in raw_pipeline_campaign_daily_metrics (verified
+#     2026-01-26). The FULL OUTER JOIN would otherwise emit every meetings-only month BACK
+#     to ~18mo (Jan'25..Dec'25) with sent=0 — a meetings-era month with NO send coverage.
+#     A client computing an "all-time" sends/volume/ratio over that would mislabel a
+#     2026-only window. -> NULL-OUT sent (and ratio) for any month BEFORE the sends-coverage
+#     start month (cov.start_mo); those months keep `booked` but carry sent=NULL (NOT 0) so
+#     the client can drop them from sends/volume/insight series. (H3)
+#   • `partial:true` is flagged where the month has fewer sent-days than days-in-month
+#     (sent_days < days_in_month), OR the month is the coverage-start month (contains the
+#     global MIN(date) — the partial Jan'26 boundary), OR the month is the current (in-
+#     progress) month. The client skips partial months for "Best Conversion" / growth math. (H2/H8)
+#   • days_elapsed / days_in_month let the client exclude the current partial month from
+#     growth math explicitly. (H8)
 data["monthly"] = safe("monthly", lambda: q(f"""
     WITH mt AS (
       SELECT date_trunc('month', m.posted_at) AS mo, COUNT(*) AS booked
       FROM core.meeting m WHERE {EMAIL_WHERE} GROUP BY 1),
     se AS (
-      SELECT date_trunc('month', date) AS mo, SUM(sent) AS sent
-      FROM raw_pipeline_campaign_daily_metrics GROUP BY 1)
-    SELECT strftime(COALESCE(mt.mo, se.mo), '%b ''%y') AS month,
-           COALESCE(mt.booked,0) AS booked, COALESCE(se.sent,0) AS sent,
-           CASE WHEN COALESCE(mt.booked,0)>0 THEN round(se.sent::DOUBLE/mt.booked) ELSE 0 END AS ratio
-    FROM mt FULL OUTER JOIN se USING (mo)
-    WHERE COALESCE(mt.mo, se.mo) >= current_date - INTERVAL '18 months'
-    ORDER BY COALESCE(mt.mo, se.mo)"""))
+      SELECT date_trunc('month', date) AS mo, SUM(sent) AS sent,
+             COUNT(DISTINCT date) AS sent_days
+      FROM raw_pipeline_campaign_daily_metrics GROUP BY 1),
+    cov AS (
+      SELECT MIN(date) AS min_date,
+             date_trunc('month', MIN(date)) AS start_mo
+      FROM raw_pipeline_campaign_daily_metrics),
+    j AS (
+      SELECT COALESCE(mt.mo, se.mo) AS mo,
+             COALESCE(mt.booked,0)  AS booked,
+             se.sent      AS sent_raw,
+             se.sent_days AS sent_days
+      FROM mt FULL OUTER JOIN se USING (mo))
+    SELECT strftime(j.mo, '%b ''%y') AS month,
+           j.booked AS booked,
+           -- H3: NULL-out sent for months before sends coverage begins (no 2025 sent=0).
+           CASE WHEN j.mo < cov.start_mo THEN NULL ELSE COALESCE(j.sent_raw,0) END AS sent,
+           CASE WHEN j.mo < cov.start_mo THEN NULL
+                WHEN j.booked>0 AND j.sent_raw IS NOT NULL
+                     THEN round(j.sent_raw::DOUBLE/j.booked) ELSE NULL END AS ratio,
+           COALESCE(j.sent_days,0) AS sent_days,
+           -- last calendar day of the month -> days_in_month
+           CAST(date_part('day', (j.mo + INTERVAL '1 month' - INTERVAL '1 day')) AS INTEGER) AS days_in_month,
+           -- H8: how many days of THIS month have elapsed as of the snapshot (current month only;
+           -- full for any past month = days_in_month).
+           CAST(LEAST(
+                  date_part('day', (j.mo + INTERVAL '1 month' - INTERVAL '1 day')),
+                  GREATEST(0, date_part('day', current_date) +
+                              CASE WHEN j.mo = date_trunc('month', current_date) THEN 0
+                                   WHEN j.mo < date_trunc('month', current_date)
+                                        THEN date_part('day', (j.mo + INTERVAL '1 month' - INTERVAL '1 day'))
+                                   ELSE 0 - date_part('day', current_date) END)
+                ) AS INTEGER) AS days_elapsed,
+           -- H2/H8: partial when sent-days < days-in-month, OR coverage-start (MIN-date) month,
+           -- OR the current in-progress month. Months before coverage are NOT flagged partial
+           -- (they carry sent=NULL instead — see H3); the client drops them by the null sent.
+           ( (j.mo >= cov.start_mo
+              AND COALESCE(j.sent_days,0)
+                  < date_part('day', (j.mo + INTERVAL '1 month' - INTERVAL '1 day')))
+             OR j.mo = cov.start_mo
+             OR j.mo = date_trunc('month', current_date) ) AS partial
+    FROM j CROSS JOIN cov
+    WHERE j.mo >= current_date - INTERVAL '18 months'
+    ORDER BY j.mo"""))
 
 # ───────────────────────── C2gen — monthly[] enrichments + day-of-week (dow[]) ─────
 # Reuses the SAME daily booked (email meetings, hybrid filter) + daily sent
@@ -763,6 +823,12 @@ data["im_bookings"] = safe("im_bookings", lambda: {
 # cannot mislead if ever wired. PRIOR BUG: it was built from mv_esp_send_matrix (the
 # DROPPED home-grown classifier), 8-13x wrong on replies.
 data["sends_replies"] = safe("sends_replies", lambda: {
+    # G5: per-block window so a renderer self-labels this block with ITS OWN window
+    # (canonical May-15 positive-reply window), NOT the global "since Jun 1" leaderboard
+    # window. NOTE: `by_workspace_mtd` below is a June-MTD cut, not a May-15 cut — this
+    # `window` describes the `org` block specifically.
+    "window": {"start": SENDS_REPLIES_WINDOW_START, "label": SENDS_REPLIES_WINDOW_LABEL,
+               "applies_to": "org"},
     "org": (lambda r: {
         **r,
         "positive_rate": (round(r["positive"] / r["human"], 4)
