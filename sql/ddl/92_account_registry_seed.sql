@@ -1,4 +1,4 @@
--- Version 87 (2026-06-20) — core.account_registry: formalize and fully seed from
+-- Version 92 (2026-06-20) — core.account_registry: formalize and fully seed from
 -- FINAL DATA - ALL.csv (2,656,099 rows, one row per sending account email address).
 --
 -- History: the table was created ad-hoc before DDL tracking; it existed in the
