@@ -53,6 +53,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import socket
 import sys
 import time
 import urllib.error
@@ -63,6 +64,29 @@ import duckdb
 
 DEFAULT_DB = os.environ.get("CORE_DB_PATH", "/root/core/warehouse.duckdb")
 DEFAULT_D1_DATABASE_ID = "25a32aa3-9d95-42a3-9e9e-8cd3a9e3f3eb"
+
+# D1 HTTP network bounds (2026-06-20). The publish makes ~237 sequential POSTs to
+# the Cloudflare D1 HTTP API. A normal full publish is ~37s; a single hung request
+# (stalled TLS handshake / a connection the server never finishes) is what wedged
+# the nightly tail for HOURS on 06-17→06-20 (nightly.sh now also caps the whole
+# step with `timeout`, but the publisher must ALSO fail fast on its own so it never
+# *needs* to be SIGKILLed). Each request gets a hard per-request timeout; retries
+# are bounded; and the whole publish has a total wall-clock budget. All tunable via
+# env. Reversible: revert the timeout arg + the deadline/except changes below.
+D1_REQUEST_TIMEOUT_S = float(os.environ.get("D1_REQUEST_TIMEOUT_S", "30"))
+D1_MAX_RETRIES = int(os.environ.get("D1_MAX_RETRIES", "3"))
+# Total wall-clock budget for the whole publish (all statements). Kept under
+# nightly.sh's outer `timeout` (default 600s) so the publisher aborts itself
+# loudly BEFORE the outer SIGTERM/SIGKILL has to fire.
+D1_PUBLISH_BUDGET_S = float(os.environ.get("D1_PUBLISH_BUDGET_S", "540"))
+
+# Exceptions that mean "transient network trouble, retry": URLError covers most
+# urllib failures, but a socket read/connect TIMEOUT raises socket.timeout /
+# TimeoutError, which on Python 3.12 is NOT a subclass of urllib.error.URLError
+# (verified: issubclass(socket.timeout, URLError) is False). The original retry
+# loop caught only (URLError, RuntimeError), so a hung-then-timed-out request
+# escaped the retry/abort path entirely. Catch the timeout/OSError family too.
+_D1_RETRYABLE = (urllib.error.URLError, socket.timeout, TimeoutError, OSError, RuntimeError)
 
 # ---------------------------------------------------------------------------
 # WLOCK-SERIALIZE THE PUBLISH (warehouse-writer wlock hardening, 2026-06-17).
@@ -353,7 +377,10 @@ def d1_query(account_id: str, database_id: str, token: str, sql: str) -> dict:
             "Content-Type": "application/json",
         },
     )
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    # Hard per-request timeout so a single hung request can never block forever.
+    # urlopen(timeout=...) bounds the connect AND each socket read, raising
+    # socket.timeout / TimeoutError on expiry (now caught by the retry loop).
+    with urllib.request.urlopen(req, timeout=D1_REQUEST_TIMEOUT_S) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
@@ -363,17 +390,31 @@ def publish(account_id: str, database_id: str, token: str, statements: list[str]
     # last good D1 snapshot only if the DELETE had not yet run -- so on failure
     # AFTER the delete, re-run the publish; the flag can also be flipped back to
     # supabase for an instant rollback).
+    #
+    # NETWORK-BOUNDED (2026-06-20): each request has a hard per-request timeout
+    # (D1_REQUEST_TIMEOUT_S); retries are bounded (D1_MAX_RETRIES) and catch the
+    # socket-timeout family (the bug that let a hung request escape the retry/abort
+    # path); and the whole publish has a total wall-clock budget (D1_PUBLISH_BUDGET_S)
+    # so it can NEVER hang the nightly tail — it aborts loudly first.
+    deadline = time.monotonic() + D1_PUBLISH_BUDGET_S
     for idx, sql in enumerate(statements):
-        for attempt in range(3):
+        if time.monotonic() > deadline:
+            raise RuntimeError(
+                f"publish aborted at statement {idx}/{len(statements)}: exceeded "
+                f"total D1 publish budget ({D1_PUBLISH_BUDGET_S:.0f}s) — D1 HTTP API "
+                f"is slow/unreachable; killing the publish so the nightly tail proceeds"
+            )
+        for attempt in range(D1_MAX_RETRIES):
             try:
                 res = d1_query(account_id, database_id, token, sql)
                 if not res.get("success"):
                     raise RuntimeError(f"D1 query failed: {res.get('errors')}")
                 break
-            except (urllib.error.URLError, RuntimeError) as exc:
-                if attempt == 2:
+            except _D1_RETRYABLE as exc:
+                if attempt == D1_MAX_RETRIES - 1 or time.monotonic() > deadline:
                     raise RuntimeError(
-                        f"publish aborted at statement {idx}/{len(statements)}: {exc}"
+                        f"publish aborted at statement {idx}/{len(statements)} "
+                        f"(attempt {attempt + 1}/{D1_MAX_RETRIES}): {exc}"
                     ) from exc
                 time.sleep(2 ** attempt)
 
