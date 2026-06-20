@@ -25,12 +25,14 @@ import uuid
 
 import uvicorn
 from starlette.applications import Starlette
+from starlette.concurrency import run_in_threadpool
 from starlette.middleware import Middleware
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import moderator_apply as apply  # noqa: E402
 import moderator_common as mc  # noqa: E402
 import moderator_engine as eng  # noqa: E402
 
@@ -398,6 +400,42 @@ async def apply_process(request):
     return JSONResponse(out)
 
 
+# POST /apply-now (editor) — the ON-DEMAND real-time apply: physically apply the ledger-approved
+# enqueued DDLs to the LIVE warehouse under the warehouse-writer flock (the SAME tooth the nightly
+# uses, content-hash-bound to the ledger), THEN re-promote the serving snapshot so the change is
+# visible to READERS in minutes — "make it live now" instead of waiting for ~03:30 UTC. Flock-safe:
+# queues behind the nightly / a running promote, never clobbers. The apply + ~10-min snapshot copy
+# are blocking, so run them in a threadpool to keep the event loop (and /healthz) responsive.
+async def apply_now(request):
+    deny = require_scope(request, "editor")
+    if deny is not None:
+        return deny
+    body = await _json_body(request)
+    actor = _actor(request, body)
+    promote = body.get("promote", True)
+    force_promote = bool(body.get("force_promote", False))
+    max_items = int(body.get("max_items", 25))
+    reason = body.get("reason")
+    mc.log_event("apply_now_start", actor=actor, promote=promote, max_items=max_items,
+                 force_promote=force_promote)
+    try:
+        out = await run_in_threadpool(
+            apply.apply_now, actor, max_items=max_items, promote=bool(promote), reason=reason,
+            force_promote=force_promote)
+    except Exception as e:
+        mc.log_event("apply_now_error", actor=actor, error=f"{type(e).__name__}: {e}")
+        return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=500)
+    mc.log_event("apply_now_done", actor=actor, ok=out.get("ok"),
+                 applied=len([a for a in out.get("applied", []) if a.get("applied")]),
+                 promoted=(out.get("promote") or {}).get("promoted"),
+                 snapshot=(out.get("freshness") or {}).get("snapshot_id"))
+    # 200 only on a fully-clean run (every row committed + promote ok). Any blocked/failed row, or a
+    # promote that didn't land, is 207 Multi-Status (partial) — the client renders the per-row detail.
+    all_committed = all(a.get("status") == "committed" for a in out.get("applied", []))
+    clean = bool(out.get("ok")) and all_committed
+    return JSONResponse(out, status_code=200 if clean else 207)
+
+
 # ── routes ──────────────────────────────────────────────────────────────────────────────────────
 ROUTES = [
     Route("/healthz", healthz, methods=["GET"]),
@@ -416,6 +454,7 @@ ROUTES = [
     Route("/apply/enqueue", apply_enqueue, methods=["POST"]),
     Route("/apply/queue", apply_queue, methods=["GET"]),
     Route("/apply/process", apply_process, methods=["POST"]),
+    Route("/apply-now", apply_now, methods=["POST"]),
 ]
 
 
