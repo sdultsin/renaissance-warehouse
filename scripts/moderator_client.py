@@ -21,7 +21,13 @@ Commands:
   loop    [--staged | --files ...]               review; if clean -> record; if block -> print the
                                                   fixes for the editor's Claude (the §7.1 loop is
                                                   Claude-driven: fix -> re-review -> record, <=6x)
-  rules | issues [--status open] | catalog [--table T --column C] | ledger
+  apply-enqueue --files A.sql ...                 add a recorded DDL to the serialized apply FIFO
+  apply-now [--reason R] [--no-promote]           APPLY the ledger-approved enqueued DDLs to the LIVE
+                                                  warehouse now (writer-flock-safe) + re-promote the
+                                                  serving snapshot -> visible to readers in minutes,
+                                                  no nightly wait, no SSH. (Default path is still:
+                                                  it applies on the nightly. apply-now = make it now.)
+  rules | issues [--status open] | catalog [--table T --column C] | ledger | apply-queue
 """
 from __future__ import annotations
 
@@ -560,6 +566,54 @@ def cmd_apply_process(args) -> int:
     return 0
 
 
+def cmd_apply_now(args) -> int:
+    """ON-DEMAND real-time apply: physically apply your ledger-approved enqueued DDLs to the LIVE
+    warehouse (under the writer flock, content-hash-bound to the ledger) AND re-promote the serving
+    snapshot so READERS see the change in minutes — instead of waiting for the ~03:30 UTC nightly.
+
+    Flock-safe: it queues behind the nightly / a running promote, never clobbers. The snapshot copy
+    is ~50GB so the promote can take several minutes (~10) — that's the cost of 'make it live now'.
+    Enqueue first (`apply-enqueue --files ...`) if you haven't; apply-now drains what's queued+passed.
+    """
+    body = {"actor": os.environ.get("USER", "?")}
+    if getattr(args, "no_promote", False):
+        body["promote"] = False
+    if getattr(args, "reason", None):
+        body["reason"] = args.reason
+    print("apply-now: applying ledger-approved DDLs + re-promoting the serving snapshot "
+          "(the snapshot copy can take a few minutes — please wait)…")
+    res = _req("POST", "/apply-now", body)
+    if res.get("error") and not res.get("applied"):
+        print(f"  apply-now ERROR: {res['error']}")
+        return 1
+    applied = res.get("applied", [])
+    if not applied:
+        print(f"  {res.get('detail','nothing queued to apply')}")
+    for a in applied:
+        mark = {"committed": "[OK]   ", "blocked": "[BLOCK]", "failed": "[FAIL] "}.get(
+            a.get("status", ""), "[?]    ")
+        print(f"  {mark} v{a.get('ddl_version')} {a.get('sql_file','')}: {a.get('detail','')}")
+    promote = res.get("promote") or {}
+    if promote.get("promoted"):
+        print(f"  PROMOTE: serving snapshot re-promoted -> {promote.get('snapshot_id','?')} "
+              f"(copy {promote.get('copy_s','?')}s). Readers see your change now.")
+    elif promote.get("promote_busy"):
+        print("  PROMOTE: another promote is already running — your apply LANDED in the live DB and "
+              "will be served by that in-flight promote (or re-run apply-now to confirm).")
+    elif promote.get("promote_refused_window"):
+        print("  PROMOTE: inside the 03:30-05:45 UTC nightly window — promote deferred. Your apply "
+              "LANDED in the live DB; it'll be served by the nightly promote (or re-run after 05:45).")
+    elif promote.get("detail"):
+        print(f"  PROMOTE: {promote['detail']}")
+    elif promote.get("error"):
+        print(f"  PROMOTE ERROR: {promote['error']} — the apply LANDED; re-run apply-now to promote.")
+    fresh = res.get("freshness") or {}
+    print(f"  FRESHNESS: serving snapshot={fresh.get('snapshot_id','?')}, "
+          f"live max DDL version={fresh.get('live_schema_version_max','?')} "
+          f"(elapsed {res.get('elapsed_s','?')}s)")
+    return 0 if res.get("ok") else 1
+
+
 def cmd_simple(args, path) -> int:
     params = {}
     if path == "/issues":
@@ -611,6 +665,10 @@ def main(argv=None) -> int:
     ae = sub.add_parser("apply-enqueue"); ae.add_argument("--files", nargs="*"); ae.add_argument("--staged", action="store_true")
     aq = sub.add_parser("apply-queue"); aq.add_argument("--status", default="all")
     sub.add_parser("apply-process")
+    an = sub.add_parser("apply-now", help="apply ledger-approved enqueued DDLs LIVE now + re-promote (no nightly wait)")
+    an.add_argument("--no-promote", dest="no_promote", action="store_true",
+                    help="apply to the live DB but skip the serving re-promote (advanced)")
+    an.add_argument("--reason", help="reason string recorded in the publish/apply log")
     args = p.parse_args(argv)
     if args.cmd == "doctor":
         return cmd_doctor(args)
@@ -636,6 +694,8 @@ def main(argv=None) -> int:
         return cmd_apply_queue(args)
     if args.cmd == "apply-process":
         return cmd_apply_process(args)
+    if args.cmd == "apply-now":
+        return cmd_apply_now(args)
     return cmd_simple(args, "/" + args.cmd)
 
 
