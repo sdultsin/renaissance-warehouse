@@ -24,6 +24,7 @@ Tag-type finding (revised 2026-05-30):
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -114,6 +115,225 @@ def _derive_is_mca(name: str | None) -> bool:
     if not name:
         return False
     return bool(_RE_MCA.search(name))
+
+
+# ---------------------------------------------------------------------
+# WS7: canonical offer taxonomy + 3-pass resolver (v109 / 2026-06-21).
+#
+# core.campaign.offer is materialized here as the SOLE writer, resolved
+#   1 workspace_map (deterministic)  2 name_regex (canonical)  3 llm_copy (cached).
+# Replaces the name-only `_derive_offer` (which is no longer the offer writer; it
+# still feeds nothing — _resolve_core_campaign now writes offer=NULL on first
+# ingest and _resolve_campaign_offer fills it in the same nightly pass).
+# Verified read-only on snapshot warehouse_20260621_063139_227.duckdb: the
+# windowed per-offer split ties to workspace totals exactly
+#   Business Funding 8,091,580 / Pre-IPO 107,443 (Σ 8,199,023, ex-warm-leads),
+# with 0 windowed campaigns resolving to NULL.
+# ---------------------------------------------------------------------
+OFFER_BF, OFFER_RND, OFFER_TARIFFS, OFFER_PREIPO, OFFER_S125 = (
+    "Business Funding", "R&D Credit", "Tariffs", "Pre-IPO", "Section 125")
+
+# Single-offer workspaces, keyed by workspace_id (UUID). Verified WS7 2026-06-20 and
+# RE-VERIFIED 2026-06-21 (snapshot 063139_227): the first 6 contribute the full
+# 7,953,337 window send total (the other BF-mapped ws have 0 window volume today).
+# MIXED workspaces are intentionally ABSENT so they fall to name_regex/LLM.
+# (Slugs are pre-rename; do NOT key on them. Key on workspace_id UUID — stable.)
+WORKSPACE_OFFER_MAP = {
+    "d5ebf2bd-d7c8-4feb-8310-e57e6140e12a": OFFER_BF,       # Funding 3 (Leo)
+    "88de6a7c-55db-4594-8851-ed7d56342a45": OFFER_BF,       # Funding 2 (Ido)
+    "587765d7-e9ed-4057-85d1-eca48bcc9384": OFFER_BF,       # Renaissance 1 (Instantly)
+    "6ab744f5-be81-4c5b-8333-c0c119a19b80": OFFER_BF,       # Funding 4 (Sam)
+    "cdae94c6-5a88-4614-92e2-09e28a073a2e": OFFER_BF,       # Funding 1 (Samuel)
+    "f02d3d50-0e9f-4687-981d-6134e789baa4": OFFER_BF,       # Funding 5 (Eyver)
+    "ddbeb975-fafb-4412-ae8f-d3b478f6abff": OFFER_BF,       # Funding Canada (outlook-1)
+    "7d4e8e68-db7c-427c-a5eb-9675c0d1f3e8": OFFER_BF,       # Funding UK (automated-applications)
+    "a998ae0d-5b87-41a6-b62d-ab5764596cb7": OFFER_BF,       # Outlook 3
+    "2aa14704-dd1d-4ca2-a527-bcc4cadf5af2": OFFER_BF,       # Renaissance 3
+    "634b4eac-8903-48a6-9361-bf1d52a13476": OFFER_BF,       # RE Wholesale (equinox)
+    "0424e5fb-8857-47e8-a3c2-00add9fb0a8c": OFFER_BF,       # The Eagles
+    "0d9ed15e-8fb9-4427-860e-99a403cea081": OFFER_TARIFFS,  # Tariffs (frozen, label only)
+}
+# MIXED (no map -> name_regex then LLM):
+#   396288e0 R&D Credit (window: all funding) ; 7adab6c6 Section 125 (frozen) ; 9e822ccc Max's workspace
+# Warm-leads (58ae9dc4-9bc0-46d6-beb2-a1dc3e99cbf5) NOT here: its campaigns are not in core.campaign (structural).
+
+# Canonical, longest/most-specific first. NOTE: distinct from the legacy _RE_*
+# regexes above (which produce the OLD tokens). These produce canonical labels.
+_RE_OFFER_PREIPO = re.compile(r"pre[\s-]?ipo", re.IGNORECASE)
+_RE_OFFER_TARIFFS = re.compile(r"tariff", re.IGNORECASE)
+_RE_OFFER_S125 = re.compile(r"section\s*125|s125", re.IGNORECASE)
+_RE_OFFER_RD = re.compile(r"r&d|r and d|\br\s*&?\s*d\b", re.IGNORECASE)
+_RE_OFFER_FUNDING = re.compile(
+    r"funding|mca|\bloc\b|o2d|o2 d|isaac|construction|reseller|real[\s-]?estate",
+    re.IGNORECASE,
+)
+
+# Cheap Haiku-class classifier (matches entities/reply_intent_llm.py convention).
+# Anthropic key lives in the parent .env as ANTHROPIC_KEY (not ANTHROPIC_API_KEY).
+_OFFER_MODEL = "claude-haiku-4-5"
+_OFFER_KEY_CANDIDATES = (
+    "ANTHROPIC_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_KEY_RENAISSANCE_OVERVIEW_CHATBOT",
+)
+_OFFER_LABELS = {OFFER_BF, OFFER_RND, OFFER_TARIFFS, OFFER_PREIPO, OFFER_S125}
+_OFFER_SYSTEM_PROMPT = (
+    "You classify a cold-email campaign into exactly ONE offer label, based on its "
+    "name and email copy. The closed label set is: Business Funding | R&D Credit | "
+    "Pre-IPO | Section 125 | Tariffs. Business Funding = revenue-based / merchant cash "
+    "advance / line-of-credit business financing. R&D Credit = R&D tax credit. Pre-IPO "
+    "= pre-IPO share / secondary / liquidity. Section 125 = Section 125 cafeteria / "
+    "payroll benefit plan. Tariffs = tariff mitigation / duty recovery. Respond with "
+    "ONLY the exact label string, or the single word __ambiguous__ if it does not "
+    "clearly match one. No other text."
+)
+
+
+def _derive_offer_canonical(name):
+    """Pass-2 name_regex. Canonical labels, longest/most-specific first."""
+    if not name:
+        return None
+    if _RE_OFFER_PREIPO.search(name):
+        return OFFER_PREIPO
+    if _RE_OFFER_TARIFFS.search(name):
+        return OFFER_TARIFFS
+    if _RE_OFFER_S125.search(name):
+        return OFFER_S125
+    if _RE_OFFER_RD.search(name):
+        return OFFER_RND
+    if _RE_OFFER_FUNDING.search(name):
+        return OFFER_BF
+    return None
+
+
+_RE_HTML_TAG = re.compile(r"<[^>]+>")
+_RE_SPINTAX = re.compile(r"\{\{[^{}]*\}\}")
+_RE_WS = re.compile(r"\s+")
+
+
+def _parse_sequence_text(seq_raw):
+    """Flatten raw_instantly_campaign.sequence_raw (JSON: list of
+    {steps:[{variants:[{subject,body}]}]}) into plain classifier text — subjects +
+    HTML-stripped bodies, spintax markers removed. Returns '' on any parse failure.
+    Runs in the GENERATOR only (it reads raw, never a serving view), so no
+    TIMESTAMPTZ column is touched. Deterministic for the md5 content_hash."""
+    if not seq_raw:
+        return ""
+    try:
+        seqs = json.loads(seq_raw) if isinstance(seq_raw, str) else seq_raw
+    except Exception:  # noqa: BLE001
+        return ""
+    parts: list[str] = []
+    for seq in seqs or []:
+        for step in (seq or {}).get("steps") or []:
+            for variant in (step or {}).get("variants") or []:
+                subj = (variant or {}).get("subject") or ""
+                body = (variant or {}).get("body") or ""
+                if subj:
+                    parts.append(subj)
+                if body:
+                    parts.append(_RE_HTML_TAG.sub(" ", body))
+    text = " ".join(parts)
+    text = _RE_SPINTAX.sub(" ", text)
+    return _RE_WS.sub(" ", text).strip()
+
+
+def _latest_sequence_body(ctx, cid):
+    """Deterministic: latest _loaded_at row per campaign_id (raw is ~5,870 rows /
+    ~687 distinct cids). Runs in the GENERATOR (portal venv has pytz); never expose
+    _loaded_at (TIMESTAMPTZ) via a serving view — the read API throws pytz on it."""
+    row = ctx.db.execute(
+        "SELECT sequence_raw FROM raw_instantly_campaign WHERE campaign_id = ? "
+        "ORDER BY _loaded_at DESC LIMIT 1",
+        [cid],
+    ).fetchone()
+    return _parse_sequence_text(row[0]) if row and row[0] else ""
+
+
+def _call_offer_classifier(ctx, name, body):
+    """LLM fallback (pass 3). Temp-0 Haiku, closed 5-label set; returns one canonical
+    label or None (__ambiguous__). Skip-with-None (never raise) if the SDK or key is
+    unavailable — an unresolved campaign WITH window sends is then caught by ASSERT 1,
+    and the LLM only ever owns 0-window-send campaigns here, so it can't poison the
+    windowed split."""
+    try:
+        import anthropic  # noqa: F401
+    except Exception as exc:  # noqa: BLE001
+        logger.error("anthropic SDK unavailable (%s) — offer LLM classify skipped", exc)
+        return None
+    api_key = next(
+        (ctx.credentials.optional(k) for k in _OFFER_KEY_CANDIDATES
+         if ctx.credentials.optional(k)),
+        None,
+    )
+    if not api_key:
+        logger.error("No Anthropic key (%s) — offer LLM classify skipped", _OFFER_KEY_CANDIDATES)
+        return None
+    user_msg = "Campaign name: " + (name or "") + "\n\nEmail copy:\n" + (body or "")[:6000]
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        resp = client.messages.create(
+            model=_OFFER_MODEL,
+            max_tokens=16,
+            system=_OFFER_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": user_msg}],
+        )
+        label = "".join(
+            b.text for b in resp.content if getattr(b, "type", None) == "text"
+        ).strip()
+    except Exception as exc:  # noqa: BLE001
+        logger.error("offer LLM classify failed (%s): %s", type(exc).__name__, str(exc)[:200])
+        return None
+    return label if label in _OFFER_LABELS else None
+
+
+def _classify_offer_llm(ctx, cid, name, now):
+    """Pass-3 cached LLM classify. Cache key (campaign_id, md5(name+body)) so the
+    nightly only calls the model when copy changes. Returns (offer, source) where
+    source is 'llm_copy' (resolved) or 'unresolved' (__ambiguous__ -> NULL offer)."""
+    body = _latest_sequence_body(ctx, cid)
+    chash = hashlib.md5(f"{name}\n{body}".encode()).hexdigest()
+    hit = ctx.db.execute(
+        "SELECT offer FROM core.campaign_offer_llm_cache "
+        "WHERE campaign_id = ? AND content_hash = ?",
+        [cid, chash],
+    ).fetchone()
+    if hit is not None:
+        return hit[0], ("llm_copy" if hit[0] else "unresolved")
+    offer = _call_offer_classifier(ctx, name, body)
+    ctx.db.execute(
+        "INSERT OR REPLACE INTO core.campaign_offer_llm_cache "
+        "(campaign_id, content_hash, offer, model, classified_at) VALUES (?, ?, ?, ?, ?)",
+        [cid, chash, offer, _OFFER_MODEL, now],
+    )
+    return offer, ("llm_copy" if offer else "unresolved")
+
+
+def _resolve_campaign_offer(ctx, now: datetime) -> None:
+    """3-pass canonical offer -> core.campaign.offer + offer_source. SOLE writer of
+    the offer column. 1 workspace_map  2 name_regex  3 llm_copy (cached). Runs every
+    nightly inside run_campaign_ingest, AFTER _resolve_core_campaign (which leaves
+    offer NULL). Idempotent."""
+    # one-time idempotent legacy-token migration (Funding/R&D/s125 -> canonical).
+    ctx.db.execute(
+        "UPDATE core.campaign SET offer = CASE offer "
+        "WHEN 'Funding' THEN 'Business Funding' WHEN 'R&D' THEN 'R&D Credit' "
+        "WHEN 's125' THEN 'Section 125' ELSE offer END "
+        "WHERE offer IN ('Funding', 'R&D', 's125')"
+    )
+    for cid, wsid, name in ctx.db.execute(
+        "SELECT campaign_id, workspace_id, name FROM core.campaign"
+    ).fetchall():
+        if wsid in WORKSPACE_OFFER_MAP:
+            offer, src = WORKSPACE_OFFER_MAP[wsid], "workspace_map"
+        else:
+            offer = _derive_offer_canonical(name)
+            if offer:
+                src = "name_regex"
+            else:
+                offer, src = _classify_offer_llm(ctx, cid, name, now)  # 'llm_copy'/'unresolved'
+        ctx.db.execute(
+            "UPDATE core.campaign SET offer = ?, offer_source = ? WHERE campaign_id = ?",
+            [offer, src, cid],
+        )
 
 
 # ---------------------------------------------------------------------
@@ -296,6 +516,7 @@ def run_campaign_ingest(ctx: RunContext) -> PhaseResult:
 
     # ---- canonical resolution ------------------------------------------
     _resolve_core_campaign(ctx, now)
+    _resolve_campaign_offer(ctx, now)  # WS7: sole writer of core.campaign.offer (3-pass)
     _resolve_core_campaign_sending_tag(ctx, now)
     _resolve_core_campaign_marker_tag(ctx, now)
 
@@ -328,7 +549,11 @@ def _resolve_core_campaign(ctx, now: datetime) -> None:
         d = dict(zip(cols, row))
         name = d["name"]
         cm = _derive_cm(name)
-        offer = _derive_offer(name)
+        # WS7: offer is owned by _resolve_campaign_offer (3-pass resolver), called
+        # right after this pass. Write NULL here so the column is set on first
+        # ingest, then the resolver fills it in the same nightly run. `_derive_offer`
+        # stays defined (legacy token producer) but is no longer the offer writer.
+        offer = None
         is_mca = _derive_is_mca(name)
 
         # Try insert; if conflict, fall through to update.

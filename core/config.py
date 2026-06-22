@@ -37,6 +37,7 @@ PHASE_ORDER = [
     "iskra",             # 03:52 — Iskra WhatsApp (messages/conversations/meetings/deals/numbers/stats)
     "outreachify",       # 03:45 — Outreachify Supabase snapshot
     "instantly",         # 04:00 — workspaces, campaigns, accounts, tags, lead membership
+    "account_census",    # 04:02 — promote live /accounts poll parquet -> core.account_census (live truth)
     "close",             # 04:05 — Close CRM warm-call activity (BI/BOF layer, spec 16)
     "sheets",            # 04:15 — Domain Tech Sheet, blacklist sheet, partner feedback
     "otd_billing",       # 04:20 — parse OTD account statement -> core.otd_* + cost_ledger rate fix

@@ -173,11 +173,51 @@ def run_workspace_ingest(ctx: RunContext) -> PhaseResult:
         SET is_active = FALSE,
             resolved_at = ?
         WHERE workspace_id NOT IN (SELECT workspace_id FROM _run_latest_ws)
+          -- WS1 (portal-data-rebuild): curated dim rows are not in the live key-poll set
+          -- under their org/registry UUID; never auto-flip them inactive here. warm-leads is a
+          -- live org (1,527 accts, kept is_active=TRUE by DDL); the-dyad is intentionally FALSE.
+          AND workspace_id NOT IN (
+            '58ae9dc4-9bc0-46d6-beb2-a1dc3e99cbf5',
+            '1265f3a5-3e03-439a-81af-55842ce7fac3'
+          )
         """,
         [now],
     )
 
     ctx.db.execute("DROP TABLE IF EXISTS _run_latest_ws")
+
+    # -- WS1 (portal-data-rebuild): refresh workspace_slug_alias + workspace_name_history (idempotent) --
+    ctx.db.execute(
+        """
+        INSERT INTO core.workspace_slug_alias (workspace_slug, workspace_id, alias_source, resolved_at)
+        SELECT w.slug, w.workspace_id, 'core_workspace', ?
+        FROM core.workspace w
+        WHERE w.slug IS NOT NULL AND w.slug NOT IN (SELECT workspace_slug FROM core.workspace_slug_alias)
+        """, [now])
+    ctx.db.execute(
+        """
+        INSERT INTO core.workspace_slug_alias (workspace_slug, workspace_id, alias_source, resolved_at)
+        SELECT DISTINCT r.slug, r.workspace_id, 'raw_instantly_workspace', ?
+        FROM raw_instantly_workspace r
+        WHERE r.slug IS NOT NULL AND r.slug NOT IN (SELECT workspace_slug FROM core.workspace_slug_alias)
+        """, [now])
+    ctx.db.execute("DELETE FROM core.workspace_name_history WHERE name_source = 'live_api'")
+    ctx.db.execute(
+        """
+        INSERT INTO core.workspace_name_history
+          (workspace_id, name, name_source, first_seen_at, last_seen_at, is_current)
+        SELECT h.workspace_id, h.name, 'live_api', h.first_seen_at, h.last_seen_at, (h.name = w.name)
+        FROM (
+          SELECT workspace_id, TRIM(name) AS name,
+                 MIN(_loaded_at) AS first_seen_at, MAX(_loaded_at) AS last_seen_at
+          FROM raw_instantly_workspace
+          WHERE name IS NOT NULL AND TRIM(name) <> ''
+          GROUP BY workspace_id, TRIM(name)
+        ) h
+        LEFT JOIN core.workspace w ON w.workspace_id = h.workspace_id
+        """)
+    # Curated A.3 alias rows + A.4 dim rows + B.1 naming-doc rows are seeded by the DDL and never
+    # deleted by the generator (it only auto-EXTENDS from core.workspace + raw).
 
     notes = {
         "keys_attempted": len(keys),
