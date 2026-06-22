@@ -117,6 +117,16 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     # recorded as a nightly failure so the nightly-success watchdog sees it.
     # Cross-checked by the CC-side self-audit freshness guard (independent path).
     echo "publishing campaign_data read-model to D1" | tee -a "$LOG_FILE"
+    # GUARD (2026-06-22): a no-match `grep` returns non-zero, which under the
+    # top-level `set -euo pipefail` makes the `$(...)` assignment fail and SILENTLY
+    # aborts the entire nightly right here — before the `[[ -z ]]` fallback can run.
+    # That is exactly what killed the nightly for a day when CC_D1_DATABASE_ID was
+    # absent from .env. Disable -e just around this env-extraction block (mirroring
+    # the orchestrator + timeout-publish guards elsewhere in this script) so a
+    # missing var can NEVER abort the nightly: the fallback then fires for
+    # CC_D1_DATABASE_ID, and empty values for the others are handled downstream
+    # (the publish step is fail-loud but non-fatal).
+    set +e
     CC_D1_API_TOKEN="$(grep '^CC_D1_API_TOKEN=' .env | cut -d= -f2- | tr -d '"')"
     CLOUDFLARE_RG_ACCOUNT_ID="$(grep '^CLOUDFLARE_RG_ACCOUNT_ID=' .env | cut -d= -f2- | tr -d '"')"
     # CC_D1_DATABASE_ID is often absent from .env (the publisher hardcodes a
@@ -125,6 +135,7 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     CC_D1_DATABASE_ID="$(grep '^CC_D1_DATABASE_ID=' .env | cut -d= -f2- | tr -d '"')"
     [[ -z "$CC_D1_DATABASE_ID" ]] && CC_D1_DATABASE_ID="25a32aa3-9d95-42a3-9e9e-8cd3a9e3f3eb"
     SLACK_ALERT_CHANNEL="$(grep '^SLACK_ALERT_CHANNEL=' .env | cut -d= -f2- | tr -d '"')"
+    set -e
     export CC_D1_API_TOKEN CLOUDFLARE_RG_ACCOUNT_ID CC_D1_DATABASE_ID SLACK_ALERT_CHANNEL
 
     # HARD TIMEOUT (2026-06-20): wrap the publish so a hung/slow publish can NEVER
