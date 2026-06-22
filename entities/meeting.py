@@ -18,6 +18,24 @@ Campaign attribution for sheet rows = main.norm_campaign_name() join to the camp
 non-campaign labels / truncated names) land with campaign_id NULL and match_method='unmatched' —
 those are the campaigns flagged as carrying inaccurate data (per the DoD), and the 4-tier fallback
 matcher is the safety net for them.
+
+WS5 v3 [2026-06-21] — canonical business-date + workspace-normalized D6 attribution + D7 SMS split:
+  * meeting_date  = col A "Date" (the business date Grace + the sheet pivots use); the sheet rows
+                    now GATE on col A and downstream day-buckets move to meeting_date. posted_at is
+                    KEPT as col C (submission timestamp) for back-compat/audit only.
+  * workspace_*   = col O "Workspace", resolved through core.workspace_alias (NOT a hand CASE —
+                    design RB3/D6). The alias table maps every name variant ("Funding 2" ==
+                    "Funding 2 (Ido)") -> one (canonical_current_name, warehouse_slug, cm).
+  * cm_workspace  = alias.cm — the WORKSPACE-credited CM (D6). Non-NULL ONLY for the 5 funding-CM
+                    workspaces. This is the portal's ONLY CM-credit source, which is what makes
+                    IDO = Funding-2-only hold. The raw col-17 `cm` is kept UNCHANGED as the audit
+                    truth (Grace types "IDO" on warm-leads/SMS/DFY work — the leak class D6 kills:
+                    Net Jun-19 portal IDO email 24 -> 8).
+  * program/offer/sendivo_sub_account (D7) — SMS splits Funding (Sendivo Renaissance 1) vs Pre-IPO
+                    (Renaissance 2) off the anchored col-O label; email offer inherited from
+                    core.campaign.offer post-insert.
+  HARD DEP: core.workspace_alias (created+seeded self-contained in the 107 DDL, block 107.0a) MUST
+            exist before this phase runs.
 """
 from __future__ import annotations
 
@@ -36,15 +54,19 @@ CUTOVER = "2026-06-01"  # sheet is canonical on/after this date; Slack stays unt
 # near-midnight booking on 2026-05-31 could land in neither branch (single-digit, one-time gap on the
 # transition day only). Accepted: pre-cutover data is explicitly "may not be accurate"; not worth a
 # TZ-normalization pass for a handful of boundary-day meetings.
+# WS5 v3: the sheet branch now gates on col A (meeting_date), with a col-C-date fallback. CUTOVER stays
+# 2026-06-01 so the slack(<=May-31) / sheet(>=Jun-01) branches never overlap on either date column.
 
 # Funding-Form 'Data' tab column positions (0-based), confirmed 2026-06-13. Keep in sync with
 # scripts/stage_funding_form.py EXPECTED_HEADER (the producer fails loud on column drift).
+_C_DATE = 0             # col A "Date" — canonical business date (the sheet pivots + Grace use this)
 _C_SUBMISSION_ID = 1
 _C_SUBMISSION_TIME = 2
 _C_CHANNEL = 3
 _C_PARTNER = 4
 _C_ADVISOR = 5          # "<PARTNER_PREFIX>: <Full Name>" e.g. "BTC: Jett Lurvey" (portal gap dim, DDL 70)
 _C_EMAIL = 9
+_C_WORKSPACE = 14       # col O "Workspace" — drives workspace_slug/cm/program/offer via core.workspace_alias
 _C_INBOX_MANAGER = 15   # Inbox Manager; some rows are first-name-only -> resolved to full names (DDL 70)
 _C_CAMPAIGN_MANAGER = 17
 _C_CAMPAIGN_NAME = 18
@@ -119,7 +141,11 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
 
     # -- 1. Pre-cutover Slack rows (date < 2026-06-01) — unchanged legacy behavior, channel/
     #       lead_email left NULL (the Slack source has neither). Date-grain boundary so there is
-    #       no overlap/gap with the sheet rows.
+    #       no overlap/gap with the sheet rows. WS5: the new canonical columns (meeting_date,
+    #       workspace_*, cm_workspace, program/offer/sendivo_sub_account) are left NULL for slack
+    #       rows — they have no col-A date and no col-O workspace; the day-bucket COALESCE in the
+    #       migrated views keeps them bucketing on posted_at, and portal CM credit falls back to
+    #       the legacy resolver for source='slack' (all-time history unbroken).
     db.execute(
         f"""
         INSERT INTO core.meeting
@@ -156,20 +182,32 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
     #       timestamp, dedup on Submission ID (synthetic md5 key for the ~12 blank IDs), and
     #       resolve campaign_id via the normalized-name join (arg_max -> most recent campaign of
     #       that normalized name). cm = uppercased Campaign Manager to align with the dim's casing.
+    #
+    #       WS5 v3 changes (D6/D7):
+    #         (a) extract col A (date_display) and col O (workspace_name);
+    #         (b) GATE the sheet branch on col A (meeting_date) — with a col-C-date fallback — so
+    #             the cutover floor sits on the same column day-buckets land on;
+    #         (c) resolve col O -> (warehouse_slug, canonical_current_name, cm) via a LEFT JOIN to
+    #             core.workspace_alias (ws_resolved CTE) — the D6-mandated mechanism, NOT a CASE;
+    #         (d) derive the Sendivo sub-account + program/offer (D7) off the anchored col-O label.
     db.execute(
         f"""
         INSERT INTO core.meeting
           (meeting_id, source, source_event_id, posted_at, partner, campaign_id,
            campaign_name_raw, cm, channel, lead_email, match_method, match_confidence,
            is_duplicate_of, cost_per_meeting_usd_estimated, raw_text,
-           advisor, advisor_name, advisor_partner, inbox_manager)
+           advisor, advisor_name, advisor_partner, inbox_manager,
+           meeting_date, submission_ts, workspace_name, workspace_slug, workspace_canonical,
+           cm_workspace, program, offer, sendivo_sub_account)
         WITH ff AS (
           SELECT
             NULLIF(json_extract_string(row_json, '$[{_C_SUBMISSION_ID}]'),'')   AS submission_id,
             json_extract_string(row_json, '$[{_C_SUBMISSION_TIME}]')            AS submission_time,
+            NULLIF(trim(json_extract_string(row_json, '$[{_C_DATE}]')),'')      AS date_display,
             NULLIF(trim(json_extract_string(row_json, '$[{_C_CHANNEL}]')),'')   AS channel,
             NULLIF(json_extract_string(row_json, '$[{_C_PARTNER}]'),'')         AS partner,
             NULLIF(trim(json_extract_string(row_json, '$[{_C_ADVISOR}]')),'')   AS advisor,
+            NULLIF(trim(json_extract_string(row_json, '$[{_C_WORKSPACE}]')),'') AS workspace_name,
             NULLIF(trim(json_extract_string(row_json, '$[{_C_INBOX_MANAGER}]')),'') AS inbox_manager_raw,
             NULLIF(lower(trim(json_extract_string(row_json, '$[{_C_EMAIL}]'))),'') AS lead_email,
             NULLIF(trim(json_extract_string(row_json, '$[{_C_CAMPAIGN_MANAGER}]')),'') AS campaign_manager,
@@ -183,9 +221,21 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
             AND row_index > 0
         ),
         ff_typed AS (
-          SELECT *, TRY_CAST(submission_time AS TIMESTAMP) AS posted_ts FROM ff
+          -- WS5: posted_ts = col C (audit/back-compat). meeting_date = CANONICAL col A, with a
+          --   col-C-date fallback (so a blank/unparseable col A never drops the row). The cutover
+          --   GATE moves to meeting_date so the floor sits on the same column the views bucket on.
+          SELECT *,
+            TRY_CAST(submission_time AS TIMESTAMP) AS posted_ts,
+            COALESCE(
+              CAST(TRY_STRPTIME(date_display, ['%b %-d, %Y','%B %-d, %Y']) AS DATE),
+              CAST(TRY_CAST(submission_time AS TIMESTAMP) AS DATE)
+            ) AS meeting_date
+          FROM ff
           WHERE TRY_CAST(submission_time AS TIMESTAMP) IS NOT NULL
-            AND CAST(TRY_CAST(submission_time AS TIMESTAMP) AS DATE) >= DATE '{CUTOVER}'
+            AND COALESCE(
+                  CAST(TRY_STRPTIME(date_display, ['%b %-d, %Y','%B %-d, %Y']) AS DATE),
+                  CAST(TRY_CAST(submission_time AS TIMESTAMP) AS DATE)
+                ) >= DATE '{CUTOVER}'
         ),
         ff_keyed AS (
           SELECT *, 'sheet:' || COALESCE(submission_id, md5(row_json)) AS meeting_id FROM ff_typed
@@ -207,16 +257,33 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
           SELECT f.*, c.campaign_id AS matched_cid
           FROM ff_dedup f
           LEFT JOIN camp c ON c.nk = main.norm_campaign_name(f.campaign_name)
+        ),
+        ws_resolved AS (
+          -- D6: resolve the raw col-O label -> canonical workspace via core.workspace_alias
+          --   (the canonical crosswalk, NOT a hand CASE — design RB3). a.cm is the
+          --   WORKSPACE-credited CM (NULL = no CM credited), which is what kills the IDO leak:
+          --   warm-leads / SMS / DFY rows resolve to a non-funding-CM workspace -> ws_cm NULL.
+          -- D7: the Sendivo sub-account for SMS is read off the anchored col-O label.
+          SELECT f.*,
+                 a.warehouse_slug          AS ws_slug,
+                 a.canonical_current_name  AS ws_canon,
+                 a.cm                       AS ws_cm,
+                 sub.sub_account_name       AS sub_acct
+          FROM matched f
+          LEFT JOIN core.workspace_alias a ON a.alias_name = f.workspace_name
+          LEFT JOIN (VALUES ('Sendivo (Renaissance 1)','Renaissance 1'),
+                            ('Sendivo (Renaissance 2)','Renaissance 2'))
+               sub(lbl, sub_account_name) ON sub.lbl = f.workspace_name
         )
         SELECT
           meeting_id,
           'sheet'                                  AS source,
           submission_id                            AS source_event_id,
-          posted_ts                                AS posted_at,
+          posted_ts                                AS posted_at,          -- col C (back-compat)
           partner,
           matched_cid                              AS campaign_id,
           campaign_name                            AS campaign_name_raw,
-          upper(campaign_manager)                  AS cm,
+          upper(campaign_manager)                  AS cm,                 -- raw col-17 (audit truth, UNCHANGED)
           channel,
           lead_email,
           CASE WHEN matched_cid IS NOT NULL THEN 'sheet_norm' ELSE 'unmatched' END AS match_method,
@@ -227,8 +294,20 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
           advisor                                  AS advisor,            -- raw "<prefix>: <name>"
           NULLIF(trim(regexp_replace(advisor, '^[^:]*:', '')), '') AS advisor_name,  -- name after the prefix
           {_advisor_partner_case('advisor')}       AS advisor_partner,
-          {_im_norm_case('inbox_manager_raw')}     AS inbox_manager
-        FROM matched
+          {_im_norm_case('inbox_manager_raw')}     AS inbox_manager,
+          -- WS5 canonical columns:
+          meeting_date                             AS meeting_date,       -- CANONICAL (col A)
+          posted_ts                                AS submission_ts,      -- audit (col C)
+          workspace_name                           AS workspace_name,     -- raw col-O label
+          ws_slug                                  AS workspace_slug,     -- alias.warehouse_slug
+          ws_canon                                 AS workspace_canonical,-- alias.canonical_current_name
+          ws_cm                                    AS cm_workspace,       -- WORKSPACE-credited CM (D6)
+          CASE WHEN sub_acct = 'Renaissance 2' THEN 'Pre-IPO' ELSE 'Funding' END AS program,
+          CASE WHEN channel = 'SMS' AND sub_acct = 'Renaissance 2' THEN 'Pre-IPO'
+               WHEN channel = 'SMS'                                THEN 'Business Funding'  -- Ren1/Ren3 -> Funding
+               ELSE NULL END                       AS offer,             -- email offer set in the post-step below
+          sub_acct                                 AS sendivo_sub_account
+        FROM ws_resolved
         """
     )
 
@@ -273,6 +352,9 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
     # CM attribution fallback (slack rows + any sheet row with a blank Campaign Manager but a
     # resolved campaign): campaign join first (authoritative), then regex on raw_text. Sheet rows
     # already carry cm and have raw_text NULL, so the regex passes only touch Slack rows.
+    # NB (WS5): this fills the RAW audit `cm` only. The portal credits a CM off `cm_workspace`
+    #   (= alias.cm), which is set in the sheet INSERT and intentionally NOT touched here — so these
+    #   raw-cm fallbacks never leak a CM credit onto a non-funding workspace.
     db.execute(
         """
         UPDATE core.meeting AS m
@@ -300,6 +382,35 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
           AND regexp_extract(raw_text, '(?i)\b(SAM|SAMUEL|LEO|IDO|EYVER|TOUKIR|TOMER|LUCAS|MAX)\s*:', 1) <> ''
         """
     )
+
+    # -- 2c. Email offer inherited from the campaign (D7 email side). core.campaign.offer is LIVE
+    #        (WS7), so this UPDATE is safe to run now: email meetings get their offer from the
+    #        resolved campaign. Until a campaign carries a non-NULL offer the meeting's offer stays
+    #        NULL — the campaign->workspace->CM chain is still complete via the alias. SMS offers
+    #        are already set in the INSERT off the Sendivo sub-account and are left untouched.
+    db.execute(
+        """
+        UPDATE core.meeting AS m
+        SET offer = c.offer
+        FROM core.campaign c
+        WHERE m.campaign_id = c.campaign_id AND m.channel = 'Email'
+          AND m.source = 'sheet' AND c.offer IS NOT NULL
+        """
+    )
+
+    # -- 2d. WARN on any col-O label that did NOT resolve via core.workspace_alias, so a new/renamed
+    #        workspace surfaces loudly instead of silently landing in the '(unmapped)' reporting
+    #        segment. (The single empty/NULL col-O row is expected and intentionally '(unmapped)'.)
+    unmapped = db.execute(
+        "SELECT DISTINCT workspace_name FROM core.meeting "
+        "WHERE source='sheet' AND workspace_name IS NOT NULL AND workspace_slug IS NULL"
+    ).fetchall()
+    if unmapped:
+        logger.warning(
+            "core.meeting: col-O labels unresolved by core.workspace_alias "
+            "(add to the WS1 seed or the 107.0 supplemental seed): %s",
+            [u[0] for u in unmapped],
+        )
 
     n = db.execute("SELECT count(*) FROM core.meeting").fetchone()[0]
     by_source = db.execute(

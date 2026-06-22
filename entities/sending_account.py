@@ -1,29 +1,13 @@
-"""core.sending_account canonical entity — resolved from raw_account_truth_accounts.
+"""core.sending_account canonical entity — CENSUS-DERIVED registry (WS3, v105).
 
-Reads the most-recent account_truth snapshot mirrored into raw_account_truth_accounts
-and projects one canonical row per inbox. Registers under the 'canonical' phase.
-Idempotent full rebuild each run (like entities/meeting.py).
-
-Classification / lifecycle derivation rules (spec 06), constrained by what a single
-account_truth snapshot can actually tell us:
-
-  esp            <- infra_type   (Google->google, Outlook->outlook, OTD->otd, else NULL)
-  infra_provider <- provider_code (1=OTD -> 'OTD'; the specific vendor brand for
-                    other Outlook/Google inboxes is NOT in account_truth, needs
-                    domain/tag resolution -> NULL for now (GAP)).
-  lifecycle_state:
-     Missing Current Inventory -> retired
-     Paused / Connection Error -> paused
-     Active + warmup_status=1   -> active      (warmed, in service)
-     Active + warmup_status=-1  -> warmed      (degraded warmup; conservative)
-     Active + warmup_status=0   -> warming
-  status         <- status_label normalized
-  warmup_phase   <- warmup_status label
-
-Transition timestamps other than created_at are left NULL — a single snapshot can't
-observe when warmup started/ended or when an account was paused. Those fill in as
-nightly snapshot-diffs detect transitions (documented follow-up, see GAPS.md).
-daily_limit_used is Instantly-supplement-only and stays NULL in v1.
+Rebuilt from core.account_census (the live Instantly /accounts census), NOT the retired
+raw_account_truth_accounts snapshot. is_active = membership in the latest census
+(retired_at NULL); departed accounts are tombstoned (retired_at stamped day-after-last-cold-send).
+status uses the DISAMBIGUATED connection axis (conn_state: conn_active/conn_paused/
+connection_error/sending_error) and warmup_state the warmup axis (warmup_on/off/banned),
+both from core.v_account_census_state. first_cold_send_at is backfilled here (= MIN daily
+date WHERE actual_sends>0 per account; WS4's cold_start reads it). Registers under the
+'canonical' phase (runs AFTER the account_census phase). Idempotent full rebuild each run.
 """
 from __future__ import annotations
 
@@ -34,7 +18,7 @@ from core.sync_run import PhaseResult
 
 logger = logging.getLogger("entities.sending_account")
 
-RAW = "raw_account_truth_accounts"
+RECENT_DAYS = 3   # safety-guard window (matches ASSERT 4)
 
 
 def register(registry: Registry) -> None:
@@ -44,116 +28,114 @@ def register(registry: Registry) -> None:
 def run_sending_account(ctx: RunContext) -> PhaseResult:
     db = ctx.db
 
-    # No raw snapshot yet -> no-op (e.g. canonical phase run before account_truth phase).
-    have_raw = db.execute(
-        f"SELECT count(*) FROM information_schema.tables WHERE table_name = '{RAW}'"
-    ).fetchone()[0]
-    if not have_raw or db.execute(f"SELECT count(*) FROM {RAW}").fetchone()[0] == 0:
-        logger.warning("%s empty/absent — skipping core.sending_account build", RAW)
-        return PhaseResult(rows_in=0, rows_out=0, notes={"skipped": "no raw snapshot"})
+    # --- Fail-loud precondition (B3): census AND summary must exist, else NO-OP
+    #     (do NOT rebuild on an inflated/absent source) ---
+    have_census = db.execute(
+        "SELECT count(*) FROM information_schema.tables "
+        "WHERE table_schema='core' AND table_name='account_census'").fetchone()[0]
+    have_summary = db.execute(
+        "SELECT count(*) FROM information_schema.tables "
+        "WHERE table_schema='core' AND table_name='account_census_summary'").fetchone()[0]
+    if not have_census or db.execute("SELECT count(*) FROM core.account_census").fetchone()[0] == 0:
+        logger.warning("core.account_census empty/absent — skipping sending_account rebuild (fail-safe)")
+        return PhaseResult(rows_in=0, rows_out=0, notes={"skipped": "no census"})
+    if not have_summary or db.execute(
+            "SELECT count(*) FROM core.account_census_summary "
+            "WHERE census_date=(SELECT max(census_date) FROM core.account_census)").fetchone()[0] == 0:
+        raise RuntimeError(
+            "core.account_census_summary missing latest-date row — ASSERT 1 ground truth absent; abort")
 
-    # Idempotent full rebuild from the most-recent snapshot run.
+    LATEST = "(SELECT max(census_date) FROM core.account_census)"
+
+    # Carry-forward prior labels + historical universe BEFORE the DELETE (so esp/infra survive).
+    db.execute("CREATE TEMP TABLE sending_account_PRE AS SELECT * FROM core.sending_account")
     db.execute("DELETE FROM core.sending_account")
-    db.execute(
-        f"""
-        INSERT INTO core.sending_account (
-          account_id, email, domain, workspace_slug, workspace_id,
-          esp, infra_provider, lifecycle_state, rotation_state,
-          created_at, warmup_started_at, warmup_completed_at, rampup_started_at,
-          rampup_completed_at, paused_at, retired_at,
-          status, warmup_phase, warmup_score, daily_limit, daily_limit_used,
-          cost_per_day_usd_estimated, vendor_billing_cycle,
-          is_active, has_errors, first_seen_at, last_seen_at, resolved_at
-        )
-        WITH latest AS (
-          SELECT * FROM {RAW}
-          WHERE _run_id = (SELECT _run_id FROM {RAW} ORDER BY _loaded_at DESC LIMIT 1)
-        ), ranked AS (
-          SELECT *,
-            ROW_NUMBER() OVER (
-              PARTITION BY email
-              ORDER BY CASE WHEN status_label = 'Missing Current Inventory' THEN 1 ELSE 0 END,
-                       daily_limit DESC NULLS LAST
-            ) AS rn
-          FROM latest
-        )
-        SELECT
-          email                                              AS account_id,
-          email,
-          COALESCE(domain, split_part(email, '@', 2))        AS domain,
-          workspace_slug,
-          w.workspace_id,
-          CASE infra_type
-            WHEN 'Google'  THEN 'google'
-            WHEN 'Outlook' THEN 'outlook'
-            WHEN 'OTD'     THEN 'otd'
-            ELSE NULL
-          END                                                AS esp,
-          CASE WHEN provider_code = 1 THEN 'OTD' ELSE NULL END AS infra_provider,
-          CASE
-            WHEN status_label = 'Missing Current Inventory' THEN 'retired'
-            WHEN status_label = 'Paused'                    THEN 'paused'
-            WHEN status_label = 'Temporarily Paused'        THEN 'paused'
-            WHEN status_label = 'Connection Error'          THEN 'paused'
-            WHEN status_label = 'Soft Bounce Error'         THEN 'paused'
-            WHEN status_label = 'Sending Error'             THEN 'paused'
-            WHEN status_label = 'Active' AND warmup_status = 1  THEN 'active'
-            WHEN status_label = 'Active' AND warmup_status = -1 THEN 'warmed'
-            WHEN status_label = 'Active'                     THEN 'warming'
-            ELSE 'warming'
-          END                                                AS lifecycle_state,
-          NULL                                               AS rotation_state,
-          TRY_CAST(created_at AS TIMESTAMPTZ)                AS created_at,
-          NULL, NULL, NULL, NULL, NULL,                      -- warmup/rampup/paused transitions
-          CASE WHEN status_label = 'Missing Current Inventory'
-               THEN TRY_CAST(updated_at AS TIMESTAMPTZ) END  AS retired_at,
-          CASE status_label
-            WHEN 'Active'                    THEN 'active'
-            WHEN 'Paused'                    THEN 'paused'
-            WHEN 'Connection Error'          THEN 'connection_error'
-            WHEN 'Missing Current Inventory' THEN 'missing'
-            ELSE lower(status_label)
-          END                                                AS status,
-          CASE warmup_status WHEN 1 THEN 'warmed' WHEN 0 THEN 'not_warmed'
-               WHEN -1 THEN 'degraded' ELSE NULL END         AS warmup_phase,
-          warmup_score,
-          daily_limit,
-          NULL                                               AS daily_limit_used,
-          NULL                                               AS cost_per_day_usd_estimated,
-          NULL                                               AS vendor_billing_cycle,
-          (status_label <> 'Missing Current Inventory')      AS is_active,
-          -- has_errors: negative status codes excluding Missing Current Inventory (-999)
-          (status < 0 AND status_label <> 'Missing Current Inventory') AS has_errors,
-          now()                                              AS first_seen_at,
-          now()                                              AS last_seen_at,
-          now()                                              AS resolved_at
-        FROM ranked
-        LEFT JOIN core.workspace w ON w.slug = ranked.workspace_slug
-        WHERE rn = 1 AND email IS NOT NULL
-        """
+    db.execute(f"""
+    INSERT INTO core.sending_account (
+      account_id, email, domain, workspace_slug, workspace_id,
+      esp, infra_provider, lifecycle_state, rotation_state,
+      created_at, status, warmup_state, warmup_phase, warmup_score, daily_limit,
+      is_active, has_errors, first_seen_at, last_seen_at, resolved_at,
+      _snapshot_date, retired_at, inventory_source, census_date_resolved, first_cold_send_at
     )
+    WITH cur AS (                                    -- latest live census, DISAMBIGUATED state labels
+        SELECT lower(email) AS email_lc, * FROM core.v_account_census_state
+    ),
+    hist AS (                                         -- prior warehouse rows (labels to carry forward)
+        SELECT lower(email) AS email_lc, * FROM sending_account_PRE
+    ),
+    dly AS (                                          -- per-email daily rollup: esp + first/last cold-send date
+        SELECT lower(account_id) AS email_lc,
+               any_value(esp)                              AS esp,
+               any_value(workspace_slug)                   AS workspace_slug,
+               MAX(date)                                   AS last_row_date,
+               MAX(date) FILTER (WHERE actual_sends > 0)   AS last_cold_send_date,
+               MIN(date) FILTER (WHERE actual_sends > 0)   AS first_cold_send_date,  -- WS4 cold_start reads this
+               MIN(date)                                   AS first_seen_date
+        FROM core.sending_account_daily GROUP BY 1
+    ),
+    universe AS (                                     -- census ∪ daily ∪ prior rows (the REAL universe — B1)
+        SELECT email_lc FROM cur
+        UNION SELECT email_lc FROM dly
+        UNION SELECT email_lc FROM hist
+    )
+    SELECT
+        u.email_lc                                                        AS account_id,
+        COALESCE(c.email, h.email, u.email_lc)                            AS email,
+        COALESCE(c.domain, h.domain, split_part(u.email_lc,'@',2))        AS domain,
+        COALESCE(c.workspace_slug, h.workspace_slug, dl.workspace_slug)   AS workspace_slug,
+        w.workspace_id,
+        COALESCE(h.esp, dl.esp)                                           AS esp,            -- B2: daily esp fallback
+        h.infra_provider,                                                                   -- WS4 owns; pass-through
+        COALESCE(h.lifecycle_state, 'unknown')                           AS lifecycle_state,
+        NULL                                                             AS rotation_state,
+        COALESCE(TRY_CAST(c.timestamp_created AS TIMESTAMPTZ), h.created_at) AS created_at,
+        -- status: DISAMBIGUATED connection axis for live; else carry the prior VARCHAR status.
+        COALESCE(c.conn_state, h.status)                                AS status,
+        c.warmup_state                                                  AS warmup_state,   -- disambiguated warmup axis
+        h.warmup_phase,
+        COALESCE(c.stat_warmup_score, h.warmup_score)                  AS warmup_score,
+        COALESCE(c.daily_limit, h.daily_limit)                         AS daily_limit,
+        (c.email_lc IS NOT NULL)                                       AS is_active,         -- LIVE iff in latest census
+        COALESCE(h.has_errors, FALSE)                                  AS has_errors,
+        COALESCE(h.first_seen_at, dl.first_seen_date::timestamptz, now()) AS first_seen_at,
+        CASE WHEN c.email_lc IS NOT NULL THEN now()
+             ELSE COALESCE(dl.last_row_date::timestamptz, h.last_seen_at) END AS last_seen_at,
+        now()                                                          AS resolved_at,
+        {LATEST}                                                       AS _snapshot_date,
+        -- retired_at (C2): NULL if in latest census; else day-after-last-cold-send, else census date (bootstrap)
+        CASE WHEN c.email_lc IS NOT NULL THEN NULL
+             ELSE COALESCE(dl.last_cold_send_date + INTERVAL 1 DAY, {LATEST}) END::DATE AS retired_at,
+        CASE WHEN c.email_lc IS NOT NULL THEN 'instantly_census'
+             WHEN dl.last_cold_send_date IS NOT NULL THEN 'census_diff_departed'
+             ELSE 'bootstrap_departed' END                            AS inventory_source,
+        {LATEST}                                                       AS census_date_resolved,
+        -- first_cold_send_at BACKFILL (WS3 owns; WS4's cold_start reads this):
+        COALESCE(h.first_cold_send_at, dl.first_cold_send_date::timestamptz) AS first_cold_send_at
+    FROM universe u
+    LEFT JOIN cur  c  ON c.email_lc  = u.email_lc
+    LEFT JOIN hist h  ON h.email_lc  = u.email_lc
+    LEFT JOIN dly  dl ON dl.email_lc = u.email_lc
+    LEFT JOIN core.workspace w ON w.slug = COALESCE(c.workspace_slug, h.workspace_slug, dl.workspace_slug)
+    """)
 
-    # Seed 'created' lifecycle events (append-only; PK prevents dupes on re-run).
+    # Seed 'created' lifecycle events (append-only; PK prevents dupes on re-run). Unchanged from v1.
     db.execute(
         """
         INSERT OR IGNORE INTO core.sending_account_state_event
           (account_id, event_type, event_at, previous_state, new_state, notes, _detected_at)
         SELECT account_id, 'created', created_at, NULL, lifecycle_state,
-               'seeded from account_truth snapshot', now()
+               'seeded from census-derived rebuild', now()
         FROM core.sending_account
         WHERE created_at IS NOT NULL
         """
     )
 
     n = db.execute("SELECT count(*) FROM core.sending_account").fetchone()[0]
-    n_active = db.execute(
-        "SELECT count(*) FROM core.sending_account WHERE is_active"
-    ).fetchone()[0]
-    n_events = db.execute(
-        "SELECT count(*) FROM core.sending_account_state_event"
-    ).fetchone()[0]
+    n_active = db.execute("SELECT count(*) FROM core.sending_account WHERE is_active").fetchone()[0]
+    n_events = db.execute("SELECT count(*) FROM core.sending_account_state_event").fetchone()[0]
     logger.info(
-        "core.sending_account rebuilt: %d rows (%d active); %d state events",
+        "core.sending_account rebuilt (census-derived): %d rows (%d active); %d state events",
         n, n_active, n_events,
     )
     return PhaseResult(

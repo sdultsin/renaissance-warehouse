@@ -91,7 +91,7 @@ WINDOW_LABEL = f"since {_wm.strftime('%b')} {_wm.day}"  # e.g. "since Jun 1"
 # Upper-clamp included for symmetry with the MTD queries (QA A5). No future-dated rows
 # exist today (MAX(posted_at::DATE)=2026-06-19, zero future rows), so this is pure
 # symmetry hardening — it changes nothing about the current numbers.
-WINDOW_WHERE = f"m.posted_at >= DATE '{WINDOW_START}' AND m.posted_at < current_date + 1"
+WINDOW_WHERE = f"COALESCE(m.meeting_date, CAST(m.posted_at AS DATE)) >= DATE '{WINDOW_START}' AND COALESCE(m.meeting_date, CAST(m.posted_at AS DATE)) < current_date + 1"  # WS5 v3: bucket on meeting_date (col A)
 
 # ── Org sends/replies WINDOW (Instantly-native reply scorecard) ────────────────────
 # The org-wide sends/replies scorecard is sourced from the SAME Instantly-native daily
@@ -152,10 +152,17 @@ REAL_CMS_CTE = f"""
 # CM_RESOLVED: the canonical CM of a meeting. core.meeting.cm when present, else the
 # trailing "(TOKEN)" parenthetical in raw_text (where every let-go CM's name actually is).
 # `m` must be the table alias in the surrounding query.
+# WS5 v3 (D6): a CM is credited IFF the meeting's WORKSPACE is that CM's funding workspace.
+# m.cm_workspace (= core.workspace_alias.cm) is non-NULL ONLY for the 5 funding-CM workspaces;
+# warm-leads / SMS / DFY / section-125 rows have cm_workspace=NULL -> drop off the CM leaderboard.
+# Slack-era rows (pre-sheet, no workspace) keep the legacy resolver so all-time history is intact.
 CM_RESOLVED = (
     "COALESCE("
+    "NULLIF(UPPER(TRIM(m.cm_workspace)),''),"
+    "CASE WHEN m.source='slack' THEN COALESCE("
     "NULLIF(UPPER(TRIM(m.cm)),''),"
     r"NULLIF(UPPER(TRIM(regexp_extract(m.raw_text, '\(([^()]*)\)\s*$', 1))),'')"
+    ") END"
     ")"
 )
 
@@ -173,7 +180,7 @@ CM_RESOLVED = (
 # Rationale: status='active' is the tightest defensible "active inbox" — it is what an
 # operator means by "an inbox that can send right now". Kept as an env knob so the
 # definition can be re-pinned against the live inbox count post-swap without a code edit.
-ACTIVE_INBOX_WHERE = os.environ.get("PORTAL_ACTIVE_INBOX_FILTER", "status = 'active'")
+ACTIVE_INBOX_WHERE = os.environ.get("PORTAL_ACTIVE_INBOX_FILTER", "status = 'conn_active'")  # WS3 v105: status relabel active->conn_active
 # In-warmup = active inboxes still in the warming lifecycle phase.
 WARMUP_WHERE = f"({ACTIVE_INBOX_WHERE}) AND lower(COALESCE(lifecycle_state,'')) LIKE '%warm%' AND lower(COALESCE(lifecycle_state,'')) <> 'warmed'"
 
@@ -318,11 +325,11 @@ data["inboxes"] = safe("inboxes", lambda: {
         GROUP BY esp ORDER BY inboxes DESC"""),
     # Workspace split (Accounts ▸ Workspaces). Volume ≈ daily sending capacity.
     "by_workspace": q(f"""
-        SELECT COALESCE(w.name, sa.workspace_slug, '(unknown)') AS workspace,
+        SELECT COALESCE(n.current_name, sa.workspace_slug, '(unknown)') AS workspace,
                COUNT(*) AS inboxes, SUM(sa.daily_limit) AS daily_capacity,
                COUNT(DISTINCT sa.domain) AS domains
         FROM core.sending_account sa
-        LEFT JOIN core.workspace w ON w.slug = sa.workspace_slug
+        LEFT JOIN core.v_workspace_norm n ON n.workspace_slug = sa.workspace_slug
         WHERE sa.{ACTIVE_INBOX_WHERE} GROUP BY 1 ORDER BY inboxes DESC"""),
     "total_domains": one(f"SELECT COUNT(DISTINCT domain) FROM core.sending_account WHERE {ACTIVE_INBOX_WHERE}"),
 })
