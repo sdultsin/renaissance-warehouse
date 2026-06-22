@@ -167,6 +167,31 @@ def _committed_in_repo(sql_file: str | None, content_sha256: str, content: str |
                       f"applying isn't what's merged; commit the EXACT content + box-pull, re-run"}
 
 
+def _git_pull_ff() -> dict:
+    """Box-side `git pull --ff-only origin <ref-branch>` so the co-located checkout matches origin/main
+    BEFORE we apply. Essential for the one-command 'ship' flow: it makes the working-tree sql/ddl carry
+    the just-merged DDL so the NIGHTLY rebuild keeps it (else the next from-repo rebuild silently drops
+    a change applied only transiently — the v96 nightly-drop risk). FF-only + box-never-commits = no
+    conflicts; on the box this is the sanctioned deploy path (pull, never push). Best-effort + reported;
+    never raises (apply-now still runs — Fix A's commit check is the backstop)."""
+    out = {"pulled": False, "detail": None, "head_before": _origin_ref_sha()}
+    if not WAREHOUSE_ROOT or not os.path.isdir(os.path.join(WAREHOUSE_ROOT, ".git")):
+        out["detail"] = "no git repo at WAREHOUSE_REPO_ROOT — skipped"
+        return out
+    branch = _GIT_REF.split("/", 1)[1] if "/" in _GIT_REF else _GIT_REF
+    try:
+        p = _git(["pull", "--ff-only", "origin", branch], timeout=120)
+        out["pulled"] = p.returncode == 0
+        out["detail"] = (p.stdout.decode("utf-8", "replace") + p.stderr.decode("utf-8", "replace")).strip()[-300:]
+    except Exception as e:  # noqa: BLE001
+        out["detail"] = f"git pull failed ({type(e).__name__}: {e})"
+    try:
+        out["head_after"] = _git(["rev-parse", "--short", "HEAD"]).stdout.decode().strip()
+    except Exception:
+        out["head_after"] = None
+    return out
+
+
 # ── the apply tooth (reuses core.db — the SAME path the nightly uses, under the writer flock) ─────
 def _import_core_db():
     """Import the canonical core.db (apply_ddl_file + the writer-flock connect) from the box repo
@@ -477,23 +502,25 @@ def _promote_acceptable(p: dict | None, promote_requested: bool) -> bool:
 
 
 def apply_now(actor: str, max_items: int = 25, promote: bool = True,
-              reason: str | None = None, force_promote: bool = False) -> dict:
+              reason: str | None = None, force_promote: bool = False, pull_first: bool = False) -> dict:
     """Public entry. Serializes apply-now in-process (a 2nd concurrent call waits, then fails fast if
     the first is still running) so two callers can't race the writer-flock env flag and self-deadlock.
-    Then runs the real apply under the warehouse-writer flock + re-promote."""
+    Then runs the real apply under the warehouse-writer flock + re-promote. pull_first=True does a
+    box-side ff-only pull of origin/main first (the 'ship' flow: keep the nightly in sync)."""
     if not _APPLY_NOW_LOCK.acquire(timeout=_APPLY_NOW_LOCK_WAIT_S):
         return {"applied": [], "promote": None, "freshness": _snapshot_freshness(), "actor": actor,
                 "ok": False, "error": "another apply-now is already running on the server "
                 f"(waited {_APPLY_NOW_LOCK_WAIT_S}s) — retry shortly"}
     try:
         return _apply_now_impl(actor, max_items=max_items, promote=promote, reason=reason,
-                               force_promote=force_promote)
+                               force_promote=force_promote, pull_first=pull_first)
     finally:
         _APPLY_NOW_LOCK.release()
 
 
 def _apply_now_impl(actor: str, max_items: int = 25, promote: bool = True,
-                    reason: str | None = None, force_promote: bool = False) -> dict:
+                    reason: str | None = None, force_promote: bool = False,
+                    pull_first: bool = False) -> dict:
     """Drain ledger-approved queued DDLs to the LIVE warehouse under the warehouse-writer flock, then
     re-promote the serving snapshot. Returns a clear, structured result. (Always called with
     _APPLY_NOW_LOCK held — see apply_now.)
@@ -508,6 +535,9 @@ def _apply_now_impl(actor: str, max_items: int = 25, promote: bool = True,
     """
     t0 = time.time()
     result = {"applied": [], "promote": None, "freshness": None, "actor": actor, "ok": True}
+
+    if pull_first:
+        result["pull"] = _git_pull_ff()  # sync the box checkout to origin/main so the nightly keeps it
 
     reaped = _reap_stale_applying()
     if reaped:

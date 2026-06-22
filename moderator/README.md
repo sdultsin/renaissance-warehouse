@@ -39,6 +39,14 @@ Renaissance repo). Phase-1 substrate: branch `schema-gate-phase1`.
 
 `/healthz` is unauthenticated.
 
+## The one-command writer front door (`SHIP-FLOW.md`)
+Writers (David / Darcy / Thomas / Sam) and their agents use ONE invisible flow — they say "review and
+ship these changes" once and the agent runs: `next-version` → gate review + auto-revise (escalate only
+on a destructive/ambiguous call) → commit → PR → auto-merge → box `git pull --ff-only` →
+`apply-now --pull-first` (single-writer-flocked apply + promote). The writer never sees a branch, picks
+a version, or hand-coordinates concurrency. **Canonical procedure: `moderator/SHIP-FLOW.md`** (also the
+`warehouse-ship` skill). The hardened gate below is what makes that final carry-through safe to automate.
+
 ## Auto-assigned DDL numbers (`/apply/next-version`) — no more collisions
 DDL `version` numbers used to be hand-picked from the filename prefix; a writer on a STALE local
 checkout could pick a number already taken (the 2026-06-22 v96 incident: applied as 96 while the repo

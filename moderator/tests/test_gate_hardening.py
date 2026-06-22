@@ -144,6 +144,9 @@ def test_committed(tmp):
     ap.WAREHOUSE_ROOT = os.path.join(tmp, "nonexistent")
     nogit = ap._committed_in_repo("200_foo.sql", sha)
     check("no git repo -> verifiable False (caller fail-closes)", nogit["verifiable"] is False, str(nogit))
+    # box-pull (apply-now --pull-first) degrades cleanly + never raises when there's no repo
+    pull = ap._git_pull_ff()
+    check("git pull-ff no-repo -> pulled False (degrades, no raise)", pull["pulled"] is False, str(pull))
 
 
 def test_engine_maxes(tmp):

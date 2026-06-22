@@ -606,6 +606,8 @@ def cmd_apply_now(args) -> int:
         body["promote"] = False
     if getattr(args, "promote_only", False):
         body["force_promote"] = True
+    if getattr(args, "pull_first", False):
+        body["pull_first"] = True
     if getattr(args, "reason", None):
         body["reason"] = args.reason
     print("apply-now: applying ledger-approved DDLs + re-promoting the serving snapshot "
@@ -618,6 +620,10 @@ def cmd_apply_now(args) -> int:
     if res.get("error") and not res.get("applied"):
         print(f"  apply-now ERROR: {res['error']}")
         return 1
+    pull = res.get("pull")
+    if pull:
+        print(f"  PULL: box {'fast-forwarded' if pull.get('pulled') else 'pull skipped/failed'} "
+              f"{pull.get('head_before','?')}->{pull.get('head_after','?')} ({pull.get('detail','')})")
     applied = res.get("applied", [])
     if not applied:
         print(f"  {res.get('detail','nothing queued to apply')}")
@@ -705,6 +711,9 @@ def main(argv=None) -> int:
     an.add_argument("--promote-only", dest="promote_only", action="store_true",
                     help="force a serving re-promote even when nothing is queued (surface an "
                          "already-applied change) — triggers the ~10-min snapshot copy")
+    an.add_argument("--pull-first", dest="pull_first", action="store_true",
+                    help="box-side `git pull --ff-only origin main` before applying, so the box "
+                         "checkout (and the nightly) carry the just-merged DDL (the 'ship' flow)")
     an.add_argument("--reason", help="reason string recorded in the publish/apply log")
     args = p.parse_args(argv)
     if args.cmd == "doctor":

@@ -429,14 +429,15 @@ async def apply_now(request):
     actor = _actor(request, body)
     promote = body.get("promote", True)
     force_promote = bool(body.get("force_promote", False))
+    pull_first = bool(body.get("pull_first", False))
     max_items = int(body.get("max_items", 25))
     reason = body.get("reason")
     mc.log_event("apply_now_start", actor=actor, promote=promote, max_items=max_items,
-                 force_promote=force_promote)
+                 force_promote=force_promote, pull_first=pull_first)
     try:
         out = await run_in_threadpool(
             apply.apply_now, actor, max_items=max_items, promote=bool(promote), reason=reason,
-            force_promote=force_promote)
+            force_promote=force_promote, pull_first=pull_first)
     except Exception as e:
         mc.log_event("apply_now_error", actor=actor, error=f"{type(e).__name__}: {e}")
         return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=500)
