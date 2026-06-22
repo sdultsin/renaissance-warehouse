@@ -13,6 +13,12 @@ never pushed up. This is the standing rule + the automated guard that prevent a 
    and do **not** leave the box working tree dirty.
 3. Genuine box-local emergency hotfix? Allowed, but **PR it back same day**. The guard makes any un-pushed
    box commit (or dirty tree) loud within the hour.
+4. **A moderator `apply-now` is bound to the repo too — `apply == commit`.** apply-now refuses to apply a
+   DDL whose exact content isn't already committed at `origin/main:sql/ddl/<file>` (`MODERATOR_REQUIRE_COMMITTED=enforce`,
+   the default). So the live DB can never get **ahead** of the repo via apply-now: commit + PR + merge +
+   box-pull FIRST, then `apply-now`. (This closes the 2026-06-22 v96 hole, where a DDL was applied to the
+   live warehouse but never committed — a drift `git status` can't see.) Always take a DDL **number** from
+   `moderator_client.py next-version` (the single authority across all writers) — never eyeball `sql/ddl/`.
 
 ## The automated guard — `scripts/warehouse_git_divergence_guard.sh`
 
@@ -24,6 +30,13 @@ Box cron at **:05 each hour** (offset from 03:15 delta-sync / 03:30 nightly / 06
 | `AHEAD` = `git rev-list --count origin/main..HEAD` | box has commits not on origin (the exact 2026-06-20 failure) | **> 0** → alert |
 | `BEHIND` = `git rev-list --count HEAD..origin/main` | box hasn't pulled origin | **> 5** → alert |
 | `DIRTY` = `git status --porcelain` (minus runtime-generated paths) | uncommitted box edits | **> 0** → alert |
+| `DBDRIFT` = applied `core.schema_version` versions with no committed `sql/ddl/NN_*.sql` at origin/main (`scripts/schema_db_repo_drift.py`) | live DB schema **ahead of** the repo — a moderator `apply-now` that skipped the commit (the 2026-06-22 v96 blind spot `git status` can't see) | **> 0** → alert |
+
+The `DBDRIFT` check reads the serving snapshot read-only and is **fail-silent on its own errors** (a guard
+helper must never false-alarm). It keys on the applied DDL **filename** (not the number), so it alerts
+whenever an applied DDL file isn't committed under `sql/ddl/` at origin/main — robust even if the number
+was reused (which would otherwise mask the drift). `repo-ahead` (committed-not-yet-applied — normal) is
+info-only.
 
 **Alert dedup (no #cc-sam spam):** a state file `/root/.warehouse-git-drift-state` holds the last-alerted
 drift signature + timestamp. The guard alerts **once per distinct drift signature**, re-alerts only when the

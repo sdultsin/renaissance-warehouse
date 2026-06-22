@@ -25,24 +25,53 @@ Renaissance repo). Phase-1 substrate: branch `schema-gate-phase1`.
 
 ## Store
 - **Catalog/lineage** stays in DuckDB (`core.schema_catalog/_consumers/_aliases`), rebuilt nightly.
-- **Rules + alias authority + approval ledger + issue ledger** live in Postgres schema `moderator`
-  in the PIPELINE project `nmkaydqcnkjsehyqokgg` (Supavisor 6543). Append-only trigger on the ledger.
+- **Rules + alias authority + approval ledger + issue ledger + version reservations** live in Postgres
+  schema `moderator` in the PIPELINE project `nmkaydqcnkjsehyqokgg` (Supavisor 6543). Append-only
+  trigger on the ledger. `moderator.version_reservation` (PK `version`) is the auto-assign allocator's
+  reservation table (created idempotently on first `/apply/next-version`).
 
 ## Auth & scopes
 `/opt/duckdb/allowed_tokens.txt` — `token<TAB>email[<TAB>scope]`, reloaded per request. Scope is a
 3rd column; lines without it default to `reader`. `reader` ⊂ `editor` ⊂ `admin`.
 - `reader` — `/catalog` `/ledger` `/issues` `/rules` (GET) `/apply/queue`
-- `editor` — `/review` `/record-pass` `/judge-advisory` `/apply/enqueue` `/apply/process` `/apply-now`
+- `editor` — `/review` `/record-pass` `/judge-advisory` `/apply/enqueue` `/apply/next-version` `/apply/process` `/apply-now`
 - `admin`  — `POST /rules`
 
 `/healthz` is unauthenticated.
 
+## The one-command writer front door (`SHIP-FLOW.md`)
+Writers (David / Darcy / Thomas / Sam) and their agents use ONE invisible flow — they say "review and
+ship these changes" once and the agent runs: `next-version` → gate review + auto-revise (escalate only
+on a destructive/ambiguous call) → commit → PR → auto-merge → box `git pull --ff-only` →
+`apply-now --pull-first` (single-writer-flocked apply + promote). The writer never sees a branch, picks
+a version, or hand-coordinates concurrency. **Canonical procedure: `moderator/SHIP-FLOW.md`** (also the
+`warehouse-ship` skill). The hardened gate below is what makes that final carry-through safe to automate.
+
+## Auto-assigned DDL numbers (`/apply/next-version`) — no more collisions
+DDL `version` numbers used to be hand-picked from the filename prefix; a writer on a STALE local
+checkout could pick a number already taken (the 2026-06-22 v96 incident: applied as 96 while the repo
+was at 113). **Always get your number from the service — the single authority across every writer
+(human or agent), unlike the bus-local `ddl-number` lock a laptop bypasses:**
+```
+python scripts/moderator_client.py next-version    # reserves + prints the next free number
+```
+`next = 1 + max(committed sql/ddl at origin/main, applied core.schema_version, in-flight queue+ledger,
+prior reservations)`, reserved atomically in `moderator.version_reservation` (never reuses a gap).
+Name your new file `sql/ddl/<that-number>_<name>.sql`.
+
 ## Real-time apply (`/apply-now`) — the two-speed apply model
 A recorded DDL applies on the **nightly (~03:30 UTC) by default**. To make it live in **minutes**:
 ```
+python scripts/moderator_client.py next-version                             # reserve the DDL number
 python scripts/moderator_client.py apply-enqueue --files sql/ddl/NN_x.sql   # if not already queued
+# commit the file -> PR -> merge to origin/main -> box pull   (apply==commit; see below)
 python scripts/moderator_client.py apply-now                                # apply live + re-promote
 ```
+**`apply == commit` (refuse-if-uncommitted):** apply-now REFUSES a DDL whose exact content isn't
+committed at `origin/main:sql/ddl/<file>` (`MODERATOR_REQUIRE_COMMITTED=enforce`, default; `warn` =
+apply-but-flag, `off` = skip for local dev). So the live DB can never get ahead of the repo — commit
++ PR + merge + box-pull FIRST. It also REFUSES a version-number collision (a number already applied
+under a different file) instead of silently no-op'ing the writer's DDL.
 `apply-now` acquires the warehouse-writer flock, applies every queued DDL that has a content-hash-bound
 `approval_ledger` pass (the same authority + tooth the nightly uses), then re-promotes the serving
 snapshot so **readers** see it. **Latency:** the promote copies the ~50GB warehouse, so it takes
@@ -65,6 +94,10 @@ ANTHROPIC_API_KEY=<metered console key>                # server-side LLM deep-re
 SCHEMA_GATE_SERVER_LLM=1
 MODERATOR_LLM_MODEL=claude-opus-4-8
 MODERATOR_LOG=/opt/moderator/logs/moderator.jsonl
+# apply==commit (refuse-if-uncommitted) — default ON. enforce | warn | off.
+MODERATOR_REQUIRE_COMMITTED=enforce
+MODERATOR_APPLY_GIT_REF=origin/main     # the authoritative code ref the apply must match
+MODERATOR_APPLY_FETCH=1                  # best-effort `git fetch` before the commit check (see a just-merged PR)
 ```
 
 ## Deploy / operate

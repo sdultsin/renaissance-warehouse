@@ -22,6 +22,11 @@ Safety properties (all required by the build):
     (ddl_version, sha256-of-content) with verdict pass/pass-with-warn. An unledgered/edited queue
     row is refused (status='blocked'), never applied. This is the same authority the apply tooth and
     CI trust — the client is never trusted.
+  * APPLY==COMMIT (no DB-ahead-of-repo drift): a row applies ONLY if its EXACT content is committed
+    at origin/main as sql/ddl/<file> (MODERATOR_REQUIRE_COMMITTED=enforce, default), so apply-now
+    can never take the live DB ahead of the repo (the v96 / 2026-06-20 drift class). It also REFUSES
+    a version-number collision (a version already applied under a different file) instead of silently
+    no-op'ing it — forcing a fresh number (next-version) rather than swallowing the writer's DDL.
   * FAIL-CLOSED + REVERSIBLE: any apply error rolls back that DDL (apply_ddl_file BEGIN/ROLLBACK)
     and marks the row 'failed' with the error; other rows are unaffected; nothing is half-applied.
     apply_ddl_file is idempotent by version (core.schema_version) so re-running apply-now is safe.
@@ -64,6 +69,26 @@ PROMOTE_TIMEOUT_S = int(os.environ.get("MODERATOR_PROMOTE_TIMEOUT_S", "1200"))
 # The warehouse repo checkout co-located on the box — its core/ package owns the apply tooth.
 WAREHOUSE_ROOT = mc.WAREHOUSE_ROOT
 
+# ── apply==commit (refuse-if-uncommitted): bind the live apply to the COMMITTED repo ────────────
+# The 2026-06-20 box-reconcile + the v96 incident (David applied a DDL via apply-now that was never
+# in the repo, leaving the live DB AHEAD of origin/main — a drift `git status` can't see) are the
+# exact failure this prevents. The content we apply comes from moderator.apply_queue (PG); nothing
+# tied it to a COMMITTED repo file. Here we bind them: a queued DDL applies ONLY if its EXACT content
+# (by sha256) is committed at origin/main as sql/ddl/<file>. So apply-now can take live ONLY what is
+# already merged + pushed — enforcing GIT-SYNC-DISCIPLINE.md (edit -> PR -> merge to origin/main ->
+# box pulls) at the schema chokepoint, for EVERY writer (incl. humans who bypass the bus ddl-number
+# lock). Modes (MODERATOR_REQUIRE_COMMITTED): "enforce"/"1" (default) = REFUSE uncommitted
+# (status='blocked'); "warn" = apply but flag it (the drift guard then catches the lapse); "off"/"0"
+# = skip entirely (local dev / test). Fail-CLOSED: if git/the repo can't be consulted, "enforce"
+# refuses (never apply on an unverifiable ref).
+_REQUIRE_COMMITTED = os.environ.get("MODERATOR_REQUIRE_COMMITTED", "enforce").strip().lower()
+_GIT_REF = os.environ.get("MODERATOR_APPLY_GIT_REF", "origin/main")  # the authoritative code ref
+# Best-effort `git fetch` of the ref's branch before the check so a just-merged PR is visible. Tolerates
+# fetch failure (uses the last-fetched ref; we fail toward REFUSE below, never apply on a stale ref we
+# couldn't confirm matches). Disable with MODERATOR_APPLY_FETCH=0.
+_APPLY_FETCH = os.environ.get("MODERATOR_APPLY_FETCH", "1") not in ("0", "false", "False", "")
+_GIT_TIMEOUT_S = int(os.environ.get("MODERATOR_APPLY_GIT_TIMEOUT_S", "30"))
+
 # The box-local warehouse-writer flock (same file with_warehouse_lock.sh / core.db use). We acquire
 # it OURSELVES here (own fd, released in a finally) — NOT via core.db's atexit-only release, which in
 # a long-lived service would hold the lock for the whole process lifetime and starve the nightly.
@@ -74,6 +99,97 @@ WRITE_LOCK_WAIT_S = int(os.environ.get("MODERATOR_WRITE_LOCK_WAIT_S", "1800"))
 # Requeue an apply_queue row stuck in 'applying' longer than this (an apply-now that died mid-run /
 # lost its PG conn before _finish). Reaped on the next apply-now entry so rows are never stranded.
 STALE_APPLYING_MIN = int(os.environ.get("MODERATOR_STALE_APPLYING_MIN", "30"))
+
+
+# ── repo-commit binding helpers (apply==commit) ──────────────────────────────────────────────────
+def _git(args: list, timeout: int | None = None) -> "subprocess.CompletedProcess":
+    """Run `git -C <repo> <args>` capturing raw bytes (no text decode — blob bytes must hash exactly)."""
+    return subprocess.run(["git", "-C", WAREHOUSE_ROOT, *args],
+                          capture_output=True, timeout=(timeout or _GIT_TIMEOUT_S))
+
+
+def _origin_ref_sha() -> str | None:
+    try:
+        p = _git(["rev-parse", "--short", _GIT_REF])
+        return p.stdout.decode("utf-8", "replace").strip() if p.returncode == 0 else None
+    except Exception:
+        return None
+
+
+def _eol_norm(b: bytes) -> bytes:
+    return b.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+
+
+def _committed_in_repo(sql_file: str | None, content_sha256: str, content: str | None = None) -> dict:
+    """Is the content of this DDL committed at _GIT_REF (origin/main) as sql/ddl/<sql_file>? Returns
+    {committed, verifiable, ref_sha, detail}. `verifiable=False` means git/the repo couldn't be
+    consulted at all — under 'enforce' the caller then REFUSES (fail-closed), so we never apply against
+    a ref we couldn't confirm. The blob is hashed with sha256 of its raw BYTES (NOT git's sha1 object
+    id) to match moderator's content_sha256 convention. We first try an EXACT byte match; if `content`
+    is given we then fall back to an EOL-NORMALIZED match, so a writer whose git normalized line
+    endings (core.autocrlf -> an LF blob vs a CRLF working tree) isn't false-blocked on the same SQL."""
+    if not sql_file:
+        return {"committed": False, "verifiable": True, "ref_sha": None,
+                "detail": "queue row has no sql_file — cannot locate a committed repo file"}
+    if not WAREHOUSE_ROOT or not os.path.isdir(os.path.join(WAREHOUSE_ROOT, ".git")):
+        return {"committed": False, "verifiable": False, "ref_sha": None,
+                "detail": f"no git repo at WAREHOUSE_REPO_ROOT={WAREHOUSE_ROOT!r} — cannot verify commit"}
+    if _APPLY_FETCH:
+        try:
+            branch = _GIT_REF.split("/", 1)[1] if "/" in _GIT_REF else _GIT_REF
+            _git(["fetch", "origin", branch])  # best-effort; a failure just leaves the last-fetched ref
+        except Exception:
+            pass  # fail toward REFUSE below if the (stale) ref doesn't match — never apply unverified
+    repo_path = f"sql/ddl/{sql_file}"
+    try:
+        p = _git(["cat-file", "blob", f"{_GIT_REF}:{repo_path}"])
+    except Exception as e:  # noqa: BLE001 — git missing / timeout / repo error
+        return {"committed": False, "verifiable": False, "ref_sha": _origin_ref_sha(),
+                "detail": f"git cat-file failed ({type(e).__name__}) — cannot verify commit"}
+    ref_sha = _origin_ref_sha()
+    if p.returncode != 0:
+        return {"committed": False, "verifiable": True, "ref_sha": ref_sha,
+                "detail": f"{repo_path} is NOT committed at {_GIT_REF} — commit + PR + box-pull first "
+                          f"(GIT-SYNC-DISCIPLINE.md), then re-run apply-now"}
+    blob_sha = hashlib.sha256(p.stdout).hexdigest()
+    if blob_sha == content_sha256:
+        return {"committed": True, "verifiable": True, "ref_sha": ref_sha,
+                "detail": f"content committed at {_GIT_REF} ({ref_sha})"}
+    # EOL-normalized fallback: same SQL modulo CRLF/LF still counts as committed (re-applying the LF
+    # repo copy produces the identical schema). Only collapses line endings — different SQL still fails.
+    if content is not None and hashlib.sha256(_eol_norm(p.stdout)).hexdigest() == \
+            hashlib.sha256(_eol_norm(content.encode("utf-8"))).hexdigest():
+        return {"committed": True, "verifiable": True, "ref_sha": ref_sha,
+                "detail": f"content committed at {_GIT_REF} ({ref_sha}) (matched modulo line-endings)"}
+    return {"committed": False, "verifiable": True, "ref_sha": ref_sha,
+            "detail": f"{repo_path} at {_GIT_REF} has DIFFERENT content (committed sha "
+                      f"{blob_sha[:12]}…, applying {content_sha256[:12]}…) — the content you're "
+                      f"applying isn't what's merged; commit the EXACT content + box-pull, re-run"}
+
+
+def _git_pull_ff() -> dict:
+    """Box-side `git pull --ff-only origin <ref-branch>` so the co-located checkout matches origin/main
+    BEFORE we apply. Essential for the one-command 'ship' flow: it makes the working-tree sql/ddl carry
+    the just-merged DDL so the NIGHTLY rebuild keeps it (else the next from-repo rebuild silently drops
+    a change applied only transiently — the v96 nightly-drop risk). FF-only + box-never-commits = no
+    conflicts; on the box this is the sanctioned deploy path (pull, never push). Best-effort + reported;
+    never raises (apply-now still runs — Fix A's commit check is the backstop)."""
+    out = {"pulled": False, "detail": None, "head_before": _origin_ref_sha()}
+    if not WAREHOUSE_ROOT or not os.path.isdir(os.path.join(WAREHOUSE_ROOT, ".git")):
+        out["detail"] = "no git repo at WAREHOUSE_REPO_ROOT — skipped"
+        return out
+    branch = _GIT_REF.split("/", 1)[1] if "/" in _GIT_REF else _GIT_REF
+    try:
+        p = _git(["pull", "--ff-only", "origin", branch], timeout=120)
+        out["pulled"] = p.returncode == 0
+        out["detail"] = (p.stdout.decode("utf-8", "replace") + p.stderr.decode("utf-8", "replace")).strip()[-300:]
+    except Exception as e:  # noqa: BLE001
+        out["detail"] = f"git pull failed ({type(e).__name__}: {e})"
+    try:
+        out["head_after"] = _git(["rev-parse", "--short", "HEAD"]).stdout.decode().strip()
+    except Exception:
+        out["head_after"] = None
+    return out
 
 
 # ── the apply tooth (reuses core.db — the SAME path the nightly uses, under the writer flock) ─────
@@ -245,6 +361,42 @@ def _apply_one(core_db, db_path, conn, row) -> dict:
                    detail="row has no ddl_version (cannot key core.schema_version) — refusing")
         return out
 
+    # 2.5) apply==commit (refuse-if-uncommitted): the EXACT content must be committed at origin/main
+    # as sql/ddl/<file>, so apply-now can NEVER take the live DB ahead of the repo (the v96 /
+    # 2026-06-20 drift class). 'enforce' (default) blocks; 'warn' applies but flags; 'off' skips.
+    if _REQUIRE_COMMITTED not in ("off", "0"):
+        commit = _committed_in_repo(sql_file, content_sha256, content)
+        out["committed"] = commit["committed"]
+        out["repo_ref"] = commit.get("ref_sha")
+        if not commit["committed"]:
+            if _REQUIRE_COMMITTED == "warn":
+                out["commit_warning"] = commit["detail"]  # apply proceeds; the drift guard flags it
+            else:
+                out.update(applied=False, status="blocked",
+                           detail="apply==commit: " + commit["detail"])
+                return out
+
+    # 2.7) version-collision guard: REFUSE (don't silently no-op) if this version is already applied
+    # in core.schema_version under a DIFFERENT sql_file. apply_ddl_file is idempotent BY VERSION, so a
+    # stale-local number (David's v96 was picked while the repo was already at 113) would otherwise be
+    # swallowed as "already-applied" and the writer's real DDL would never land. A loud block forces a
+    # fresh number (moderator_client.py next-version). A genuine same-file re-run still no-ops below.
+    # NOTE: this intentionally also blocks a same-number FILE-RENAME (numbers are immutable + never
+    # reused here, so "this number is taken — get a fresh one" is the right answer). We can't tell a
+    # rename from a clobber without a content hash on core.schema_version (the filed David follow-up),
+    # so we fail safe toward refusing; the apply would be a no-op anyway, so nothing is lost.
+    try:
+        existing = conn.execute(
+            "SELECT sql_file FROM core.schema_version WHERE version = ?", [ddl_version]).fetchone()
+    except Exception:
+        existing = None  # table not created yet (fresh DB) — apply_ddl_file creates it
+    if existing and existing[0] and os.path.basename(str(existing[0])) != (sql_file or ""):
+        out.update(applied=False, status="blocked",
+                   detail=f"version {ddl_version} already applied as '{existing[0]}' (you are applying "
+                          f"'{sql_file}') — version COLLISION; allocate a fresh number with "
+                          f"`moderator_client.py next-version` and re-gate. Refusing to silently no-op.")
+        return out
+
     # 3) apply with the SAME tooth the nightly uses. apply_ddl_file is idempotent by version
     # (core.schema_version) — a version already applied returns False (already-applied), never
     # re-runs / errors. We write the EXACT recorded content to a temp file named NN_<file> so the
@@ -350,23 +502,25 @@ def _promote_acceptable(p: dict | None, promote_requested: bool) -> bool:
 
 
 def apply_now(actor: str, max_items: int = 25, promote: bool = True,
-              reason: str | None = None, force_promote: bool = False) -> dict:
+              reason: str | None = None, force_promote: bool = False, pull_first: bool = False) -> dict:
     """Public entry. Serializes apply-now in-process (a 2nd concurrent call waits, then fails fast if
     the first is still running) so two callers can't race the writer-flock env flag and self-deadlock.
-    Then runs the real apply under the warehouse-writer flock + re-promote."""
+    Then runs the real apply under the warehouse-writer flock + re-promote. pull_first=True does a
+    box-side ff-only pull of origin/main first (the 'ship' flow: keep the nightly in sync)."""
     if not _APPLY_NOW_LOCK.acquire(timeout=_APPLY_NOW_LOCK_WAIT_S):
         return {"applied": [], "promote": None, "freshness": _snapshot_freshness(), "actor": actor,
                 "ok": False, "error": "another apply-now is already running on the server "
                 f"(waited {_APPLY_NOW_LOCK_WAIT_S}s) — retry shortly"}
     try:
         return _apply_now_impl(actor, max_items=max_items, promote=promote, reason=reason,
-                               force_promote=force_promote)
+                               force_promote=force_promote, pull_first=pull_first)
     finally:
         _APPLY_NOW_LOCK.release()
 
 
 def _apply_now_impl(actor: str, max_items: int = 25, promote: bool = True,
-                    reason: str | None = None, force_promote: bool = False) -> dict:
+                    reason: str | None = None, force_promote: bool = False,
+                    pull_first: bool = False) -> dict:
     """Drain ledger-approved queued DDLs to the LIVE warehouse under the warehouse-writer flock, then
     re-promote the serving snapshot. Returns a clear, structured result. (Always called with
     _APPLY_NOW_LOCK held — see apply_now.)
@@ -381,6 +535,9 @@ def _apply_now_impl(actor: str, max_items: int = 25, promote: bool = True,
     """
     t0 = time.time()
     result = {"applied": [], "promote": None, "freshness": None, "actor": actor, "ok": True}
+
+    if pull_first:
+        result["pull"] = _git_pull_ff()  # sync the box checkout to origin/main so the nightly keeps it
 
     reaped = _reap_stale_applying()
     if reaped:

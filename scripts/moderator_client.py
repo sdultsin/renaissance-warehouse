@@ -21,6 +21,9 @@ Commands:
   loop    [--staged | --files ...]               review; if clean -> record; if block -> print the
                                                   fixes for the editor's Claude (the §7.1 loop is
                                                   Claude-driven: fix -> re-review -> record, <=6x)
+  next-version                                    auto-assign + RESERVE the next free schema_version
+                                                  number (use this to NAME a new sql/ddl/NN_*.sql —
+                                                  the single authority across writers; no collisions)
   apply-enqueue --files A.sql ...                 add a recorded DDL to the serialized apply FIFO
   apply-now [--reason R] [--no-promote]           APPLY the ledger-approved enqueued DDLs to the LIVE
                                                   warehouse now (writer-flock-safe) + re-promote the
@@ -565,6 +568,25 @@ def cmd_apply_queue(args) -> int:
     return 0
 
 
+def cmd_next_version(args) -> int:
+    """Auto-assign + RESERVE the next free DDL/schema_version number. ALWAYS get your number from
+    here (not by eyeballing sql/ddl/) — the server is the single authority across every writer, so
+    two people can't pick the same number (the v96 collision). Name your new file with it."""
+    body = {"actor": os.environ.get("USER", "?")}
+    res = _req("POST", "/apply/next-version", body)
+    if not res.get("reserved"):
+        print(f"  next-version FAILED: {res.get('error','could not reserve')} — retry.")
+        return 1
+    v = res["version"]
+    src = res.get("sources", {})
+    print(f"  next free schema_version = {v}  (RESERVED to you)")
+    print(f"  -> name your file: sql/ddl/{v}_<name>.sql   (then: loop -> apply-enqueue -> commit+PR -> apply-now)")
+    print(f"  computed from max(repo={src.get('repo_max')}, applied={src.get('applied_max')}, "
+          f"queue={src.get('queue_max')}, ledger={src.get('ledger_max')}, "
+          f"reservations={src.get('reservation_max_before')})")
+    return 0
+
+
 def cmd_apply_process(args) -> int:
     print(json.dumps(_req("POST", "/apply/process", {}), indent=2))
     return 0
@@ -584,6 +606,8 @@ def cmd_apply_now(args) -> int:
         body["promote"] = False
     if getattr(args, "promote_only", False):
         body["force_promote"] = True
+    if getattr(args, "pull_first", False):
+        body["pull_first"] = True
     if getattr(args, "reason", None):
         body["reason"] = args.reason
     print("apply-now: applying ledger-approved DDLs + re-promoting the serving snapshot "
@@ -596,6 +620,10 @@ def cmd_apply_now(args) -> int:
     if res.get("error") and not res.get("applied"):
         print(f"  apply-now ERROR: {res['error']}")
         return 1
+    pull = res.get("pull")
+    if pull:
+        print(f"  PULL: box {'fast-forwarded' if pull.get('pulled') else 'pull skipped/failed'} "
+              f"{pull.get('head_before','?')}->{pull.get('head_after','?')} ({pull.get('detail','')})")
     applied = res.get("applied", [])
     if not applied:
         print(f"  {res.get('detail','nothing queued to apply')}")
@@ -674,6 +702,8 @@ def main(argv=None) -> int:
     fb.add_argument("--ddl-file", dest="ddl_file")
     ae = sub.add_parser("apply-enqueue"); ae.add_argument("--files", nargs="*"); ae.add_argument("--staged", action="store_true")
     aq = sub.add_parser("apply-queue"); aq.add_argument("--status", default="all")
+    sub.add_parser("next-version", help="auto-assign + reserve the next free schema_version number "
+                                        "(use this instead of eyeballing sql/ddl/ — avoids collisions)")
     sub.add_parser("apply-process")
     an = sub.add_parser("apply-now", help="apply ledger-approved enqueued DDLs LIVE now + re-promote (no nightly wait)")
     an.add_argument("--no-promote", dest="no_promote", action="store_true",
@@ -681,6 +711,9 @@ def main(argv=None) -> int:
     an.add_argument("--promote-only", dest="promote_only", action="store_true",
                     help="force a serving re-promote even when nothing is queued (surface an "
                          "already-applied change) — triggers the ~10-min snapshot copy")
+    an.add_argument("--pull-first", dest="pull_first", action="store_true",
+                    help="box-side `git pull --ff-only origin main` before applying, so the box "
+                         "checkout (and the nightly) carry the just-merged DDL (the 'ship' flow)")
     an.add_argument("--reason", help="reason string recorded in the publish/apply log")
     args = p.parse_args(argv)
     if args.cmd == "doctor":
@@ -705,6 +738,8 @@ def main(argv=None) -> int:
         return cmd_apply_enqueue(args)
     if args.cmd == "apply-queue":
         return cmd_apply_queue(args)
+    if args.cmd == "next-version":
+        return cmd_next_version(args)
     if args.cmd == "apply-process":
         return cmd_apply_process(args)
     if args.cmd == "apply-now":

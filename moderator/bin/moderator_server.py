@@ -390,6 +390,21 @@ async def apply_queue(request):
     return JSONResponse({"queue": eng.apply_queue_status(request.query_params.get("status", "all"))})
 
 
+# POST /apply/next-version (editor) — auto-assign + RESERVE the next free DDL/schema_version number,
+# authoritatively across every writer (the v96 stale-local-number collision fix). Reserving is a
+# write to moderator.version_reservation, hence editor scope.
+async def apply_next_version(request):
+    deny = require_scope(request, "editor")
+    if deny is not None:
+        return deny
+    body = await _json_body(request)
+    rid = body.get("request_id")
+    out = eng.next_schema_version(actor=_actor(request, body), request_id=rid)
+    mc.log_event("apply_next_version", actor=_actor(request, body), version=out.get("version"),
+                 reserved=out.get("reserved"))
+    return JSONResponse(out, status_code=200 if out.get("reserved") else 503)
+
+
 async def apply_process(request):
     deny = require_scope(request, "editor")
     if deny is not None:
@@ -414,14 +429,15 @@ async def apply_now(request):
     actor = _actor(request, body)
     promote = body.get("promote", True)
     force_promote = bool(body.get("force_promote", False))
+    pull_first = bool(body.get("pull_first", False))
     max_items = int(body.get("max_items", 25))
     reason = body.get("reason")
     mc.log_event("apply_now_start", actor=actor, promote=promote, max_items=max_items,
-                 force_promote=force_promote)
+                 force_promote=force_promote, pull_first=pull_first)
     try:
         out = await run_in_threadpool(
             apply.apply_now, actor, max_items=max_items, promote=bool(promote), reason=reason,
-            force_promote=force_promote)
+            force_promote=force_promote, pull_first=pull_first)
     except Exception as e:
         mc.log_event("apply_now_error", actor=actor, error=f"{type(e).__name__}: {e}")
         return JSONResponse({"ok": False, "error": f"{type(e).__name__}: {e}"}, status_code=500)
@@ -453,6 +469,7 @@ ROUTES = [
     Route("/feedback", feedback, methods=["POST"]),
     Route("/apply/enqueue", apply_enqueue, methods=["POST"]),
     Route("/apply/queue", apply_queue, methods=["GET"]),
+    Route("/apply/next-version", apply_next_version, methods=["POST"]),
     Route("/apply/process", apply_process, methods=["POST"]),
     Route("/apply-now", apply_now, methods=["POST"]),
 ]
