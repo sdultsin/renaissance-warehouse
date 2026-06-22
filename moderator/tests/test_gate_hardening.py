@@ -244,20 +244,53 @@ def test_two_key_decide(tmp):
         check(f"detect_destructive {sqls[0][:38]!r} -> {exp}",
               tk.detect_destructive(sqls)["destructive"] == exp, str(tk.detect_destructive(sqls)))
 
-    # (3) plain-English escalation: human-facing, actionable, and NEVER contains a raw diff/code block.
+    # (3) plain-English escalation (DECISION 2026-06-22 refinement). Two genuinely different messages,
+    #     each posted ON THE PR (so the AUTHOR is notified, not a generic "Sam approves"), never a diff.
+    #     DESTRUCTIVE = an AUTHOR-INTENT CONFIRMATION (the only human action left in the system): the
+    #     author may confirm their OWN intent by merging / YES, or ignore to block.
     esc_d = tk.decide("pass", "approve", True)
     txt = tk.plain_english_escalation(esc_d, pr_number=7, pr_title="t", gate_verdict="pass",
                                       reviewer={"verdict": "approve"},
                                       destructive={"destructive": True, "reasons": ["drops a table (and all its data)"]})
-    check("destructive escalation is plain-English + actionable",
-          "permanently" in txt.lower() and "YES" in txt and "```" not in txt, txt)
+    check("destructive escalation = author-intent confirm (permanent + author + confirm-by-merge, no diff)",
+          "permanently" in txt.lower() and "@author" in txt and "merging" in txt.lower()
+          and "YES" in txt and "```" not in txt, txt)
+    #     DISAGREEMENT = a BLOCK, NOT an approval request: it must NOT offer a "merge it anyway" / "YES to
+    #     merge" coin-flip; it tells the AUTHOR to FIX (push a commit) or escalate to Sam.
     dis_d = tk.decide("pass", "request_changes", False)
     dtxt = tk.plain_english_escalation(dis_d, pr_number=8, pr_title="t", gate_verdict="pass",
                                        reviewer={"verdict": "request_changes", "summary": "the migration silently no-ops",
                                                  "reasons": ["x"]},
                                        destructive={"destructive": False, "reasons": []})
-    check("disagreement escalation is plain-English + no diff",
-          "second independent reviewer" in dtxt.lower() and "```" not in dtxt and "YES" in dtxt, dtxt)
+    check("disagreement escalation = BLOCK (author fixes/escalates; NO merge-anyway path; no diff)",
+          "second independent reviewer" in dtxt.lower() and "```" not in dtxt
+          and "blocked" in dtxt.lower() and "push a new commit" in dtxt.lower()
+          and "escalate to sam" in dtxt.lower()
+          and "merge it anyway" not in dtxt.lower() and "*yes*" not in dtxt.lower(), dtxt)
+    #     unavailable reviewer is also a DISAGREEMENT block (an unconfirmed key never green-lights a merge).
+    una_d = tk.decide("pass", "unavailable", False)
+    utxt = tk.plain_english_escalation(una_d, pr_number=9, pr_title="t", gate_verdict="pass",
+                                       reviewer={"verdict": "unavailable"},
+                                       destructive={"destructive": False, "reasons": []})
+    check("unavailable-reviewer escalation = BLOCK (no merge-anyway)",
+          "blocked" in utxt.lower() and "could not be reached" in utxt.lower()
+          and "*yes*" not in utxt.lower(), utxt)
+
+    # (3b) the kill switch: TWO_KEY_AUTOMERGE must gate all action; only the literal 'on' enables it.
+    import importlib as _il
+    _saved = os.environ.get("TWO_KEY_AUTOMERGE")
+    try:
+        for val, exp in [("on", True), ("ON", True), (" On ", True), ("off", False),
+                         ("", False), ("yes", False), ("1", False)]:
+            os.environ["TWO_KEY_AUTOMERGE"] = val
+            check(f"automerge_enabled({val!r}) -> {exp}", tk.automerge_enabled() == exp, val)
+        os.environ.pop("TWO_KEY_AUTOMERGE", None)
+        check("automerge_enabled() unset -> False", tk.automerge_enabled() is False, "unset")
+    finally:
+        if _saved is None:
+            os.environ.pop("TWO_KEY_AUTOMERGE", None)
+        else:
+            os.environ["TWO_KEY_AUTOMERGE"] = _saved
 
     # (4) agreement log + stats round-trip.
     logp = os.path.join(tmp, "agree.jsonl")

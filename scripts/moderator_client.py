@@ -30,12 +30,14 @@ Commands:
                                                   serving snapshot -> visible to readers in minutes,
                                                   no nightly wait, no SSH. (Default path is still:
                                                   it applies on the nightly. apply-now = make it now.)
-  two-key [--files ...] [--pr-number N]          two-key auto-merge decision for a PR: GATE verdict AND
-                                                  an INDEPENDENT reviewer (claude-sonnet-4-6, different
+  two-key [--files ...] [--pr-number N]          two-key auto-merge for a PR: GATE verdict AND an
+                                                  INDEPENDENT reviewer (claude-sonnet-4-6, different
                                                   model+lens) must BOTH approve + the change be
-                                                  non-destructive, else escalate in PLAIN ENGLISH. Logs
-                                                  the agreement record. NEVER merges; exit 0=merge-eligible
-                                                  / 10=escalate.
+                                                  non-destructive → auto-merge; else HOLD on the PR in
+                                                  PLAIN ENGLISH (destructive=author-intent confirm /
+                                                  disagreement=BLOCK). Logs the agreement record. Acts
+                                                  ONLY when TWO_KEY_AUTOMERGE=on (the kill switch; else
+                                                  decide+print only). exit 0=merge-eligible / 10=escalate.
   rules | issues [--status open] | catalog [--table T --column C] | ledger | apply-queue
 """
 from __future__ import annotations
@@ -53,6 +55,8 @@ DEFAULT_URL = "https://renaissance-droplet.tailae5c80.ts.net/moderator"
 RENAISSANCE_ENV = os.environ.get(
     "RENAISSANCE_ENV", "/Users/sam/Documents/Claude Code/Renaissance/.env")
 WAREHOUSE_HOST = os.environ.get("WAREHOUSE_HOST", "renaissance-worker")
+# The ONLY repo Renaissance ships to. Overridable for tests/forks; defaults to the canonical slug.
+REPO_SLUG = os.environ.get("WAREHOUSE_REPO_SLUG", "sdultsin/renaissance-warehouse")
 PY_CONSUMER_DIRS = ("entities", "sources", "scripts")
 MAX_LOOP = 6
 
@@ -658,13 +662,40 @@ def cmd_apply_now(args) -> int:
     return 0 if res.get("ok") else 1
 
 
+def _gh(*gh_args: str) -> tuple[int, str, str]:
+    """Run a `gh` command; return (rc, stdout, stderr). gh not installed / not authed → rc!=0 (handled)."""
+    try:
+        p = subprocess.run(["gh", *gh_args], capture_output=True, text=True, timeout=120)
+        return p.returncode, (p.stdout or "").strip(), (p.stderr or "").strip()
+    except FileNotFoundError:
+        return 127, "", "gh CLI not found"
+    except Exception as e:  # noqa: BLE001
+        return 1, "", f"{type(e).__name__}: {e}"
+
+
+def _post_pr_comment(pr_number, text: str) -> bool:
+    """Post the plain-English escalation ON THE PR (so the AUTHOR is notified). Best-effort."""
+    if not pr_number:
+        print("  (no --pr-number → cannot post the escalation on the PR; printed above instead.)")
+        return False
+    rc, _out, err = _gh("pr", "comment", str(pr_number), "--repo", REPO_SLUG, "--body", text)
+    if rc == 0:
+        print(f"  posted plain-English escalation on PR #{pr_number} (author notified).")
+        return True
+    print(f"  WARNING: could not post on PR #{pr_number} ({err}) — escalation printed above, route manually.")
+    return False
+
+
 def cmd_two_key(args) -> int:
-    """Two-key auto-merge decision for a PR (DECISION 2026-06-22). Gets the GATE verdict from /review
-    (the existing moderator gate, claude-opus-4-8), then runs the INDEPENDENT adversarial reviewer
-    (scripts/independent_reviewer.py, claude-sonnet-4-6 — different model + lens), checks the change is
-    non-destructive, and decides merge-vs-escalate. Logs the agreement record. PRINTS a plain-English
-    escalation if the keys disagree or the change is destructive. NEVER merges — the ship flow only runs
-    `gh pr merge` when this exits 0 (merge-eligible) AND auto-merge is enabled (TWO_KEY_AUTOMERGE=on)."""
+    """Two-key auto-merge for a PR (DECISION 2026-06-22). Re-asks the GATE (/review, claude-opus-4-8),
+    runs the INDEPENDENT adversarial reviewer (independent_reviewer.py, claude-sonnet-4-6 — different
+    model + lens), checks the change is non-destructive, decides, and LOGS the agreement record. Then,
+    ONLY when the one-command kill switch TWO_KEY_AUTOMERGE=on, it ACTS:
+      • merge-eligible (gate PASS + reviewer APPROVE + non-destructive) → enable auto-merge on the PR.
+      • escalate (DESTRUCTIVE → author-intent HOLD; DISAGREEMENT → BLOCK) → post the plain-English
+        message ON THE PR so the author is the one notified; never merges.
+    With TWO_KEY_AUTOMERGE off/unset it degrades to decide+log+print only (today's manual behavior) —
+    the single reversible kill switch. Exit 0 = merge-eligible, 10 = escalate."""
     import importlib.util
     here = os.path.dirname(os.path.abspath(__file__))
     spec = importlib.util.spec_from_file_location("two_key_merge", os.path.join(here, "two_key_merge.py"))
@@ -688,16 +719,38 @@ def cmd_two_key(args) -> int:
                          pr_title=args.pr_title or os.environ.get("TWO_KEY_PR_TITLE", ""),
                          pr_body=args.pr_body or os.environ.get("TWO_KEY_PR_BODY", ""), files=files)
     d, rv = out["decision"], out["reviewer"]
+    enabled = tk.automerge_enabled()
     print("=" * 74)
     print(f"  TWO-KEY: gate={gate}  reviewer={rv['verdict']} (model={rv.get('model')})  "
           f"destructive={out['destructive']['destructive']}  agreed={d['agreed']}")
     print(f"  -> ACTION = {d['action'].upper()}" + (f"  ({d['escalation_kind']})" if d['escalation_kind'] else ""))
+    print(f"  TWO_KEY_AUTOMERGE={'on' if enabled else 'off (degrade to manual; no PR action)'}")
     print(f"  agreement-log: {json.dumps(tk.agreement_stats())}")
     print("=" * 74)
-    if d["action"] == "escalate":
-        print("\n--- PLAIN-ENGLISH ESCALATION (send to the human — NEVER a raw diff) ---\n")
-        print(out["escalation_text"])
-    return 0 if d["action"] == "merge" else 10
+
+    if d["action"] == "merge":
+        if not enabled:
+            print("\n  merge-eligible, but TWO_KEY_AUTOMERGE is OFF → not merging (manual gate). "
+                  "A human merges, or flip TWO_KEY_AUTOMERGE=on.")
+        elif not args.pr_number:
+            print("\n  merge-eligible + automerge ON, but no --pr-number → cannot enable auto-merge here.")
+        else:
+            rc, _o, err = _gh("pr", "merge", str(args.pr_number), "--repo", REPO_SLUG,
+                              "--auto", "--squash", "--delete-branch")
+            if rc == 0:
+                print(f"\n  AUTO-MERGE ENABLED on PR #{args.pr_number} — merges when required checks are green.")
+            else:
+                print(f"\n  WARNING: `gh pr merge --auto` failed on PR #{args.pr_number}: {err}")
+        return 0
+
+    # escalate: ON THE PR so the AUTHOR is notified (destructive=author-intent HOLD, disagreement=BLOCK).
+    print("\n--- PLAIN-ENGLISH ESCALATION (posted ON THE PR — NEVER a raw diff) ---\n")
+    print(out["escalation_text"])
+    if enabled:
+        _post_pr_comment(args.pr_number, out["escalation_text"])
+    else:
+        print("\n  (TWO_KEY_AUTOMERGE off → not posting to the PR automatically; route the text above.)")
+    return 10
 
 
 def cmd_simple(args, path) -> int:
@@ -763,9 +816,10 @@ def main(argv=None) -> int:
                     help="box-side `git pull --ff-only origin main` before applying, so the box "
                          "checkout (and the nightly) carry the just-merged DDL (the 'ship' flow)")
     an.add_argument("--reason", help="reason string recorded in the publish/apply log")
-    tk = sub.add_parser("two-key", help="two-key auto-merge decision: gate verdict AND an independent "
-                                        "reviewer must both approve + non-destructive, else escalate "
-                                        "(plain English). NEVER merges; exits 0=merge-eligible / 10=escalate.")
+    tk = sub.add_parser("two-key", help="two-key auto-merge: gate verdict AND an independent reviewer "
+                                        "must both approve + non-destructive → auto-merge; else HOLD on "
+                                        "the PR (plain English). Acts only when TWO_KEY_AUTOMERGE=on. "
+                                        "exits 0=merge-eligible / 10=escalate.")
     tk.add_argument("--files", nargs="*", help="the gated DDL/py files for this change")
     tk.add_argument("--staged", action="store_true")
     tk.add_argument("--pr-number", dest="pr_number")

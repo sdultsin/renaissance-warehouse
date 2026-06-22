@@ -47,6 +47,15 @@ AGREEMENT_LOG = os.environ.get(
 # Gate verdicts that count as the gate's KEY = PASS. The gate emits: pass | pass-with-warn | block.
 _GATE_PASS = {"pass", "pass-with-warn"}
 
+
+# ── the one-command kill switch ───────────────────────────────────────────────────────────────────
+def automerge_enabled() -> bool:
+    """The SINGLE kill switch. TWO_KEY_AUTOMERGE=on (case-insensitive) → the two-key flow may actually
+    merge / post on the PR. Anything else (unset, off, blank, garbage) → degrade to today's manual
+    behavior: decide + log + print only, never touch the PR. `=off` is the one-flip rollback."""
+    return os.environ.get("TWO_KEY_AUTOMERGE", "").strip().lower() == "on"
+
+
 # ── destructive detection (independent, deterministic) ────────────────────────────────────────────
 # We reuse the SAME taxonomy the gate's classify_ddl uses (DESTRUCTIVE | BREAKING-RENAME | LOCK-REWRITE |
 # DATA-DEPENDENT are the risky classes; ADD is safe) but compute it here with a self-contained regex
@@ -110,34 +119,49 @@ def decide(gate_verdict: str, reviewer_verdict: str, destructive: bool) -> dict:
 
 
 # ── plain-English escalation (what a NON-TECHNICAL human sees; never a raw diff) ───────────────────
+# Two genuinely different escalations, by trigger (Sam, 2026-06-22):
+#   DESTRUCTIVE → an AUTHOR-INTENT CONFIRMATION. Posted ON THE PR so the PERSON WHO WROTE IT is the one
+#     notified (not a generic "Sam approves this"). The only remaining human action in the whole system:
+#     the author confirming their OWN intent on an irreversible change. Confirm by merging / reply YES,
+#     or ignore to block. (The change is correct + the second key approved; the only open question is
+#     "did you, the author, mean to permanently delete this?" — which only the author can answer.)
+#   DISAGREEMENT → a BLOCK, NOT an approval request. The two automatic checks split (or the second key
+#     couldn't be confirmed), so we do NOT route anyone a yes/no coin-flip they can't adjudicate. We post
+#     the reviewer's plain-English concern on the PR for the AUTHOR to FIX (push a new commit) or escalate
+#     to Sam. There is deliberately NO "merge it anyway" path here — that path was the rubber-stamp.
 def plain_english_escalation(decision: dict, *, pr_number, pr_title: str, gate_verdict: str,
                              reviewer: dict, destructive: dict) -> str:
-    """Build the human-facing message. Leads with what's happening + the recommended action; no diff,
-    no jargon. Applies to BOTH triggers (destructive, disagreement)."""
-    head = f"*Warehouse change needs your OK*  (PR #{pr_number}: {pr_title or 'untitled'})"
+    """Build the human-facing message posted ON THE PR (so the author is the one notified). Leads with
+    what's happening + the recommended action; no diff, no jargon. Branches on the escalation trigger."""
     if decision["escalation_kind"] == "destructive":
+        # AUTHOR-INTENT CONFIRMATION — addressed to the author of this PR, on the PR itself.
         what = "; ".join(destructive.get("reasons") or ["makes a permanent/irreversible change"])
+        head = f"⚠️ *This change permanently deletes data — please confirm you meant to*  (PR #{pr_number}: {pr_title or 'untitled'})"
         return (f"{head}\n"
-                f"This change {what}. That permanently affects live data, so it is held for your "
-                f"approval and was NOT merged automatically.\n"
-                f"• To ALLOW it: reply *YES* (or merge PR #{pr_number}).\n"
-                f"• To BLOCK it: ignore this message, or reply *NO* — nothing changes.")
-    # disagreement (covers reviewer request_changes / unavailable / gate block)
+                f"@author — both automatic checks were happy with this change, but it **{what}**. "
+                f"Because that is irreversible, we did NOT auto-merge it: only YOU can confirm you "
+                f"intended to delete this.\n"
+                f"• If you DID mean to: confirm by **merging this PR** (or reply *YES* here) — it will go live.\n"
+                f"• If you did NOT: **ignore / close this PR** — nothing changes, nothing is deleted.")
+    # DISAGREEMENT → BLOCK. No "merge anyway"; the author fixes it or escalates.
+    head = f"🛑 *Held — the two automatic checks disagreed, so this was NOT merged*  (PR #{pr_number}: {pr_title or 'untitled'})"
     if reviewer.get("verdict") == "request_changes":
         why = reviewer.get("summary") or "; ".join(reviewer.get("reasons") or []) \
-            or "the independent reviewer flagged a possible problem"
-        lead = (f"Our automatic safety check passed, but a SECOND independent reviewer disagreed and "
-                f"would NOT approve it: {why}")
+            or "a possible problem"
+        lead = (f"The safety gate passed, but the second independent reviewer would NOT approve it: {why}")
     elif reviewer.get("verdict") == "unavailable":
-        lead = ("The automatic safety check passed, but we could not get a confirming second opinion "
-                "(the independent reviewer didn't respond), so we did not merge on a single check.")
-    else:  # gate itself blocked (or non-pass) while reviewer approved, or any other split
+        lead = ("The safety gate passed, but the second independent reviewer could not be reached, so "
+                "we could not confirm a second opinion — and we never merge on a single unconfirmed check.")
+    else:  # gate blocked / non-pass while reviewer approved, or any other split
         lead = ("The two automatic checks did not agree on this change "
                 f"(safety gate: {gate_verdict}; independent reviewer: {reviewer.get('verdict')}).")
-    return (f"{head}\n{lead}\n"
-            f"It was held for you and NOT merged automatically.\n"
-            f"• If you want it in: reply *YES* (or merge PR #{pr_number}).\n"
-            f"• If not: ignore this — nothing changes.")
+    return (f"{head}\n"
+            f"@author — {lead}\n"
+            f"This is **blocked** on purpose: we don't ask a human to rubber-stamp a check the system "
+            f"isn't sure about. Nothing was merged.\n"
+            f"• To proceed: **address the concern above and push a new commit** to this PR — the two-key "
+            f"check re-runs automatically.\n"
+            f"• If you believe the reviewer is wrong: reply here and **escalate to Sam** to make the call.")
 
 
 # ── agreement log (append-only JSONL; the data that unlocks single-key later) ──────────────────────
