@@ -101,6 +101,17 @@ def test_drift(tmp):
     check("repo-ahead lists v106 (info, not alerted)", r["repo_ahead"] == [106], f"got {r['repo_ahead']}")
     check("max_applied=105", r["max_applied"] == 105, f"got {r['max_applied']}")
 
+    # Baseline suppresses known drift -> alert only on NEW: baseline {96} leaves only v105 alerting.
+    rb = drift.compute_drift(snapshot_path=snap, repo_root=repo, ref="HEAD", baseline={96})
+    check("baseline {96} -> v96 baselined, only v105 alerts",
+          [d["version"] for d in rb["missing"]] == [105]
+          and [d["version"] for d in rb["baselined"]] == [96], f"missing={rb['missing']} baselined={rb['baselined']}")
+    # load_baseline parses numbers + ignores comments/blanks
+    bfile = os.path.join(tmp, "baseline.txt")
+    with open(bfile, "w") as fh:
+        fh.write("# comment\n96  # inline\n\n105\nnotanumber\n")
+    check("load_baseline parses {96,105}", drift.load_baseline(bfile) == {96, 105}, str(drift.load_baseline(bfile)))
+
     # Clean case: every applied file is committed under its exact name
     snap2 = os.path.join(tmp, "snap2.duckdb")
     _make_snapshot(snap2, [(103, "103_a.sql"), (104, "104_b.sql"), (105, "105_y.sql"), (106, "106_z.sql")])

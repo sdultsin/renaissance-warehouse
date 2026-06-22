@@ -27,6 +27,8 @@ Env:
   WAREHOUSE_CURRENT_DUCKDB  serving snapshot (read-only)   default /opt/duckdb/warehouse_current.duckdb
   WAREHOUSE_REPO_ROOT       repo checkout                  default /root/renaissance-warehouse
   SCHEMA_REPO_REF           ref to compare against         default origin/main
+  SCHEMA_DRIFT_BASELINE     known-uncommitted versions to suppress (alert only on NEW drift)
+                            default <repo>/scripts/schema_db_repo_drift_baseline.txt
 """
 from __future__ import annotations
 
@@ -37,6 +39,28 @@ import sys
 CURRENT_DUCKDB = os.environ.get("WAREHOUSE_CURRENT_DUCKDB", "/opt/duckdb/warehouse_current.duckdb")
 REPO_ROOT = os.environ.get("WAREHOUSE_REPO_ROOT", "/root/renaissance-warehouse")
 REF = os.environ.get("SCHEMA_REPO_REF", "origin/main")
+# Baseline = applied versions ALREADY known to be uncommitted (benign historical artifacts + residue
+# being cleaned). They're EXCLUDED from the alerting DBDRIFT count (reported as `baselined`, info only)
+# so the guard fires only on NEW drift — a watchdog that re-alerts a known, understood state is noise.
+# Default = a version-controlled file next to this script; override with SCHEMA_DRIFT_BASELINE.
+BASELINE_PATH = os.environ.get("SCHEMA_DRIFT_BASELINE",
+                               os.path.join(REPO_ROOT, "scripts", "schema_db_repo_drift_baseline.txt"))
+
+
+def load_baseline(path: str = None) -> set:
+    """Parse the baseline file -> {version:int}. One number per line; `#` comments + blanks ignored;
+    an inline `# ...` comment after a number is fine. Missing/unreadable file -> empty set (no baseline)."""
+    p = path if path is not None else BASELINE_PATH
+    out: set = set()
+    try:
+        with open(p) as f:
+            for line in f:
+                tok = line.split("#", 1)[0].strip()
+                if tok.isdigit():
+                    out.add(int(tok))
+    except OSError:
+        pass
+    return out
 
 
 def applied_versions(snapshot_path: str) -> dict:
@@ -72,28 +96,30 @@ def repo_ddl_versions(repo_root: str, ref: str) -> dict:
 
 
 def compute_drift(snapshot_path: str = CURRENT_DUCKDB, repo_root: str = REPO_ROOT,
-                  ref: str = REF) -> dict:
+                  ref: str = REF, baseline: set = None) -> dict:
     """Pure comparison: applied DB versions vs committed repo DDL. Returns a structured report.
     `missing` = the ALERTING signal: an applied DDL whose FILE isn't committed at <ref> (robust to
-    number reuse — keying on the number alone would let a reused number mask the drift). `repo_ahead`
-    (committed-not-yet-applied) is info-only."""
+    number reuse — keying on the number alone would let a reused number mask the drift), EXCLUDING any
+    version in `baseline` (those go to `baselined`, info only). `repo_ahead` (committed-not-yet-applied)
+    is info-only."""
+    if baseline is None:
+        baseline = load_baseline()
     applied = applied_versions(snapshot_path)
     repo = repo_ddl_versions(repo_root, ref)
     by_num, basenames = repo["by_num"], repo["basenames"]
-    missing = []
+    missing, baselined = [], []
     for v, sql_file in sorted(applied.items()):
         base = os.path.basename(sql_file) if sql_file else ""
-        if base:
-            if base not in basenames:  # the exact applied DDL file is not committed -> drift
-                kind = "file-not-in-repo" if v not in by_num else "number-reused"
-                missing.append({"version": v, "applied_as": sql_file,
-                                "repo": by_num.get(v), "kind": kind})
-        elif v not in by_num:          # no filename recorded -> fall back to the number
-            missing.append({"version": v, "applied_as": sql_file, "repo": None, "kind": "number-missing"})
+        drifted = (base and base not in basenames) or (not base and v not in by_num)
+        if not drifted:
+            continue
+        kind = ("file-not-in-repo" if v not in by_num else "number-reused") if base else "number-missing"
+        item = {"version": v, "applied_as": sql_file, "repo": by_num.get(v), "kind": kind}
+        (baselined if v in baseline else missing).append(item)
     repo_ahead = sorted(v for v in by_num if v not in applied)
     return {"applied_count": len(applied), "repo_count": len(by_num),
             "max_applied": max(applied) if applied else 0, "max_repo": max(by_num) if by_num else 0,
-            "missing": missing, "repo_ahead": repo_ahead}
+            "missing": missing, "baselined": baselined, "repo_ahead": repo_ahead}
 
 
 def _drift_versions(report: dict) -> list:
@@ -115,6 +141,9 @@ def main() -> int:
         repo_hint = f" (repo has '{d['repo']}' at that number)" if d.get("repo") else ""
         print(f"  DRIFT [{d['kind']}]: v{d['version']} applied as '{d['applied_as']}' "
               f"is not committed at {REF}{repo_hint}")
+    if report.get("baselined"):
+        print(f"  info  baselined (known-uncommitted, suppressed): "
+              f"{','.join('v%d' % d['version'] for d in report['baselined'])}")
     if report["repo_ahead"]:
         print(f"  info  repo-ahead (committed, not yet applied — normal): "
               f"{','.join('v%d' % v for v in report['repo_ahead'][:20])}"
