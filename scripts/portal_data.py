@@ -383,8 +383,29 @@ data["sb_ratio"] = safe("sb_ratio", lambda: (lambda sent, booked: {
 # ───────────────────────────────────────────────────────── Partner summary
 # Partner of a booked meeting from core.meeting.partner, label-NORMALIZED across eras
 # (Phase-0 edge case #2). MTD + all-time per partner. Email-only (hybrid filter).
-# Revenue MODELS (PPA / PPA+10% / 50-50) are business constants kept client-side; the
-# warehouse commercial_model from core.funding_partner is included as a reference.
+# Revenue MODELS (PPA / PPA + 10% / 50/50 Rev Share) are now SOURCED FROM DuckDB
+# (core.funding_partner.commercial_model + rev_share_pct) via models_ref below — the portal
+# cards read that instead of hardcoded labels (Sam's directive: every value from DuckDB).
+def _partner_model_label(commercial_model, rev_share_pct):
+    """Display label for a partner's commercial model, built from the warehouse dim
+    (core.funding_partner). Mirrors the labels the portal previously hardcoded, now sourced
+    from DuckDB. Returns None when no model is on file -> the card renders '—'."""
+    if not commercial_model:
+        return None
+    pct = None
+    if rev_share_pct is not None:
+        try:
+            pct = int(round(float(rev_share_pct)))
+        except (TypeError, ValueError):
+            pct = None
+    if commercial_model == "ppa":
+        return "PPA"
+    if commercial_model == "rev_share":
+        return f"{pct}/{100 - pct} Rev Share" if pct is not None else "Rev Share"
+    if commercial_model == "ppa_plus_rev_share":
+        return f"PPA + {pct}%" if pct is not None else "PPA + Rev Share"
+    return commercial_model.replace("_", " ").title()
+
 data["partners"] = safe("partners", lambda: {
     "all_time": q(f"""
         SELECT {PARTNER_NORM} AS partner, COUNT(*) AS meetings
@@ -410,11 +431,18 @@ data["partners"] = safe("partners", lambda: {
         WHERE {EMAIL_WHERE} AND m.posted_at >= current_date - INTERVAL '14 months'
         GROUP BY date_trunc('month', m.posted_at), 2
         ORDER BY date_trunc('month', m.posted_at), meetings DESC"""),
-    # Reference: commercial models / tiers from the warehouse dim (NOT the source of
-    # the portal's rev-model labels — those stay hardcoded — just provenance).
-    "models_ref": safe("partner_models", lambda: q("""
-        SELECT display_name AS partner, commercial_model, tier
-        FROM core.funding_partner ORDER BY 1""")),
+    # Commercial model PER PARTNER — the SOURCE OF TRUTH for the portal's rev-model labels
+    # (was hardcoded in index.html). Emits a display-ready `model` (built from commercial_model
+    # + rev_share_pct) plus the raw fields. Partner label normalized to the meeting-side card
+    # key ('Llama Funding' -> 'Llama'). NULL model (no terms on file) -> model=None -> card '—'.
+    "models_ref": safe("partner_models", lambda: [
+        {**r,
+         "partner": ("Llama" if r["partner"] == "Llama Funding" else r["partner"]),
+         "model": _partner_model_label(r.get("commercial_model"), r.get("rev_share_pct"))}
+        for r in q("""
+            SELECT display_name AS partner, commercial_model, rev_share_pct, tier
+            FROM core.funding_partner ORDER BY 1""")
+    ]),
 })
 
 # ───────────────────────────────────────────────────── Top CMs (all-time meetings)
