@@ -277,20 +277,36 @@ def test_two_key_decide(tmp):
           and "*yes*" not in utxt.lower(), utxt)
 
     # (3b) the kill switch: TWO_KEY_AUTOMERGE must gate all action; only the literal 'on' enables it.
-    import importlib as _il
+    #     Point RENAISSANCE_ENV at a nonexistent file so the .env fallback is hermetic (no local .env).
     _saved = os.environ.get("TWO_KEY_AUTOMERGE")
+    _saved_env = os.environ.get("RENAISSANCE_ENV")
+    os.environ["RENAISSANCE_ENV"] = os.path.join(tmp, "no_such.env")
     try:
         for val, exp in [("on", True), ("ON", True), (" On ", True), ("off", False),
                          ("", False), ("yes", False), ("1", False)]:
             os.environ["TWO_KEY_AUTOMERGE"] = val
             check(f"automerge_enabled({val!r}) -> {exp}", tk.automerge_enabled() == exp, val)
         os.environ.pop("TWO_KEY_AUTOMERGE", None)
-        check("automerge_enabled() unset -> False", tk.automerge_enabled() is False, "unset")
+        check("automerge_enabled() unset (no env file) -> False", tk.automerge_enabled() is False, "unset")
+        # .env fallback: with no shell var, an `=on` in the env file enables it.
+        envp = os.path.join(tmp, "wired.env")
+        open(envp, "w").write("FOO=bar\nTWO_KEY_AUTOMERGE=on\n")
+        os.environ["RENAISSANCE_ENV"] = envp
+        check("automerge_enabled() reads .env fallback on", tk.automerge_enabled() is True, "env on")
+        open(envp, "w").write("TWO_KEY_AUTOMERGE=off\n")
+        check("automerge_enabled() reads .env fallback off", tk.automerge_enabled() is False, "env off")
+        # shell var overrides the file.
+        os.environ["TWO_KEY_AUTOMERGE"] = "on"
+        check("shell var overrides .env (on beats file off)", tk.automerge_enabled() is True, "override")
     finally:
         if _saved is None:
             os.environ.pop("TWO_KEY_AUTOMERGE", None)
         else:
             os.environ["TWO_KEY_AUTOMERGE"] = _saved
+        if _saved_env is None:
+            os.environ.pop("RENAISSANCE_ENV", None)
+        else:
+            os.environ["RENAISSANCE_ENV"] = _saved_env
 
     # (4) agreement log + stats round-trip.
     logp = os.path.join(tmp, "agree.jsonl")
