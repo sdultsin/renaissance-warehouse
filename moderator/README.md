@@ -47,6 +47,36 @@ on a destructive/ambiguous call) → commit → PR → auto-merge → box `git p
 a version, or hand-coordinates concurrency. **Canonical procedure: `moderator/SHIP-FLOW.md`** (also the
 `warehouse-ship` skill). The hardened gate below is what makes that final carry-through safe to automate.
 
+## Two-key auto-merge (`scripts/two_key_merge.py` + `scripts/independent_reviewer.py`)
+The ship flow auto-merges a PR **only when ALL of**: (1) the moderator **gate** = PASS, (2) an
+**independent adversarial reviewer** = APPROVE, and (3) the change is **non-destructive** — then it
+enables auto-merge with zero human action. Otherwise it **holds**, posting a plain-English message
+**on the PR** (never a raw diff) so the change's **author** is the one notified, in one of exactly two
+ways (DECISION 2026-06-22 refinement):
+- **Destructive → author-intent HOLD:** asks the author to confirm they meant an irreversible delete
+  (*confirm by merging / reply YES, or ignore to block*) — the only human touch left, and it is the
+  author confirming their **own** intent, not a detached "Sam approves" rubber-stamp.
+- **Disagreement → BLOCK** (gate vs reviewer split, or reviewer unavailable): **no "merge anyway"**;
+  the PR comment gives the reviewer's concern for the author to fix (push a commit → re-runs) or escalate.
+
+Rationale (Sam, 2026-06-22): a non-technical human clicking "yes" on every merge is theater; the
+per-change reviewer should be a second *independent machine*, not a rubber-stamp human — and the only
+residual human action is an author confirming their own intent on something irreversible.
+- **Independence is the point.** The reviewer (`scripts/independent_reviewer.py`) uses a **different
+  model** — `claude-sonnet-4-6` vs the gate's `claude-opus-4-8` — AND a **different lens**: it is an
+  adversarial *code reviewer* (correctness / safety / "does the diff do what was asked?"), given the PR
+  diff + title/body, NOT the schema rules or catalog. It does not import the gate engine. So it is a
+  genuinely orthogonal second check, not the gate run twice.
+- **Decision + log** (`scripts/two_key_merge.py`): `decide()` is the pure 3-input rule; `run_two_key()`
+  captures the diff, runs the reviewer, decides, and appends `{gate_verdict, reviewer_verdict, agreed?,
+  destructive?, merged?}` to the agreement log (`logs/two_key_agreement.jsonl`, override
+  `TWO_KEY_AGREEMENT_LOG`). That agreement-rate data is what lets Sam collapse to single-key (gate only)
+  in ~2 weeks once the two keys consistently agree. Run it via `moderator_client.py two-key --files …`.
+- **Fail-safe + reversible.** A flaky/unreachable gate or reviewer is `unavailable` → BLOCK, never
+  auto-merge. The kill switch is read in code (`automerge_enabled()`): `TWO_KEY_AUTOMERGE=on` enables the
+  merge/PR-comment actions; **off/unset degrades to decide+log+print only** (today's manual-gate behavior),
+  and `=off` is the one-flip rollback. ENABLED 2026-06-22; see `SHIP-FLOW.md` step 5.2.
+
 ## Auto-assigned DDL numbers (`/apply/next-version`) — no more collisions
 DDL `version` numbers used to be hand-picked from the filename prefix; a writer on a STALE local
 checkout could pick a number already taken (the 2026-06-22 v96 incident: applied as 96 while the repo
