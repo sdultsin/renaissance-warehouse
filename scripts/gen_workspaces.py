@@ -43,12 +43,14 @@ for d, slug, sent, opps, rep in cur.fetchall():
     b = bucket(d, slug); b["sent"]+=int(sent or 0); b["opps"]+=int(opps or 0); b["replies"]+=int(rep or 0)
 pg.close()
 
-# 2) email meetings from snapshot core.meeting (campaign->workspace via raw_pipeline_campaigns)
+# 2) email meetings from snapshot core.meeting — attribute by the meeting's OWN clean
+#    workspace_slug (QA FIX 2026-06-21: was joining through raw_pipeline_campaigns.workspace_id,
+#    a dirty/stale codename surface that dropped meetings to '(unmapped)'; core.meeting.workspace_slug
+#    is the ingest-clean key that matches the Funding Form per-workspace bookings).
 con = duckdb.connect("/opt/duckdb/warehouse_current.duckdb", read_only=True)
 mrows = con.execute("""
-  WITH camp AS (SELECT campaign_id, any_value(workspace_id) AS ws FROM raw_pipeline_campaigns GROUP BY campaign_id)
-  SELECT CAST(m.posted_at AS DATE)::text, COALESCE(c.ws,'(unmapped)'), COUNT(*)
-  FROM core.meeting m LEFT JOIN camp c ON c.campaign_id=m.campaign_id
+  SELECT CAST(m.posted_at AS DATE)::text, COALESCE(m.workspace_slug,'(unmapped)'), COUNT(*)
+  FROM core.meeting m
   WHERE CAST(m.posted_at AS DATE) >= DATE '2026-05-14' AND m.is_duplicate_of IS NULL AND m.channel='Email'
   GROUP BY 1,2
 """).fetchall()
