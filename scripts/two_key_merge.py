@@ -49,11 +49,32 @@ _GATE_PASS = {"pass", "pass-with-warn"}
 
 
 # ── the one-command kill switch ───────────────────────────────────────────────────────────────────
+def _env_file_automerge() -> str | None:
+    """Read TWO_KEY_AUTOMERGE from the canonical Renaissance .env (RENAISSANCE_ENV) as a fallback, so the
+    kill switch has ONE home that works on any writer machine without exporting a shell var. os.environ
+    still wins (a shell flip overrides the file)."""
+    path = os.environ.get("RENAISSANCE_ENV", "/Users/sam/Documents/Claude Code/Renaissance/.env")
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith("TWO_KEY_AUTOMERGE="):
+                    return line.split("=", 1)[1].strip().strip('"').strip("'")
+    except Exception:
+        return None
+    return None
+
+
 def automerge_enabled() -> bool:
     """The SINGLE kill switch. TWO_KEY_AUTOMERGE=on (case-insensitive) → the two-key flow may actually
     merge / post on the PR. Anything else (unset, off, blank, garbage) → degrade to today's manual
-    behavior: decide + log + print only, never touch the PR. `=off` is the one-flip rollback."""
-    return os.environ.get("TWO_KEY_AUTOMERGE", "").strip().lower() == "on"
+    behavior: decide + log + print only, never touch the PR. `=off` is the one-flip rollback. Source of
+    truth: os.environ first (the box sets it in /etc/environment; a shell can flip it), then the
+    canonical .env (RENAISSANCE_ENV) as a fallback so writer machines need no shell export."""
+    val = os.environ.get("TWO_KEY_AUTOMERGE")
+    if val is None or val.strip() == "":
+        val = _env_file_automerge() or ""
+    return val.strip().lower() == "on"
 
 
 # ── destructive detection (independent, deterministic) ────────────────────────────────────────────
