@@ -48,9 +48,14 @@ def run_esp_matrix(ctx: RunContext) -> PhaseResult:
         pass
     conn.execute(f"ATTACH '{pg_url}' AS pg (TYPE postgres, READ_ONLY)")
 
+    # arg_max over the upsert-mirror: raw_pipeline_campaigns is 1 row/campaign, so a
+    # _run_id=(latest) filter silently drops frozen/deleted-upstream campaigns from the
+    # infra split once _run_id ever diverges (same bug class as the now-fixed
+    # dashboard_data.py:108; mirrors dash.lens_overview__sending_daily, sql/ddl/86). Same
+    # output today (single _run_id), no freeze bug going forward.
     latest_campaigns = (
-        "(SELECT campaign_id, infra_type FROM raw_pipeline_campaigns "
-        " WHERE _run_id = (SELECT _run_id FROM raw_pipeline_campaigns ORDER BY _loaded_at DESC LIMIT 1))"
+        "(SELECT campaign_id, arg_max(infra_type, _loaded_at) AS infra_type "
+        " FROM raw_pipeline_campaigns GROUP BY campaign_id)"
     )
     latest_reply_intent = (
         "(SELECT * FROM raw_pipeline_reply_intent_classifications "
