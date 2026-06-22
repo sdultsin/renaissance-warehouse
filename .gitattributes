@@ -1,0 +1,6 @@
+# Pin DDL files to LF so the committed blob is byte-identical to what the moderator applies.
+# The moderator's `apply == commit` check (moderator/bin/moderator_apply.py) compares sha256(committed
+# blob bytes) to the queued content sha; an off-box writer with core.autocrlf would otherwise commit a
+# CRLF/LF-shifted blob and get a false "not committed" block. (The check ALSO normalizes EOL as a
+# fallback — this is belt-and-suspenders so the exact-match fast path always hits for these files.)
+sql/ddl/*.sql text eol=lf

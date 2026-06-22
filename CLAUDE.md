@@ -19,8 +19,11 @@ Postgres (`moderator` schema); the catalog/lineage stays in DuckDB.
 **Whenever you propose a schema change — a new/edited `sql/ddl/NN_*.sql`, or an
 `entities|sources|scripts/*.py` that changes an INSERT column list — you MUST:**
 
-1. Claim the next DDL number atomically (the `ddl-number` wlock convention), write the
-   change in `sql/ddl/NN_*.sql` and/or the entity `.py`.
+1. Claim the next DDL number from the moderator — `python scripts/moderator_client.py next-version`
+   (the single authority across ALL writers; it reserves the number atomically so two people can't
+   collide, the way David's stale-local v96 did 2026-06-22). The bus-local `ddl-number` wlock still
+   exists but is now advisory — `next-version` is authoritative. Write the change in
+   `sql/ddl/<that-number>_*.sql` and/or the entity `.py`.
 2. Tag intent at the top of the DDL: `-- @gate: add | rename A->B | drop | alter-type`
    and `-- Depends on NN`. (So a rename reads as a rename and apply-order is checkable.)
 3. Run the moderator and read the checklist — then drive the **bounded auto-fix loop**:
@@ -52,6 +55,12 @@ deliberate (a gate that refused un-gated DDL pre-calibration would break the oth
 The flip — R1–R4 → `tier='block'` + `SCHEMA_GATE_ENFORCE_APPLY=1` + `MODERATOR_LLM_FAIL_CLOSED=1`
 (deep-review fails CLOSED) — is a separate, Sam-gated step after a clean WARN/calibration week.
 Scopes (in `/opt/duckdb/allowed_tokens.txt`, 3rd column): `reader` < `editor` (review/record) < `admin` (rules).
+
+NOTE — this WARN-hold is about the *content* gate (refusing un-reviewed DDL). It is **independent** of
+the **`apply == commit`** binding (`MODERATOR_REQUIRE_COMMITTED=enforce`, ON by default), which is a
+*drift* control, not a content judgement: `apply-now` refuses a DDL whose exact content isn't committed
+at `origin/main`, and refuses a version-number collision — so the live DB can't drift ahead of the repo
+(the 2026-06-22 v96 fix). That enforcement is live regardless of the content-gate flip.
 
 ### The queryable contract (the "manager with vision over the whole DB")
 **Catalog/lineage — DuckDB** (read-derived, rebuilt nightly from live `information_schema` by

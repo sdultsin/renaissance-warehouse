@@ -22,6 +22,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import subprocess
 from collections import defaultdict
 
 import moderator_common as mc
@@ -603,6 +604,101 @@ def _ddl_version_of(path: str) -> int | None:
         return int(stem)
     except ValueError:
         return None
+
+
+# ── DDL/schema_version ALLOCATOR (auto-assign the next number; collision-proof across writers) ────
+# The v96 incident: David picked version 96 from a STALE local checkout while origin/main was already
+# at 113 — a number collision the bus-local `ddl-number` wlock can't prevent (a laptop writer bypasses
+# it). The moderator IS the chokepoint every writer hits, so the authoritative allocator lives here.
+# next = 1 + max over EVERY source that could already own a number; reserved atomically so two
+# concurrent callers never get the same one. Never reuses a GAP (a gap number may be applied-but-not-
+# in-repo or vice versa — reuse would re-collide).
+def _ensure_version_reservation(cur) -> None:
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS moderator.version_reservation ("
+        "  version integer PRIMARY KEY,"
+        "  reserved_by text,"
+        "  request_id text,"
+        "  reserved_at timestamptz NOT NULL DEFAULT now())")
+
+
+def _fetch_origin_main() -> None:
+    """Best-effort `git fetch origin main` so origin/main is current before we read it (a number that
+    just merged upstream but isn't yet on this box would otherwise be UNDERCOUNTED -> a re-collision,
+    the exact class we prevent). Tolerates failure: a stale ref only undercounts, and the apply-time
+    apply==commit check is the backstop. Disable with MODERATOR_APPLY_FETCH=0 (shared with apply)."""
+    if os.environ.get("MODERATOR_APPLY_FETCH", "1") in ("0", "false", "False", ""):
+        return
+    try:
+        subprocess.run(["git", "-C", mc.WAREHOUSE_ROOT, "fetch", "origin", "main"],
+                       capture_output=True, timeout=30)
+    except Exception:
+        pass
+
+
+def _max_repo_ddl_version() -> int:
+    """Highest NN among committed sql/ddl/NN_*.sql at origin/main (the repo's view). 0 if unknown."""
+    try:
+        p = subprocess.run(
+            ["git", "-C", mc.WAREHOUSE_ROOT, "ls-tree", "-r", "--name-only", "origin/main", "sql/ddl/"],
+            capture_output=True, text=True, timeout=30)
+        if p.returncode != 0:
+            return 0
+        best = 0
+        for line in p.stdout.splitlines():
+            stem = os.path.basename(line.strip()).split("_", 1)[0]
+            if stem.isdigit():
+                best = max(best, int(stem))
+        return best
+    except Exception:
+        return 0
+
+
+def _max_applied_version() -> int:
+    """Highest version applied in the live DB (core.schema_version, read off the serving snapshot)."""
+    try:
+        with mc.duckdb_ro() as con:
+            v = con.execute("SELECT max(version) FROM core.schema_version").fetchone()[0]
+            return int(v) if v is not None else 0
+    except Exception:
+        return 0
+
+
+def next_schema_version(actor: str | None = None, request_id: str | None = None) -> dict:
+    """Allocate + RESERVE the next free DDL/schema_version number, authoritatively across ALL writers.
+    next = 1 + max over {committed sql/ddl/NN at origin/main, applied core.schema_version, in-flight
+    apply_queue+approval_ledger, prior reservations}. The reserve is an atomic PK insert with retry,
+    so two concurrent callers get DISTINCT numbers. Returns {version, reserved, sources, suggested_file}."""
+    _fetch_origin_main()  # current origin/main before reading it (don't undercount a just-merged number)
+    repo_max = _max_repo_ddl_version()
+    applied_max = _max_applied_version()
+    sources = {"repo_max": repo_max, "applied_max": applied_max}
+    with mc.pg_conn() as c, c.cursor() as cur:
+        _ensure_version_reservation(cur)
+        cur.execute("SELECT coalesce(max(ddl_version),0) FROM moderator.apply_queue "
+                    "WHERE status IN ('queued','reviewing','applying')")
+        queue_max = cur.fetchone()[0] or 0
+        cur.execute("SELECT coalesce(max(ddl_version),0) FROM moderator.approval_ledger")
+        ledger_max = cur.fetchone()[0] or 0
+        sources.update(queue_max=queue_max, ledger_max=ledger_max)
+        base = max(repo_max, applied_max, queue_max, ledger_max)
+        # Reserve atomically: candidate = max(base, max(reservation))+1; INSERT; on PK clash bump+retry.
+        # autocommit conn -> a failed INSERT is its own rolled-back txn, so the retry runs clean.
+        for _ in range(50):
+            cur.execute("SELECT coalesce(max(version),0) FROM moderator.version_reservation")
+            res_max = cur.fetchone()[0] or 0
+            candidate = max(base, res_max) + 1
+            try:
+                cur.execute(
+                    "INSERT INTO moderator.version_reservation (version, reserved_by, request_id) "
+                    "VALUES (%s,%s,%s)", (candidate, actor or "?", request_id))
+                sources["reservation_max_before"] = res_max
+                return {"version": candidate, "reserved": True, "sources": sources,
+                        "suggested_file": f"sql/ddl/{candidate}_<name>.sql"}
+            except Exception:
+                continue  # another caller grabbed `candidate` between our read + insert — retry
+    return {"version": None, "reserved": False, "sources": sources,
+            "error": "could not reserve a version after 50 attempts (contention?) — retry"}
 
 
 # ── §8 rule-evolution engine: deterministic weekly detection -> rule_proposal ────────────────────
