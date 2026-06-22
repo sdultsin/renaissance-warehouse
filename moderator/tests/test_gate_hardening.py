@@ -205,6 +205,69 @@ def test_cli_contract(tmp):
               f"DBDRIFT={m.group(1)} VERSIONS={m.group(2)}")
 
 
+def test_two_key_decide(tmp):
+    """two_key_merge.decide() truth table + destructive detection + plain-English escalation guarantees.
+    Pure logic — no Anthropic key, no Postgres, no box (the LLM reviewer is mocked out of the decision)."""
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("two_key_merge", os.path.join(SCRIPTS, "two_key_merge.py"))
+    tk = importlib.util.module_from_spec(spec); spec.loader.exec_module(tk)
+
+    # (1) decide(): merge ONLY on gate-pass + approve + non-destructive; else escalate (tagged).
+    cases = [
+        ("pass", "approve", False, "merge", None, True),
+        ("pass-with-warn", "approve", False, "merge", None, True),
+        ("pass", "request_changes", False, "escalate", "disagreement", False),
+        ("block", "approve", False, "escalate", "disagreement", False),
+        ("pass", "approve", True, "escalate", "destructive", True),       # destructive trumps approve
+        ("pass", "request_changes", True, "escalate", "destructive", False),
+        ("pass", "unavailable", False, "escalate", "disagreement", False),  # unconfirmed key never merges
+        ("block", "request_changes", False, "escalate", "disagreement", True),
+    ]
+    for g, r, dz, ea, ek, eag in cases:
+        d = tk.decide(g, r, dz)
+        check(f"decide gate={g}/rev={r}/destr={dz} -> {ea}/{ek}",
+              d["action"] == ea and d["escalation_kind"] == ek and d["agreed"] == eag, str(d))
+
+    # (2) detect_destructive(): drops/deletes/renames/type-changes are destructive; ADD/CREATE are not;
+    #     a DROP mentioned only in a comment must NOT false-flag.
+    dtests = [
+        (["ALTER TABLE core.x ADD COLUMN IF NOT EXISTS y DOUBLE;"], False),
+        (["DROP TABLE core.x;"], True),
+        (["ALTER TABLE core.x DROP COLUMN y;"], True),
+        (["DELETE FROM core.x WHERE id=1;"], True),
+        (["ALTER TABLE core.x RENAME COLUMN a TO b;"], True),
+        (["ALTER TABLE core.x ALTER COLUMN a SET DATA TYPE INTEGER;"], True),
+        (["CREATE OR REPLACE VIEW core.v AS SELECT 1;"], False),
+        (["-- IRREVERSIBLE: drop_column core.x.y drops data\nALTER TABLE core.x ADD COLUMN z INT;"], False),
+    ]
+    for sqls, exp in dtests:
+        check(f"detect_destructive {sqls[0][:38]!r} -> {exp}",
+              tk.detect_destructive(sqls)["destructive"] == exp, str(tk.detect_destructive(sqls)))
+
+    # (3) plain-English escalation: human-facing, actionable, and NEVER contains a raw diff/code block.
+    esc_d = tk.decide("pass", "approve", True)
+    txt = tk.plain_english_escalation(esc_d, pr_number=7, pr_title="t", gate_verdict="pass",
+                                      reviewer={"verdict": "approve"},
+                                      destructive={"destructive": True, "reasons": ["drops a table (and all its data)"]})
+    check("destructive escalation is plain-English + actionable",
+          "permanently" in txt.lower() and "YES" in txt and "```" not in txt, txt)
+    dis_d = tk.decide("pass", "request_changes", False)
+    dtxt = tk.plain_english_escalation(dis_d, pr_number=8, pr_title="t", gate_verdict="pass",
+                                       reviewer={"verdict": "request_changes", "summary": "the migration silently no-ops",
+                                                 "reasons": ["x"]},
+                                       destructive={"destructive": False, "reasons": []})
+    check("disagreement escalation is plain-English + no diff",
+          "second independent reviewer" in dtxt.lower() and "```" not in dtxt and "YES" in dtxt, dtxt)
+
+    # (4) agreement log + stats round-trip.
+    logp = os.path.join(tmp, "agree.jsonl")
+    tk.log_agreement({"agreed": True, "action": "merge", "merged": True}, logp)
+    tk.log_agreement({"agreed": False, "action": "escalate", "merged": False}, logp)
+    s = tk.agreement_stats(logp)
+    check("agreement_stats counts total/agreed/escalated",
+          s["total"] == 2 and s["agreed"] == 1 and s["escalated"] == 1 and s["agreement_rate_pct"] == 50.0, str(s))
+
+
 def main() -> int:
     with tempfile.TemporaryDirectory(prefix="gate_hardening_test_") as tmp:
         d = os.path.join(tmp, "d"); os.makedirs(d, exist_ok=True)
@@ -212,6 +275,7 @@ def main() -> int:
         test_committed(tmp)
         test_engine_maxes(tmp)
         test_cli_contract(tmp)
+        test_two_key_decide(tmp)
     print(f"\n{_PASS} passed, {_FAIL} failed")
     return 1 if _FAIL else 0
 

@@ -30,6 +30,12 @@ Commands:
                                                   serving snapshot -> visible to readers in minutes,
                                                   no nightly wait, no SSH. (Default path is still:
                                                   it applies on the nightly. apply-now = make it now.)
+  two-key [--files ...] [--pr-number N]          two-key auto-merge decision for a PR: GATE verdict AND
+                                                  an INDEPENDENT reviewer (claude-sonnet-4-6, different
+                                                  model+lens) must BOTH approve + the change be
+                                                  non-destructive, else escalate in PLAIN ENGLISH. Logs
+                                                  the agreement record. NEVER merges; exit 0=merge-eligible
+                                                  / 10=escalate.
   rules | issues [--status open] | catalog [--table T --column C] | ledger | apply-queue
 """
 from __future__ import annotations
@@ -652,6 +658,48 @@ def cmd_apply_now(args) -> int:
     return 0 if res.get("ok") else 1
 
 
+def cmd_two_key(args) -> int:
+    """Two-key auto-merge decision for a PR (DECISION 2026-06-22). Gets the GATE verdict from /review
+    (the existing moderator gate, claude-opus-4-8), then runs the INDEPENDENT adversarial reviewer
+    (scripts/independent_reviewer.py, claude-sonnet-4-6 — different model + lens), checks the change is
+    non-destructive, and decides merge-vs-escalate. Logs the agreement record. PRINTS a plain-English
+    escalation if the keys disagree or the change is destructive. NEVER merges — the ship flow only runs
+    `gh pr merge` when this exits 0 (merge-eligible) AND auto-merge is enabled (TWO_KEY_AUTOMERGE=on)."""
+    import importlib.util
+    here = os.path.dirname(os.path.abspath(__file__))
+    spec = importlib.util.spec_from_file_location("two_key_merge", os.path.join(here, "two_key_merge.py"))
+    tk = importlib.util.module_from_spec(spec); spec.loader.exec_module(tk)
+
+    files = args.files or _select(args)
+    # GATE verdict: ask the moderator /review (the single authority, server-side re-gate). A transport
+    # error is NOT a pass — treat it as a non-pass so a flaky gate can't auto-merge (fail-safe).
+    ddl, py = _payload(files)
+    gate = "unavailable"
+    if ddl or py:
+        res = _req("POST", "/review", {"ddl_files": ddl, "py_files": py,
+                                       "actor": os.environ.get("USER", "?"), "branch": _branch()})
+        if res.get("error"):
+            print(f"  gate review error: {res['error']} — treating gate as UNAVAILABLE (will not merge).")
+        else:
+            gate = res.get("verdict", "unavailable")
+            _print_checklist(res)
+    ddl_contents = [d["content"] for d in ddl]
+    out = tk.run_two_key(gate_verdict=gate, ddl_contents=ddl_contents, pr_number=args.pr_number,
+                         pr_title=args.pr_title or os.environ.get("TWO_KEY_PR_TITLE", ""),
+                         pr_body=args.pr_body or os.environ.get("TWO_KEY_PR_BODY", ""), files=files)
+    d, rv = out["decision"], out["reviewer"]
+    print("=" * 74)
+    print(f"  TWO-KEY: gate={gate}  reviewer={rv['verdict']} (model={rv.get('model')})  "
+          f"destructive={out['destructive']['destructive']}  agreed={d['agreed']}")
+    print(f"  -> ACTION = {d['action'].upper()}" + (f"  ({d['escalation_kind']})" if d['escalation_kind'] else ""))
+    print(f"  agreement-log: {json.dumps(tk.agreement_stats())}")
+    print("=" * 74)
+    if d["action"] == "escalate":
+        print("\n--- PLAIN-ENGLISH ESCALATION (send to the human — NEVER a raw diff) ---\n")
+        print(out["escalation_text"])
+    return 0 if d["action"] == "merge" else 10
+
+
 def cmd_simple(args, path) -> int:
     params = {}
     if path == "/issues":
@@ -715,6 +763,14 @@ def main(argv=None) -> int:
                     help="box-side `git pull --ff-only origin main` before applying, so the box "
                          "checkout (and the nightly) carry the just-merged DDL (the 'ship' flow)")
     an.add_argument("--reason", help="reason string recorded in the publish/apply log")
+    tk = sub.add_parser("two-key", help="two-key auto-merge decision: gate verdict AND an independent "
+                                        "reviewer must both approve + non-destructive, else escalate "
+                                        "(plain English). NEVER merges; exits 0=merge-eligible / 10=escalate.")
+    tk.add_argument("--files", nargs="*", help="the gated DDL/py files for this change")
+    tk.add_argument("--staged", action="store_true")
+    tk.add_argument("--pr-number", dest="pr_number")
+    tk.add_argument("--pr-title", dest="pr_title")
+    tk.add_argument("--pr-body", dest="pr_body")
     args = p.parse_args(argv)
     if args.cmd == "doctor":
         return cmd_doctor(args)
@@ -744,6 +800,8 @@ def main(argv=None) -> int:
         return cmd_apply_process(args)
     if args.cmd == "apply-now":
         return cmd_apply_now(args)
+    if args.cmd == "two-key":
+        return cmd_two_key(args)
     return cmd_simple(args, "/" + args.cmd)
 
 

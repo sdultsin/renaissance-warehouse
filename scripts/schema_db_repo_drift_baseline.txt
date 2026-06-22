@@ -2,7 +2,8 @@
 # origin/main. The drift guard EXCLUDES these from the alerting DBDRIFT count (reports them as
 # `baselined`, info only) so it fires ONLY on NEW drift. A watchdog that re-alerts a known, already-
 # understood state is noise → gets ignored. apply==commit prevents new uncommitted applies, so any
-# future (non-baselined) alert is real. Captured 2026-06-22 from the drift guard's first run (16 items).
+# future (non-baselined) alert is real. Captured 2026-06-22 from the drift guard's first run (16 items);
+# trimmed 16→11 on 2026-06-22 once the 5 onboarding-test residues were actually cleaned (see below).
 #
 # --- PERMANENT (benign recorded-name artifacts — NOT object drift; leave baselined) ---
 31   # 31-40: old bootstrap `*_skip_prereq.sql` recording; the real files 31-40 ARE committed in repo
@@ -17,10 +18,11 @@
 40
 51   # `51_instantly_sent_email.sql` — file legitimately RETIRED in git b8e20c7 (dead infra)
 #
-# --- TEMPORARY (apply-now TEST residue from David/Darcy 06-20 onboarding; being cleaned in the
-#     post-05:45Z window — DROP objects + DELETE schema_version rows. Remove these 5 lines after.) ---
-95   # derived.david_live_edit_test (table)
-99   # darcy_write_test (row only; object already dropped)
-100  # core.v_apply_now_verification (view)
-101  # core.v_apply_now_verification2 (view)
-102  # darcy_write_test_drop (row only; object already dropped)
+# --- CLEANED 2026-06-22 (removed from this baseline) ---
+# v95/99/100/101/102 were apply-now TEST residue from David/Darcy's 06-20 onboarding
+# (david_live_edit_test view, darcy_write_test rows, v_apply_now_verification[2] views). They were
+# DROPped + their schema_version rows DELETEd under the writer flock on 2026-06-22 and verified gone
+# from the live core warehouse (0/0). With the objects+rows gone they are no longer applied, so they
+# are no longer drift to suppress — removed here. A future re-appearance of any of these versions
+# would now be NEW (real) drift and SHOULD alert. (The serving snapshot lags the live DB until the next
+# nightly/promote refreshes it; the live DB is the source of truth and is clean.)

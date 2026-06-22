@@ -70,15 +70,32 @@ python scripts/moderator_client.py loop --files sql/ddl/<N>_<name>.sql   # revie
    ```
    (If the writer had other unrelated uncommitted changes, set them aside first — `git stash` — and
    restore after; ship ONLY the gated files so the PR is clean.)
-2. **PR + auto-merge gated on the moderator-gate CI check:**
+2. **PR + TWO-KEY auto-merge** (gate AND an independent reviewer must both approve + non-destructive):
    ```
    gh pr create --base main --fill
-   gh pr merge --auto --squash --delete-branch
+   python scripts/moderator_client.py two-key --files sql/ddl/<N>_<name>.sql [entity.py ...] \
+       --pr-number <N> --pr-title "<title>"   # exit 0 = merge-eligible, exit 10 = escalate
    ```
-   Auto-merge completes the merge to origin/main the moment the `moderator-gate` check is green.
-   **If auto-merge / branch-protection isn't enabled yet** (see KNOWN DEPENDENCY below): merge directly
-   if you have rights, else report *"PR #N open + gate green — awaiting merge-enable"* and stop. Never
-   skip the merge to apply directly — apply-now will refuse uncommitted content (the backstop).
+   `two-key` re-asks the moderator **gate** (`/review`, claude-opus-4-8) for the verdict, runs an
+   **independent adversarial reviewer** (`scripts/independent_reviewer.py`, **claude-sonnet-4-6** — a
+   different model AND a different lens: code-review correctness/safety/intent-match, not the schema-rule
+   lens), checks the change is **non-destructive**, logs the agreement record, and decides:
+   - **exit 0 (merge-eligible: gate PASS + reviewer APPROVE + non-destructive)** → merge **only if
+     auto-merge is enabled** (`TWO_KEY_AUTOMERGE=on` + the GitHub auto-merge setting / branch protection):
+     ```
+     gh pr merge --auto --squash --delete-branch
+     ```
+     **Until auto-merge is enabled (default today):** report *"PR #N open + two-key green — awaiting
+     merge-enable"* and stop; a human merges. Never skip the merge to apply directly — apply-now refuses
+     uncommitted content (the backstop).
+   - **exit 10 (escalate: destructive, OR the two keys disagree)** → do **NOT** merge. `two-key` printed a
+     **plain-English** escalation with a recommended action (e.g. *"This change will permanently delete
+     table X. Reply YES to allow, or ignore to block."*) — post **that text** (never the diff) to the human
+     (`#cc-sam` / route via the orchestrator) and stop.
+   The agreement log (`logs/two_key_agreement.jsonl`, overridable via `TWO_KEY_AGREEMENT_LOG`) records
+   `{gate_verdict, reviewer_verdict, agreed?, destructive?, merged?}` per change — the data Sam uses to
+   collapse to single-key (gate only) in ~2 weeks once the two keys consistently agree (`two-key`'s
+   footer prints the running agreement rate; surface it in the Slack ship report).
 3. **Wait for the merge to actually land** on origin/main (poll `gh pr view <N> --json state`).
 4. **Apply live + keep the box (and nightly) in sync:**
    ```
@@ -99,9 +116,23 @@ python scripts/moderator_client.py loop --files sql/ddl/<N>_<name>.sql   # revie
   is refused loudly, never silently swallowed.
 - **DB-vs-repo drift guard (hourly):** alerts if anything ever lands in the live DB without a committed
   file — a tripwire on this whole flow.
+- **two-key fail-safe:** a flaky/unreachable gate or independent reviewer is treated as a NON-pass /
+  `unavailable` → it ESCALATES, never auto-merges. An unconfirmed key can never green-light a merge.
+
+## Two-key auto-merge (DECISION 2026-06-22 — Option B)
+A PR auto-merges **iff ALL of**: (1) moderator **gate** = PASS, (2) the **independent reviewer** =
+APPROVE, and (3) the change is **non-destructive**. Otherwise → **escalate to Sam** in plain English
+(never a diff), with two triggers only: **destructive** (a permanent/irreversible change) or
+**disagreement** (gate and reviewer split, or the reviewer can't be confirmed). The reviewer is
+genuinely independent of the gate — different model (sonnet-4-6 vs the gate's opus-4-8) AND a different
+lens (adversarial code review, not schema rules) — so two independent checks must agree. This is
+**strictly safer than single-gate auto-merge** on day one. Reversible: `TWO_KEY_AUTOMERGE=off` falls back
+to today's manual-gate behavior with one flip.
 
 ## KNOWN DEPENDENCY (orchestrator/Sam — flagged 2026-06-22)
-Fully-automatic merge needs GitHub repo config: branch protection on `main` + auto-merge enabled + the
-`moderator-gate` workflow as a **required** status check, and writers' machines having merge creds.
-Until that's enabled, step 5.2 degrades to "PR open + gate green, awaiting merge-enable." Everything
-else (version, review/revise, box-pull, lock, apply, promote) is automatic now.
+Enabling fully-automatic merge still needs the GitHub repo config: branch protection on `main` +
+auto-merge enabled + the `moderator-gate` workflow as a **required** status check, writers' machines
+having merge creds, **and the flip `TWO_KEY_AUTOMERGE=on`**. **All of that is HELD for human review** —
+until then step 5.2 degrades to "PR open + two-key green, awaiting merge-enable" and a human merges.
+Everything else (version, review/revise, the two-key decision + agreement log + plain-English escalation,
+box-pull, lock, apply, promote) is automatic now.
