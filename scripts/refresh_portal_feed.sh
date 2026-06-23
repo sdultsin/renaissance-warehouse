@@ -38,7 +38,7 @@ fi
 mv -f "$REPO/portal_data.js.tmp" "$REPO/portal_data.js"
 echo "  generated $(wc -c < "$REPO/portal_data.js") bytes"
 
-# 2b) Regenerate the 5 in-portal Lens dashboard feeds from the SAME serving snapshot
+# 2b) Regenerate the 3 in-portal Lens dashboard feeds from the SAME serving snapshot
 #     (read-only) straight into the portal checkout so they ride this same nightly commit.
 #     CORE_DB_PATH=$SNAP is REQUIRED — the Lens generators default to the LOCKED live writer
 #     and fail otherwise (that was the old standalone-cron breakage, see
@@ -55,57 +55,23 @@ lensgen () {  # $1 = generator script, $2 = dest path in the portal repo
 }
 lensgen dashboard_data.py     "$REPO/dashboards/lens-overview/data.json"
 lensgen kpi_dashboard_data.py "$REPO/dashboards/lens-kpi/data.json"
-# sending-truth cube: committed GZIPPED (data.json.gz, ~1.3MB) instead of raw (~17.8MB) so the
-# nightly git commit stays small (the cube regenerates every night -> ~17MB/day of history
-# otherwise). The generator gzips when --json-out ends in .gz; app.js inflates client-side via
-# DecompressionStream. Direct call (not lensgen) so we can pass --json-out .gz; same read-only
-# serving-snapshot source + last-known-good contract (only swap in a non-empty fresh cube).
-ST_GZ="$REPO/dashboards/lens-sending-truth/data.json.gz"
-mkdir -p "$(dirname "$ST_GZ")"
-if CORE_DB_PATH="$SNAP" "$PY" "$WH/scripts/sending_truth_dashboard_data.py" --gzip --json-out "$ST_GZ.tmp" 2>>/root/lens_feeds.err && [ -s "$ST_GZ.tmp" ]; then
-  mv -f "$ST_GZ.tmp" "$ST_GZ"; echo "  ok lens-sending-truth $(wc -c < "$ST_GZ")B (gz)"
-else
-  rm -f "$ST_GZ.tmp"; echo "  WARN sending_truth_dashboard_data.py failed — keeping last-known-good $ST_GZ" >&2
-fi
 CORE_DB_PATH="$SNAP" "$PY" "$WH/scripts/sms_campaign_dashboard_data.py" --out "$REPO/dashboards/lens-sms/data/latest.json" >>/root/lens_feeds.err 2>&1 \
   && echo "  ok lens-sms $(wc -c < "$REPO/dashboards/lens-sms/data/latest.json")B" || echo "  WARN sms feed failed — keeping last-known-good" >&2
-
-# campaign-performance is the ODD ONE OUT: its generator lives in /root/lens/scripts (it imports
-# the proven daily_performance shaping module) and needs the LENS venv (duckdb), so it can't use
-# $PY/lensgen. Same serving-snapshot source (--db $SNAP), same read-only contract. Writes the
-# file itself via --json-out. Non-fatal: keep last-known-good on failure.
-LENS_PY="/root/lens/backend/.venv/bin/python"
-CP_DIR="$REPO/dashboards/lens-campaign-performance/data"; mkdir -p "$CP_DIR"
-CP_OUT="$CP_DIR/latest.json"
-if CORE_DB_PATH="$SNAP" "$LENS_PY" /root/lens/scripts/daily_performance_warehouse.py \
-     --days 35 --db "$SNAP" --json-out "$CP_OUT" >>/root/lens_feeds.err 2>&1 && [ -s "$CP_OUT" ]; then
-  echo "  ok lens-campaign-performance $(wc -c < "$CP_OUT")B"
+# lens-sending-truth: the CORRECTED capacity cube from core.account_label (phantom-free MX-infra
+# census + DDL-1003-healed limits) + per-day actuals. Retires the old bespoke account_truth.duckdb
+# pipeline (which left the cube frozen at 2026-06-16/17). Writes gzip straight into the portal repo.
+if CORE_DB_PATH="$SNAP" "$PY" "$WH/scripts/sending_truth_dashboard_data.py" \
+     --out "$REPO/dashboards/lens-sending-truth/data.json.gz" >>/root/lens_feeds.err 2>&1 \
+   && [ -s "$REPO/dashboards/lens-sending-truth/data.json.gz" ]; then
+  echo "  ok lens-sending-truth $(wc -c < "$REPO/dashboards/lens-sending-truth/data.json.gz")B"
 else
-  echo "  WARN campaign-performance feed failed — keeping last-known-good" >&2
-fi
-# The generator also drops a sibling unmapped-campaigns-<date>.md beside latest.json; it is not
-# part of the served dashboard. Prune it so the tracked data/ dir stays {latest.json} only.
-rm -f "$CP_DIR"/unmapped-campaigns-*.md 2>/dev/null || true
-
-# 2c) Per-workspace dataset for the campaign-performance Workspaces tab (full totals,
-#     all workspaces, no active-CM filter) from Pipeline (= Instantly) + email meetings.
-#     Non-fatal: keep last-known-good on failure.
-if "$PY" "$WH/scripts/gen_workspaces.py" >>/root/lens_feeds.err 2>&1; then
-  echo "  ok lens-campaign-performance/workspaces.json"
-else
-  echo "  WARN gen_workspaces.py failed — keeping last-known-good" >&2
+  echo "  WARN sending-truth feed failed — keeping last-known-good" >&2
 fi
 
 # 3) Commit if changed.
 cd "$REPO" || exit 1
 git config --global --add safe.directory "$REPO" 2>/dev/null
-git add portal_data.js \
-  dashboards/lens-overview/data.json \
-  dashboards/lens-kpi/data.json \
-  dashboards/lens-sms/data/latest.json \
-  dashboards/lens-sending-truth/data.json.gz \
-  dashboards/lens-campaign-performance/data/latest.json \
-  dashboards/lens-campaign-performance/data/workspaces.json 2>/dev/null
+git add portal_data.js dashboards/lens-overview/data.json dashboards/lens-kpi/data.json dashboards/lens-sms/data/latest.json dashboards/lens-sending-truth/data.json.gz 2>/dev/null
 if git diff --cached --quiet; then
   echo "[3/4] no change in portal feed or Lens data — nothing to publish"; exit 0
 fi
