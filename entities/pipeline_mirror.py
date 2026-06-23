@@ -165,6 +165,20 @@ SPECS: dict[str, Spec] = {
             "event_timestamp", "event_data", "synced_at",
         ],
     ),
+    # Campaign -> lead contact roster (the granular "which leads did each campaign
+    # contact" log; ~49M rows, send_date >= 2026-05-08). Upsert on the natural
+    # grain (campaign x lead x send_date) so re-sends update sent_count/last_sent_at
+    # in place; incremental by updated_at watermark so nightly scans only the
+    # recent tail after the one-time backfill. DDL: sql/ddl/1007_contact_frequency_campaign_daily.sql.
+    "contact_frequency_campaign_daily": Spec(
+        mode="upsert",
+        key_sql=_key_concat(["campaign_id", "lead_email", "send_date"]),
+        watermark_col="updated_at",
+        columns=[
+            "workspace_id", "campaign_id", "campaign_name", "lead_email", "lead_domain",
+            "send_date", "sent_count", "first_sent_at", "last_sent_at", "updated_at",
+        ],
+    ),
     "variant_copy": Spec(
         mode="insert_hash",
         key_sql=_key_concat(["campaign_id", "step", "variant", "content_hash"]),
