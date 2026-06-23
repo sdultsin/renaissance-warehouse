@@ -46,6 +46,7 @@ WITH ranked AS (
             ORDER BY is_current_batch DESC NULLS LAST, _loaded_at DESC NULLS LAST
         ) AS rn
     FROM core.sending_account_batch
+    WHERE account_email IS NOT NULL          -- guard: NULL email would collapse to one bogus inbox
 ),
 batch AS (
     SELECT email, domain, raw_workspace AS workspace_csv,
@@ -63,7 +64,8 @@ census AS (
 )
 SELECT
     COALESCE(b.email, c.email)                         AS email,
-    b.domain                                           AS domain,
+    -- domain from CSV master; for the ~297k Instantly-only rows (b NULL) derive from the email
+    COALESCE(b.domain, split_part(COALESCE(b.email, c.email), '@', 2)) AS domain,
     COALESCE(c.workspace_slug, b.workspace_csv)        AS workspace,
     b.provider_tag                                     AS provider_tag,
     b.batch_key                                        AS batch_key,
@@ -75,7 +77,7 @@ SELECT
         WHEN c.status IN ('connection_error','sending_error') THEN 'broken'
         WHEN c.status IN ('paused','conn_paused')         THEN 'paused'
         WHEN c.status IN ('active','conn_active')         THEN 'live'
-        ELSE 'live'                                                        -- in-Instantly, other status
+        ELSE 'unknown'                                                     -- surface any unmapped census status, never silently 'live'
     END                                                AS live_state
 FROM batch b
 FULL OUTER JOIN census c ON b.email = c.email;
