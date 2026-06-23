@@ -86,3 +86,18 @@ exactly why off-box backups are mandatory, not optional.
   least daily backups) is enabled on that Supabase project. Mitigating factor: the off-box warehouse
   backup is itself a de-facto backup of the pipeline-supabase tables the warehouse mirrors.
 - **`.env` is not backed up off-box** (secrets). Keep it in the password manager; recovery (B) depends on it.
+
+## Secrets backup (added 2026-06-23) — supersedes the ".env not backed up" risk note above
+
+Secrets ARE now backed up off-box, encrypted. `scripts/backup_secrets.sh` (nightly 08:00 UTC) bundles
+all ~64 secret files (every `.env*`, API keys, query-API tokens, `~/.ssh/*`, rclone config), encrypts
+with **age public-key** encryption, and pushes the ciphertext to Drive `Renaissance/secrets-encrypted/`
+(30-day retention). The box holds only the PUBLIC key, so the bundle is safe even if the box or Drive
+is compromised.
+
+- Public (recipient) key: `age1qr2cuzuag9rrhmersjyd8jp5w4pk243fdlfnsw8g0he7y3xfmgjs498kcs`
+- PRIVATE key: `/root/.config/secrets-backup/identity.key` on the box AND in Sam's password manager
+  (custody = Sam). Without it the encrypted bundles cannot be decrypted.
+- **Restore:** `rclone copy "sdultsin@gmail.com:Renaissance/secrets-encrypted/secrets-<newest>.tar.age" .`
+  then `age -d -i identity.key secrets-<newest>.tar.age | tar -xzf - -C /restore-root` (paths are
+  rooted at `root/...`). Round-trip verified working 2026-06-23.
