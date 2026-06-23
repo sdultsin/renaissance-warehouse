@@ -1,0 +1,71 @@
+# rclone filter for the box->Drive mirror. Patterns without a leading "/" match at ANY depth.
+# Order: first match wins. Excludes only; everything else is mirrored.
+
+# ---- SECRETS / CREDENTIALS: never upload (the ".env besides" rule, applied to ALL secret files) ----
+- *.env*
+- .env*
+- *env.bak*
+- *api-key*
+- *api_key*
+- *apikey*
+- .ssh/**
+- *.ssh/**
+- .gnupg/**
+- .aws/**
+- .config/**
+- *.pem
+- *.key
+- *.pkey
+- *.p12
+- *.pfx
+- id_rsa*
+- id_ed25519*
+- *credential*
+- *credentials*
+- *secret*
+- *secrets*
+- *.token
+- *_token
+- *token*
+- *tokens*
+- *password*
+- *passwd*
+- .pgpass
+- .netrc
+- *service-account*
+- *service_account*
+- client_secret*
+- rclone.conf
+- known_hosts
+- authorized_keys
+
+# ---- JUNK / reproducible / already in GitHub (no data value) ----
+- *venv/**
+- venv/**
+- site-packages/**
+- *.egg-info/**
+- *.dist-info/**
+- .git/**
+- node_modules/**
+- __pycache__/**
+- *.pyc
+- .cache/**
+- .vscode-server/**
+- .npm/**
+- .cargo/**
+- .rustup/**
+- snap/**
+- *.log
+- logs/**
+- *.tmp
+- tmp/**
+- *.sock
+
+# ---- warehouse: handled by backup.sh as consistent DATED snapshots ----
+# (exclude here to avoid a torn copy of the live file + redundant 400GB of warehouse duplicates;
+#  the warehouse IS backed up — see Renaissance/warehouse-offbox-backups/)
+- core/warehouse.duckdb
+- core/warehouse.duckdb.wal
+- backups/warehouse-*.duckdb
+- serving/snapshots/**
+- serving/test_fixtures/**
