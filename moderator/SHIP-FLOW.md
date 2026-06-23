@@ -70,25 +70,26 @@ python scripts/moderator_client.py loop --files sql/ddl/<N>_<name>.sql   # revie
    ```
    (If the writer had other unrelated uncommitted changes, set them aside first — `git stash` — and
    restore after; ship ONLY the gated files so the PR is clean.)
-2. **PR + TWO-KEY auto-merge** (gate AND an independent reviewer must both approve + non-destructive):
+2. **Open the PR — the two-key runs in CI, NOT on your laptop** (fix 2026-06-23, see below):
    ```
    gh pr create --base main --fill
-   python scripts/moderator_client.py two-key --files sql/ddl/<N>_<name>.sql [entity.py ...] \
-       --pr-number <N> --pr-title "<title>"   # exit 0 = merge-eligible, exit 10 = escalate
    ```
-   `two-key` re-asks the moderator **gate** (`/review`, claude-opus-4-8) for the verdict, runs an
+   **Do NOT run `python scripts/moderator_client.py two-key` by hand.** Opening the PR triggers
+   `.github/workflows/two-key-automerge.yml`, which runs the two-key decision **server-side in CI** using
+   the funded `duckdb-review-agent` Anthropic key (a repo secret). Running it locally would use whatever
+   Anthropic key is on *your* machine — which for most writers is absent or wrong, producing a spurious
+   *"reviewer unavailable"* HOLD. (That client-side dependency is exactly what left auto-merge non-functional
+   2026-06-22→23.) The CI job re-asks the moderator **gate** (`/review`, claude-opus-4-8), runs the
    **independent adversarial reviewer** (`scripts/independent_reviewer.py`, **claude-sonnet-4-6** — a
-   different model AND a different lens: code-review correctness/safety/intent-match, not the schema-rule
-   lens), checks the change is **non-destructive**, logs the agreement record, and decides:
-   `two-key` itself ACTS on the decision when the kill switch `TWO_KEY_AUTOMERGE=on` (it needs `--pr-number`):
-   - **exit 0 (merge-eligible: gate PASS + reviewer APPROVE + non-destructive)** → with `TWO_KEY_AUTOMERGE=on`
-     it runs `gh pr merge --auto --squash --delete-branch` for you (GitHub completes the merge the moment the
-     required checks are green). With the switch **off/unset** it degrades to today's manual behavior — it
-     reports *"merge-eligible, automerge OFF"* and a human merges. Never skip the merge to apply directly —
-     apply-now refuses uncommitted content (the backstop).
-   - **exit 10 (escalate)** → it does **NOT** merge, and with `TWO_KEY_AUTOMERGE=on` it **posts the
-     plain-English message ON THE PR** (`gh pr comment`) so the change's **author** is the one notified —
-     never a raw diff. Two distinct triggers (DECISION 2026-06-22 refinement):
+   different model AND lens: code-review correctness/safety/intent-match, not the schema-rule lens), checks
+   the change is **non-destructive**, logs the agreement record, and acts when `TWO_KEY_AUTOMERGE=on` (repo
+   variable):
+   - **merge-eligible (gate PASS + reviewer APPROVE + non-destructive)** → CI runs
+     `gh pr merge --auto --squash --delete-branch` (GitHub completes the merge once the required
+     `moderator-gate` check is green). With the switch **off/unset** the job decides + logs only and a human
+     merges. Never skip the merge to apply directly — apply-now refuses uncommitted content (the backstop).
+   - **escalate** → CI does **NOT** merge; it **posts the plain-English message ON THE PR** (`gh pr comment`)
+     so the change's **author** is the one notified — never a raw diff. Two distinct triggers (DECISION 2026-06-22 refinement):
      - **DESTRUCTIVE → AUTHOR-INTENT HOLD.** The change is correct + the second key approved; the only open
        question is whether the author *meant* an irreversible delete. The PR comment asks the **author** to
        confirm their OWN intent — *"this permanently deletes X — confirm by merging / reply YES, or ignore to
@@ -143,11 +144,23 @@ AND a different lens (adversarial code review, not schema rules) — so two inde
 unset) makes `two-key` decide+log+print only and never touch the PR (today's manual-gate behavior). The
 switch is read in code (`two_key_merge.automerge_enabled()`); only the literal `on` enables action.
 
-## ENABLED 2026-06-22 (was: KNOWN DEPENDENCY)
-Fully-automatic merge is now live. The GitHub repo config is set: branch protection on `main` with the
-`moderator-gate` check **required**, repo **auto-merge enabled**, `delete-branch-on-merge` on, and the box
-carries `TWO_KEY_AUTOMERGE=on`. Verified end-to-end 2026-06-22 (clean → auto-merged with zero human action;
-destructive → held with the author-intent message on the PR; kill-switch off → degraded to manual).
-**Rollback is the single flip `TWO_KEY_AUTOMERGE=off`.** Everything (version, review/revise, the two-key
-decision + agreement log + plain-English escalation, the auto-merge/PR-comment action, box-pull, lock,
-apply, promote) is automatic.
+## ENABLED 2026-06-22 → FIXED 2026-06-23 (now runs server-side in CI)
+**What broke (2026-06-22 → 23):** the two-key was wired to run **client-side** in each writer's ship flow,
+where the independent reviewer reads the *local* `ANTHROPIC_API_KEY`/`ANTHROPIC_KEY`. For every non-Sam
+writer that key was absent (Claude Code uses OAuth); on Sam's box it was a **credit-exhausted/wrong key**.
+So the reviewer returned `unavailable` on EVERY change → the fail-safe escalated everything to manual →
+**nothing auto-merged for any writer** (agreement log stayed empty). It was never a billing problem — the
+funded `duckdb-review-agent` key existed the whole time, just unused.
+
+**The fix (2026-06-23):** the two-key now runs **server-side in CI** (`.github/workflows/two-key-automerge.yml`)
+using the funded `duckdb-review-agent` key as the repo secret `ANTHROPIC_API_KEY` (+ `MODERATOR_API_URL` /
+`MODERATOR_API_TOKEN`). It no longer depends on any writer's laptop. Gated by the **repo variable**
+`TWO_KEY_AUTOMERGE` (the kill switch now lives in repo variables, not just the box's `/etc/environment`).
+Verified end-to-end 2026-06-23: switch `off` → decide+log only (no merge); switch `on` → PR #34 auto-merged
+with zero human action. **Rollback is the single flip:** set the repo variable `TWO_KEY_AUTOMERGE=off`
+(`gh variable set TWO_KEY_AUTOMERGE --body off`), or disable the workflow.
+
+The GitHub repo config: branch protection on `main` with `moderator-gate` **required** (advisory gate, won't
+block), repo **auto-merge enabled**, `delete-branch-on-merge` on. The `moderator-gate` workflow is the
+required check the auto-merge waits on; `two-key-automerge` is intentionally **not** a required check (it is
+the actor that enables the merge, so it must not gate itself).
