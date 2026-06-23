@@ -243,3 +243,32 @@ class InstantlyClient:
         if resource_type is not None:
             params["resource_type"] = resource_type
         yield from self._paginate("/tag-mappings", params=params or None, limit=100)
+
+    def list_accounts(
+        self,
+        tag_ids: str | None = None,
+        status: int | None = None,
+        workspace_id: str | None = None,
+    ) -> Iterator[dict]:
+        """`GET /accounts` (paginated) — sending accounts in this workspace.
+
+        `tag_ids` is a SERVER-SIDE filter (comma-separated tag UUIDs): the endpoint
+        returns only accounts carrying ANY of those tags. This is the documented
+        public-v2 mechanism the account->tag sync relies on (verified 2026-06-23 via
+        the Instantly v2 docs + the MCP wrapper: F2 'Reseller Active' tag returns 4,557
+        accounts). It is the robust alternative to /tag-mappings?resource_type=1, which
+        is the private/admin surface (the public tag-mappings endpoint 404s — see the
+        marker-tag note in entities/campaign.py).
+
+        Each account item carries the fields the tag sync needs:
+          email, status, warmup_status, daily_limit, provider_code (when present),
+          sending_gap, timestamp_created.
+
+        The key already scopes the workspace; `workspace_id` is informational.
+        """
+        params: dict = {}
+        if tag_ids:
+            params["tag_ids"] = tag_ids
+        if status is not None:
+            params["status"] = status
+        yield from self._paginate("/accounts", params=params or None, limit=100)
