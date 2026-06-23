@@ -71,10 +71,13 @@ def run_sending_dq(ctx: RunContext) -> PhaseResult:
     logger.info("D4: core.sending_account._snapshot_date = %s", snapshot_date)
 
     # --- D3: Ingest daily actuals CSVs ---
+    # NOTE: even when no NEW csv is found we must still fall through to D6 (reassert
+    # capacity from core.sending_account) + the canonical rebuild, so the table self-
+    # heals against the upstream generator's "-999 / Missing Current Inventory" zeroing
+    # on every run, not only when a new day's CSV lands.
     csvs = _find_actuals_csvs()
     if not csvs:
         logger.warning("No daily actuals CSVs found in %s", ACTUALS_DIR)
-        return PhaseResult(rows_in=0, rows_out=0, notes={"d4_snapshot_date": str(snapshot_date)})
 
     # Find which dates are already loaded
     existing_dates = set()
@@ -100,11 +103,7 @@ def run_sending_dq(ctx: RunContext) -> PhaseResult:
             continue
 
     if not new_csvs:
-        logger.info("D3: All %d daily actuals CSVs already loaded", len(csvs))
-        return PhaseResult(
-            rows_in=0, rows_out=0,
-            notes={"d4_snapshot_date": str(snapshot_date), "csvs_total": len(csvs)},
-        )
+        logger.info("D3: All %d daily actuals CSVs already loaded (reassert + rebuild still run)", len(csvs))
 
     for csv_path, date_str in new_csvs:
         logger.info("D3: Loading %s", csv_path.name)
@@ -172,6 +171,21 @@ def run_sending_dq(ctx: RunContext) -> PhaseResult:
         ).fetchone()[0]
         total_rows += n
         logger.info("  -> %d rows for %s", n, date_str)
+
+    # --- D6: reassert capacity for generator-misclassified rows ---------------
+    # The upstream account-truth generator stamps any sender it cannot match to its
+    # (stale/incomplete) `account_inventory` snapshot as account_status=-999 /
+    # infra_type='Missing Current Inventory' / daily_limit=0 / expected_sends=0.
+    # That silently zeros real, active sending accounts (e.g. F2 Google reseller:
+    # ~3,307 active accts reported as 0 cold capacity while physically sending ~45k/day).
+    # core.sending_account already carries the correct ESP + daily_limit for these.
+    # Reassert it here so the fact never reports 0 capacity for an account core knows
+    # is active with a real ESP and limit. Runs over the WHOLE table every nightly
+    # (heals history + new), idempotent (only touches -999 rows). Conservative: leaves
+    # retired / esp-unresolved / warming (daily_limit<=0) rows untouched -> no overcount.
+    # Runs BEFORE the canonical rebuild so the rebuild's infra_type->esp mapping picks up
+    # the healed Google/Outlook/OTD rows (the downstream vendor esp-backfill still applies).
+    reasserted = _reassert_capacity_from_core(db)
 
     # Rebuild canonical daily table from raw (dedup: one row per date+email, prefer highest actual_sends)
     db.execute("DELETE FROM core.sending_account_daily")
@@ -243,8 +257,77 @@ def run_sending_dq(ctx: RunContext) -> PhaseResult:
             "d4_snapshot_date": str(snapshot_date),
             "csvs_loaded": len(new_csvs),
             "csvs_total": len(csvs),
+            "rows_reasserted_from_core": reasserted,
         },
     )
+
+
+def _reassert_capacity_from_core(db) -> int:
+    """D6: heal generator '-999 / Missing Current Inventory' rows from core.sending_account.
+
+    For every raw_account_truth_daily_actuals row the upstream generator zeroed
+    (account_status = -999), if core.sending_account knows that email (same workspace)
+    as an ACTIVE account with a resolved ESP and a real daily_limit (>0), overwrite the
+    capacity columns with core's truth. Idempotent: re-running only re-touches rows that
+    are still -999 (a healed row is account_status=1 and no longer matches). Returns the
+    number of rows reasserted.
+
+    provider_code mapping mirrors the generator's PROVIDER_LABELS: 1=OTD, 2=Google, 3=Outlook.
+    expected_sends := daily_limit (full configured cold capacity for an active account).
+
+    The mappings + warning_flags handling here are kept byte-identical to
+    sql/ddl/1003_reassert_account_truth_capacity.sql (the live-apply twin). The source is
+    deduped to one row per (workspace_slug, lower(email)) so the UPDATE...FROM pick is
+    deterministic (verified 0 dupes 2026-06-23; the dedup makes it provably stable).
+    """
+    before = db.execute(
+        "SELECT count(*) FROM raw_account_truth_daily_actuals WHERE account_status = -999"
+    ).fetchone()[0]
+    db.execute("""
+        UPDATE raw_account_truth_daily_actuals AS f
+        SET infra_type = CASE sa.esp
+                WHEN 'google' THEN 'Google'
+                WHEN 'outlook' THEN 'Outlook'
+                WHEN 'otd' THEN 'OTD'
+                ELSE f.infra_type END,
+            provider_code = CASE sa.esp
+                WHEN 'otd' THEN 1
+                WHEN 'google' THEN 2
+                WHEN 'outlook' THEN 3
+                ELSE f.provider_code END,
+            account_status = 1,
+            account_status_label = 'Active (reasserted from core.sending_account)',
+            daily_limit = sa.daily_limit,
+            expected_sends = sa.daily_limit,
+            delta = sa.daily_limit - COALESCE(f.actual_sends, 0),
+            fulfillment = CASE WHEN sa.daily_limit > 0
+                THEN COALESCE(f.actual_sends, 0)::DOUBLE / sa.daily_limit END,
+            warning_flags = CASE
+                WHEN COALESCE(f.warning_flags, '') LIKE '%reasserted_from_core%' THEN f.warning_flags
+                ELSE NULLIF(TRIM(BOTH ';' FROM
+                    COALESCE(f.warning_flags, '') || ';reasserted_from_core'), '') END
+        FROM (
+            SELECT workspace_slug,
+                   LOWER(email)               AS email_lc,
+                   arg_max(esp, daily_limit)  AS esp,
+                   max(daily_limit)           AS daily_limit
+            FROM core.sending_account
+            WHERE is_active AND esp IS NOT NULL AND daily_limit > 0
+            GROUP BY workspace_slug, LOWER(email)
+        ) sa
+        WHERE f.account_status = -999
+          AND LOWER(f.email) = sa.email_lc
+          AND f.workspace_slug = sa.workspace_slug
+    """)
+    after = db.execute(
+        "SELECT count(*) FROM raw_account_truth_daily_actuals WHERE account_status = -999"
+    ).fetchone()[0]
+    reasserted = before - after
+    logger.info(
+        "D6: reasserted capacity from core.sending_account for %d rows (-999 remaining: %d)",
+        reasserted, after,
+    )
+    return reasserted
 
 
 def register(registry: Registry) -> None:
