@@ -274,6 +274,11 @@ def _reassert_capacity_from_core(db) -> int:
 
     provider_code mapping mirrors the generator's PROVIDER_LABELS: 1=OTD, 2=Google, 3=Outlook.
     expected_sends := daily_limit (full configured cold capacity for an active account).
+
+    The mappings + warning_flags handling here are kept byte-identical to
+    sql/ddl/1003_reassert_account_truth_capacity.sql (the live-apply twin). The source is
+    deduped to one row per (workspace_slug, lower(email)) so the UPDATE...FROM pick is
+    deterministic (verified 0 dupes 2026-06-23; the dedup makes it provably stable).
     """
     before = db.execute(
         "SELECT count(*) FROM raw_account_truth_daily_actuals WHERE account_status = -999"
@@ -297,15 +302,22 @@ def _reassert_capacity_from_core(db) -> int:
             delta = sa.daily_limit - COALESCE(f.actual_sends, 0),
             fulfillment = CASE WHEN sa.daily_limit > 0
                 THEN COALESCE(f.actual_sends, 0)::DOUBLE / sa.daily_limit END,
-            warning_flags = NULLIF(TRIM(BOTH ';' FROM
-                COALESCE(f.warning_flags, '') || ';reasserted_from_core'), '')
-        FROM core.sending_account sa
+            warning_flags = CASE
+                WHEN COALESCE(f.warning_flags, '') LIKE '%reasserted_from_core%' THEN f.warning_flags
+                ELSE NULLIF(TRIM(BOTH ';' FROM
+                    COALESCE(f.warning_flags, '') || ';reasserted_from_core'), '') END
+        FROM (
+            SELECT workspace_slug,
+                   LOWER(email)               AS email_lc,
+                   arg_max(esp, daily_limit)  AS esp,
+                   max(daily_limit)           AS daily_limit
+            FROM core.sending_account
+            WHERE is_active AND esp IS NOT NULL AND daily_limit > 0
+            GROUP BY workspace_slug, LOWER(email)
+        ) sa
         WHERE f.account_status = -999
-          AND LOWER(sa.email) = LOWER(f.email)
-          AND sa.workspace_slug = f.workspace_slug
-          AND sa.is_active
-          AND sa.esp IS NOT NULL
-          AND sa.daily_limit > 0
+          AND LOWER(f.email) = sa.email_lc
+          AND f.workspace_slug = sa.workspace_slug
     """)
     after = db.execute(
         "SELECT count(*) FROM raw_account_truth_daily_actuals WHERE account_status = -999"

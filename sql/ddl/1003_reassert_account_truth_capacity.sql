@@ -22,6 +22,14 @@
 -- the entity then repopulates + reasserts. It only ever touches account_status=-999
 -- rows, so re-running never double-applies. Conservative: leaves retired /
 -- esp-unresolved / warming (daily_limit<=0) rows untouched -> no capacity overcount.
+-- The ESP->infra_type/provider_code map, the status label, and the warning_flags
+-- handling below are kept BYTE-IDENTICAL to entities/sending_dq.py::
+-- _reassert_capacity_from_core so a live-healed row equals a nightly-rebuilt row for
+-- the same account (dashboards/joins key on these fields).
+-- Source is DEDUPED to one row per (workspace_slug, lower(email)) so UPDATE...FROM is
+-- deterministic even if an email were ever active under >1 row (verified 0 dupes
+-- 2026-06-23, but the dedup makes the pick provably stable: max daily_limit, esp via
+-- arg_max on the same row).
 UPDATE raw_account_truth_daily_actuals AS f
 SET infra_type = CASE sa.esp
         WHEN 'google' THEN 'Google'
@@ -40,12 +48,19 @@ SET infra_type = CASE sa.esp
     delta = sa.daily_limit - COALESCE(f.actual_sends, 0),
     fulfillment = CASE WHEN sa.daily_limit > 0
         THEN COALESCE(f.actual_sends, 0)::DOUBLE / sa.daily_limit END,
-    warning_flags = NULLIF(TRIM(BOTH ';' FROM
-        COALESCE(f.warning_flags, '') || ';reasserted_from_core'), '')
-FROM core.sending_account sa
+    warning_flags = CASE
+        WHEN COALESCE(f.warning_flags, '') LIKE '%reasserted_from_core%' THEN f.warning_flags
+        ELSE NULLIF(TRIM(BOTH ';' FROM
+            COALESCE(f.warning_flags, '') || ';reasserted_from_core'), '') END
+FROM (
+    SELECT workspace_slug,
+           LOWER(email)               AS email_lc,
+           arg_max(esp, daily_limit)  AS esp,
+           max(daily_limit)           AS daily_limit
+    FROM core.sending_account
+    WHERE is_active AND esp IS NOT NULL AND daily_limit > 0
+    GROUP BY workspace_slug, LOWER(email)
+) sa
 WHERE f.account_status = -999
-  AND LOWER(sa.email) = LOWER(f.email)
-  AND sa.workspace_slug = f.workspace_slug
-  AND sa.is_active
-  AND sa.esp IS NOT NULL
-  AND sa.daily_limit > 0;
+  AND LOWER(f.email) = sa.email_lc
+  AND f.workspace_slug = sa.workspace_slug;
