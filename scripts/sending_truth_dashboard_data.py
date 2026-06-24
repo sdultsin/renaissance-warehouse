@@ -71,14 +71,34 @@ def _build_sql(days: int) -> str:
       WHERE census_date >= (SELECT max(census_date) FROM core.account_label) - INTERVAL '{days} days'
     ),
     snd AS (
-      SELECT date, lower(account_id) AS email, COALESCE(actual_sends, 0) AS actual_sends
+      SELECT date, lower(account_id) AS email, workspace_slug, esp,
+             COALESCE(daily_limit, 0) AS daily_limit, COALESCE(actual_sends, 0) AS actual_sends
       FROM core.sending_account_daily
       WHERE date >= (SELECT max(census_date) FROM core.account_label) - INTERVAL '{days} days'
     ),
     joined AS (
+      -- census era (>= first census day 2026-06-21): full lifecycle/infra/vendor from account_label
       SELECT al.date, al.workspace_slug, al.infra, al.lifecycle, al.vendor,
              al.daily_limit, COALESCE(snd.actual_sends, 0) AS actual_sends
       FROM al LEFT JOIN snd ON snd.email = al.email AND snd.date = al.date
+      UNION ALL
+      -- pre-census backfill (< first census day): real per-day Total Emails (daily_limit) + Actual
+      -- straight from sending_account_daily. Lifecycle wasn't tracked yet -> '(pre-census)' so the
+      -- Active/Warmup split stays honestly blank for these days; infra mapped from esp.
+      SELECT snd.date, snd.workspace_slug,
+             CASE WHEN snd.esp ILIKE 'google' THEN 'Google'
+                  WHEN snd.esp ILIKE 'outlook' OR snd.esp ILIKE 'microsoft' THEN 'Outlook'
+                  ELSE 'OTD' END AS infra,
+             '(pre-census)' AS lifecycle,
+             '(untagged)' AS vendor,
+             -- capacity: only the REAL current roster (phantom-free, consistent w/ census-era);
+             -- actuals: ALL accounts, so historical sends stay the true total.
+             CASE WHEN snd.email IN (SELECT lower(email) FROM core.account_label
+                                     WHERE census_date = (SELECT max(census_date) FROM core.account_label))
+                  THEN snd.daily_limit ELSE 0 END AS daily_limit,
+             snd.actual_sends
+      FROM snd
+      WHERE snd.date < (SELECT min(census_date) FROM core.account_label)
     )
     SELECT
       CAST(j.date AS VARCHAR)                                         AS date,
