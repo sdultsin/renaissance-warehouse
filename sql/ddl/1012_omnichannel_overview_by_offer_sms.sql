@@ -111,9 +111,14 @@ sms_inb_dedup AS (
         FROM raw_sendivo_inbound) WHERE rn = 1
 ),
 sms_inb AS (
+  -- replies_human + replies_auto computed as EXPLICIT, mutually-exclusive filters in the SAME
+  -- (offer, date) bucket — no cross-CTE subtraction. auto = non-opt-out & qwen-classified non-human;
+  -- human = everything else (opt-outs + non-opt-out where is_human is true OR unclassified/NULL).
+  -- human + auto = count(*) exactly, so the leg reconciles. Semantics match v_omni_sms_performance
+  -- (unclassified replies fall to human, same as its replies_total - replies_auto).
   SELECT COALESCE(b.offer, '(offer-unknown)') AS offer, CAST(i.received_at AS DATE) AS metric_date,
          count(*) FILTER (WHERE (NOT i.is_opt_out) AND q.is_human = CAST('f' AS BOOLEAN)) AS replies_auto,
-         count(*) AS replies_total,
+         count(*) FILTER (WHERE i.is_opt_out OR q.is_human IS DISTINCT FROM CAST('f' AS BOOLEAN)) AS replies_human,
          count(*) FILTER (WHERE (NOT i.is_opt_out) AND q.is_positive = CAST('t' AS BOOLEAN)) AS positive_replies
   FROM sms_inb_dedup i
   LEFT JOIN sms_brand b ON b.sn_digits = i.our_digits
@@ -134,7 +139,7 @@ sms_keys AS (
 sms_final AS (
   SELECT 'sms' AS channel, k.offer, k.metric_date,
          COALESCE(s.sent, 0) AS sent,
-         (COALESCE(i.replies_total, 0) - COALESCE(i.replies_auto, 0)) AS replies_human,
+         COALESCE(i.replies_human, 0) AS replies_human,
          COALESCE(i.replies_auto, 0) AS replies_auto,
          COALESCE(i.positive_replies, 0) AS positive_replies,
          COALESCE(mt.meetings_booked, 0) AS meetings_booked
