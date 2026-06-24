@@ -62,8 +62,8 @@ CREATE TABLE IF NOT EXISTS core.channel_offer_map (
   PRIMARY KEY (channel, source_key)
 );
 
--- Idempotent re-seed of the WhatsApp rows (delete-then-insert this channel only; never touches other channels).
-DELETE FROM core.channel_offer_map WHERE channel = 'whatsapp';
+-- Idempotent re-seed of the WhatsApp rows — UPSERT (no DELETE, provably non-destructive): re-running
+-- this DDL refreshes the mapped rows and never removes data. Other channels are never touched.
 INSERT INTO core.channel_offer_map
   (channel, source_key, offer, offer_kind, confidence, method, confirmed_by, confirmed_at, notes) VALUES
   ('whatsapp', 'a2484184-4c18-4faf-b2b9-dff9a4cadb25', 'Business Funding', 'sales', 'confirmed',
@@ -74,7 +74,15 @@ INSERT INTO core.channel_offer_map
    '24,806 convs; number warm-up / OTP, not a sales offer — exclude from funnel'),
   ('whatsapp', 'a8fe7634-40f7-44f5-9376-030672e71328', NULL, 'test', 'confirmed',
    'outbound_copy: dev gibberish/"test"', 'whatsapp-offer-tagging', '2026-06-24',
-   '7 convs; developer test pipeline');
+   '7 convs; developer test pipeline')
+ON CONFLICT (channel, source_key) DO UPDATE SET
+  offer        = EXCLUDED.offer,
+  offer_kind   = EXCLUDED.offer_kind,
+  confidence   = EXCLUDED.confidence,
+  method       = EXCLUDED.method,
+  confirmed_by = EXCLUDED.confirmed_by,
+  confirmed_at = EXCLUDED.confirmed_at,
+  notes        = EXCLUDED.notes;
 
 -- ─────────────────────────────────────────────────────────────────────────────────────────────────
 -- 2. core.v_channel_offer — ONE cross-channel offer lookup: "what offer is this (channel, key)?".
