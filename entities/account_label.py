@@ -108,7 +108,7 @@ def run_account_label(ctx: RunContext) -> PhaseResult:
         COALESCE(vnd.vendor_category, '(pending)')                        AS vendor,
         CASE WHEN vnd.vendor_category IS NOT NULL THEN 'sending_account_vendor'
              ELSE '(pending)' END                                         AS vendor_source,
-        CASE WHEN cold.email IS NOT NULL THEN 'Active' ELSE 'Warmup' END  AS lifecycle,
+        CASE WHEN cold.email IS NOT NULL AND cen.daily_limit > 0 THEN 'Active' ELSE 'Warmup' END  AS lifecycle,
         -- BINARY D1: cold-ever => confident Active; else uncertain (the strict-D1 outcome:
         -- confident-Warmup=0; every non-cold account is genuinely ambiguous within the cold window).
         CASE WHEN cold.email IS NOT NULL THEN 'confident' ELSE 'uncertain' END
