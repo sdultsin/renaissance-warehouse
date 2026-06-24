@@ -1,7 +1,7 @@
 -- @gate: add
--- Depends on 1006
+-- Depends on 1007
 -- ============================================================================
--- 1007_rg_tag_populate.sql — ADD-ONLY backfill of the empty RG-tag columns.
+-- 1008_rg_tag_populate.sql — ADD-ONLY backfill of the empty RG-tag columns.
 -- ----------------------------------------------------------------------------
 -- PURELY ADDITIVE: core.sending_account_batch.rg_tag_1 / rg_tag_2 are 100% NULL
 -- today; this fills them and NEVER overwrites or deletes anything (the UPDATE is
