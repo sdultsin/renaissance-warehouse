@@ -36,6 +36,13 @@ WS5 v3 [2026-06-21] — canonical business-date + workspace-normalized D6 attrib
                     core.campaign.offer post-insert.
   HARD DEP: core.workspace_alias (created+seeded self-contained in the 107 DDL, block 107.0a) MUST
             exist before this phase runs.
+
+Pre-IPO partner desks [2026-06-25] — step 2.5 adds a THIRD class of source='sheet' rows from the
+  partner booking sheets (raw_sheets_summit_ventures_leads / raw_sheets_collins_preipo_leads), the
+  missing Pre-IPO MEETING source (the Funding-Form is Business-Funding-only). offer/program='Pre-IPO',
+  channel per-row from "Sending Account", meeting_id namespaced 'summit:'/'collins:' so the Funding-Form-
+  only logic ('sheet:%' guards on 2b/2c and the attribution health metrics) never touches them. See the
+  PARTNER_BOOKING_SHEETS block + DDL partner_booking_sheets.sql + scripts/stage_partner_booking_sheets.py.
 """
 from __future__ import annotations
 
@@ -56,6 +63,30 @@ CUTOVER = "2026-06-01"  # sheet is canonical on/after this date; Slack stays unt
 # TZ-normalization pass for a handful of boundary-day meetings.
 # WS5 v3: the sheet branch now gates on col A (meeting_date), with a col-C-date fallback. CUTOVER stays
 # 2026-06-01 so the slack(<=May-31) / sheet(>=Jun-01) branches never overlap on either date column.
+
+# -- Pre-IPO partner booking desks (2026-06-25, deliverables/2026-06-25-partner-booking-sheets-ingest) --
+# Pre-IPO meetings are logged by partner desks in their OWN Google Sheets — the master Funding-Form is
+# Business-Funding-only (verified: core.meeting had ZERO Pre-IPO meetings). These land as additional
+# source='sheet' rows so every existing source='sheet' funnel / SMS-dashboard / omnichannel view picks
+# them up automatically, distinguished by `partner` and a namespaced meeting_id ('summit:'/'collins:' vs
+# the Funding-Form 'sheet:'). offer/program='Pre-IPO' for ALL rows (partner-desk level; corroborated by
+# core.v_channel_offer mapping Summit's funding4doctors_llc -> Pre-IPO + Collins's explicit Pre-IPO
+# campaigns/investor-qual columns). channel is per-row from the "Sending Account" cell. campaign_id stays
+# NULL (the cell is a partner SMS blast/script name, not an Instantly campaign) -> the Funding-Form-only
+# backfills (2b/2c) are gated OFF partner rows by the 'sheet:%' meeting_id prefix. NOT gated on CUTOVER:
+# there is no Slack/Funding-Form coverage of Pre-IPO (verified 0 overlap), so pre-Jun-1 Collins rows have
+# no competing source to double-count against.  (raw_table, partner_label, id_prefix)
+PARTNER_BOOKING_SHEETS = [
+    ("main.raw_sheets_summit_ventures_leads", "Summit Ventures",             "summit"),
+    ("main.raw_sheets_collins_preipo_leads",  "Collins Investment Partners", "collins"),
+]
+# Partner-sheet column positions (0-based) — Summit & Collins share the same leading layout.
+_P_DATE = 0
+_P_EMAIL = 3
+_P_SENDING_ACCOUNT = 6
+_P_CAMPAIGN = 7
+_P_BOOKED_DATE = 8
+_P_ADVISOR = 10
 
 # Funding-Form 'Data' tab column positions (0-based), confirmed 2026-06-13. Keep in sync with
 # scripts/stage_funding_form.py EXPECTED_HEADER (the producer fails loud on column drift).
@@ -127,6 +158,32 @@ def _im_norm_case(col_expr: str) -> str:
         f"            WHEN {col_expr} = '{k}' THEN '{v}'" for k, v in _IM_FIRST_TO_FULL.items()
     )
     return f"CASE\n{whens}\n            ELSE {col_expr} END"
+
+
+def _partner_channel_case(col_expr: str) -> str:
+    """Per-row channel from the partner sheet's "Sending Account" cell. Returns the canonical
+    Email/SMS/WhatsApp vocabulary; an unrecognized value -> '(unmapped)' (never guessed)."""
+    return (
+        f"CASE WHEN lower({col_expr}) = 'sms' THEN 'SMS'\n"
+        f"             WHEN lower({col_expr}) = 'whatsapp' THEN 'WhatsApp'\n"
+        f"             WHEN {col_expr} = 'Email' OR {col_expr} LIKE '%@%' THEN 'Email'\n"
+        f"             ELSE '(unmapped)' END"
+    )
+
+
+def _partner_union_sql() -> str:
+    """UNION ALL of each partner sheet's LATEST snapshot (partner label + id prefix + row_json).
+    Mirrors the Funding-Form 'read only the latest _run_id' rule so corrections win and the projection
+    stays a true idempotent rebuild."""
+    parts = []
+    for table, partner, pfx in PARTNER_BOOKING_SHEETS:
+        parts.append(
+            f"  SELECT '{partner}' AS partner, '{pfx}' AS pfx, row_json\n"
+            f"    FROM {table}\n"
+            f"   WHERE _run_id = (SELECT _run_id FROM {table} ORDER BY _loaded_at DESC LIMIT 1)\n"
+            f"     AND row_index > 0"
+        )
+    return "\n  UNION ALL\n".join(parts)
 
 
 def register(registry: Registry) -> None:
@@ -311,6 +368,96 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
         """
     )
 
+    # -- 2.5 PRE-IPO PARTNER BOOKING DESKS (Summit Ventures SMS + Collins email/SMS/WhatsApp). Additional
+    #        source='sheet' rows (so every source='sheet' view picks them up), offer/program='Pre-IPO',
+    #        channel per-row from "Sending Account", campaign_id NULL (partner blast/script name kept in
+    #        campaign_name_raw for meetings-by-blast). meeting_id namespaced 'summit:'/'collins:' (never
+    #        collides with the Funding-Form 'sheet:'). Runs AFTER step 2 so the dedup-vs-Funding-Form
+    #        NOT EXISTS sees the just-inserted Funding-Form rows. NOT gated on CUTOVER (no competing
+    #        Slack/Funding-Form Pre-IPO source — verified 0 overlap). Workspace/cm_workspace left NULL so
+    #        these never leak CM credit onto a funding workspace.
+    db.execute(
+        f"""
+        INSERT INTO core.meeting
+          (meeting_id, source, source_event_id, posted_at, partner, campaign_id,
+           campaign_name_raw, cm, channel, lead_email, match_method, match_confidence,
+           is_duplicate_of, cost_per_meeting_usd_estimated, raw_text,
+           advisor, advisor_name, advisor_partner, inbox_manager,
+           meeting_date, submission_ts, workspace_name, workspace_slug, workspace_canonical,
+           cm_workspace, program, offer, sendivo_sub_account)
+        WITH ps_raw AS (
+{_partner_union_sql()}
+        ),
+        ps AS (
+          SELECT partner, pfx,
+            NULLIF(lower(trim(json_extract_string(row_json, '$[{_P_EMAIL}]'))),'')        AS lead_email,
+            trim(json_extract_string(row_json, '$[{_P_SENDING_ACCOUNT}]'))                AS sending_account,
+            NULLIF(trim(json_extract_string(row_json, '$[{_P_CAMPAIGN}]')),'')            AS campaign_name,
+            NULLIF(trim(json_extract_string(row_json, '$[{_P_BOOKED_DATE}]')),'')         AS booked_raw,
+            NULLIF(trim(json_extract_string(row_json, '$[{_P_ADVISOR}]')),'')             AS advisor,
+            TRY_STRPTIME(trim(json_extract_string(row_json, '$[{_P_DATE}]')), '%m/%d/%Y')::DATE AS meeting_date
+          FROM ps_raw
+        ),
+        ps_typed AS (
+          SELECT *, {_partner_channel_case('sending_account')} AS channel
+          FROM ps
+          WHERE meeting_date IS NOT NULL          -- 100%-or-wipe: a row with an unparseable booked-on date is dropped
+        ),
+        ps_keyed AS (
+          SELECT *,
+            pfx || ':' || md5(
+              COALESCE(lead_email,'')   || '|' || COALESCE(meeting_date::VARCHAR,'') || '|' ||
+              COALESCE(campaign_name,'')|| '|' || COALESCE(booked_raw,'')            || '|' || channel
+            ) AS meeting_id
+          FROM ps_typed
+        ),
+        ps_dedup AS (   -- collapse byte-identical rows (a true duplicate sheet entry); genuine repeats
+          SELECT * FROM ps_keyed     -- (same lead, different date/campaign) keep distinct meeting_ids
+          QUALIFY ROW_NUMBER() OVER (PARTITION BY meeting_id ORDER BY campaign_name) = 1
+        )
+        SELECT
+          d.meeting_id,
+          'sheet'                            AS source,
+          NULL                               AS source_event_id,
+          CAST(d.meeting_date AS TIMESTAMP)  AS posted_at,           -- partner sheets carry no time-of-day
+          d.partner,
+          NULL                               AS campaign_id,         -- partner blast/script, not an Instantly campaign
+          d.campaign_name                    AS campaign_name_raw,   -- kept for meetings-by-blast attribution
+          NULL                               AS cm,                  -- not a Renaissance-CM workspace
+          d.channel,
+          d.lead_email,
+          'partner_sheet'                    AS match_method,
+          NULL                               AS match_confidence,
+          NULL                               AS is_duplicate_of,
+          NULL                               AS cost_per_meeting_usd_estimated,
+          NULL                               AS raw_text,
+          d.advisor                          AS advisor,             -- bare name (no "<prefix>:" form)
+          d.advisor                          AS advisor_name,
+          d.partner                          AS advisor_partner,     -- the booking desk
+          NULL                               AS inbox_manager,       -- partner-side setter stays in the raw table, not an IM
+          d.meeting_date                     AS meeting_date,        -- canonical (col A "Date" = booked-on)
+          CAST(d.meeting_date AS TIMESTAMP)  AS submission_ts,
+          NULL                               AS workspace_name,      -- partner desk, not a Renaissance workspace
+          NULL                               AS workspace_slug,
+          NULL                               AS workspace_canonical,
+          NULL                               AS cm_workspace,        -- no CM credit (prevents Pre-IPO leaking onto a funding CM)
+          'Pre-IPO'                          AS program,
+          'Pre-IPO'                          AS offer,
+          NULL                               AS sendivo_sub_account
+        FROM ps_dedup d
+        -- DEDUP vs the Funding-Form rows inserted in step 2: drop a partner row whose (lead_email,
+        -- meeting_date) already exists as a Funding-Form meeting (same booking logged twice). 0 today
+        -- (verified net-new); a go-forward guard. Funding-Form rows carry meeting_id 'sheet:%'.
+        WHERE NOT EXISTS (
+          SELECT 1 FROM core.meeting ff
+          WHERE ff.meeting_id LIKE 'sheet:%'
+            AND d.lead_email IS NOT NULL
+            AND ff.lead_email = d.lead_email
+            AND ff.meeting_date = d.meeting_date
+        )
+        """
+    )
+
     # -- 2b. Campaign-id BACKFILL for sheet email rows the norm-name join missed (handoff B2).
     #        The sheet's Campaign Name is sometimes truncated ("... - (EYVE" with no closing paren,
     #        which defeats norm_campaign_name's trailing "- (Name)" strip), renamed, or a genuine
@@ -341,6 +488,7 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
             FROM core.meeting m2
             JOIN main.raw_pipeline_reply_data r ON lower(r.lead_email) = m2.lead_email
             WHERE m2.source = 'sheet' AND m2.channel = 'Email' AND m2.campaign_id IS NULL
+              AND m2.meeting_id LIKE 'sheet:%'   -- Funding-Form rows only; partner-sheet rows (Pre-IPO, no Instantly campaign) are exempt
               AND m2.lead_email IS NOT NULL AND m2.lead_email <> ''
               AND r.campaign_id IS NOT NULL
           ) WHERE rn = 1
@@ -394,7 +542,8 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
         SET offer = c.offer
         FROM core.campaign c
         WHERE m.campaign_id = c.campaign_id AND m.channel = 'Email'
-          AND m.source = 'sheet' AND c.offer IS NOT NULL
+          AND m.source = 'sheet' AND m.meeting_id LIKE 'sheet:%'  -- Funding-Form rows only; never clobber the partner Pre-IPO tag
+          AND c.offer IS NOT NULL
         """
     )
 
@@ -416,22 +565,39 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
     by_source = db.execute(
         "SELECT source, count(*) FROM core.meeting GROUP BY 1 ORDER BY 1"
     ).fetchall()
+    # Funding-Form email-attribution health — scoped to 'sheet:%' so the partner Pre-IPO email rows
+    # (intentionally campaign_id NULL) don't pollute the Funding-Form attribution %.
     sheet_unmatched = db.execute(
-        "SELECT count(*) FROM core.meeting WHERE source='sheet' AND channel='Email' AND campaign_id IS NULL"
+        "SELECT count(*) FROM core.meeting WHERE source='sheet' AND channel='Email' AND campaign_id IS NULL "
+        "AND meeting_id LIKE 'sheet:%'"
     ).fetchone()[0]
     sheet_backfilled = db.execute(
         "SELECT count(*) FROM core.meeting WHERE match_method='email_reply_backfill'"
     ).fetchone()[0]
     sheet_email_total = db.execute(
-        "SELECT count(*) FROM core.meeting WHERE source='sheet' AND channel='Email'"
+        "SELECT count(*) FROM core.meeting WHERE source='sheet' AND channel='Email' AND meeting_id LIKE 'sheet:%'"
     ).fetchone()[0]
     sheet_attr_pct = round(100.0 * (sheet_email_total - sheet_unmatched) / sheet_email_total, 2) if sheet_email_total else None
+    # Pre-IPO partner-desk rows (Summit + Collins) — net-new meetings by channel, all offer='Pre-IPO'.
+    partner_by_channel = db.execute(
+        "SELECT channel, count(*) FROM core.meeting WHERE match_method='partner_sheet' GROUP BY 1 ORDER BY 1"
+    ).fetchall()
+    partner_total = sum(c for _, c in partner_by_channel)
+    partner_unmapped = db.execute(
+        "SELECT count(*) FROM core.meeting WHERE match_method='partner_sheet' AND channel='(unmapped)'"
+    ).fetchone()[0]
+    if partner_unmapped:
+        logger.warning("core.meeting: %d partner-sheet rows have an unmapped channel "
+                       "(unrecognized 'Sending Account') — they fall out of all channel-scoped views",
+                       partner_unmapped)
     logger.info("core.meeting rebuilt: %d rows %s; sheet email-meetings unmatched=%d "
-                "(reply-backfilled=%d, sheet-email-attribution=%.2f%%)",
-                n, dict(by_source), sheet_unmatched, sheet_backfilled, sheet_attr_pct or 0.0)
+                "(reply-backfilled=%d, sheet-email-attribution=%.2f%%); partner Pre-IPO meetings=%d %s",
+                n, dict(by_source), sheet_unmatched, sheet_backfilled, sheet_attr_pct or 0.0,
+                partner_total, dict(partner_by_channel))
     return PhaseResult(
         rows_in=n, rows_out=n,
         notes={"by_source": dict(by_source), "sheet_email_unmatched": sheet_unmatched,
                "sheet_email_backfilled": sheet_backfilled, "sheet_email_attr_pct": sheet_attr_pct,
-               "cutover": CUTOVER},
+               "cutover": CUTOVER, "partner_preipo_meetings": partner_total,
+               "partner_preipo_by_channel": dict(partner_by_channel)},
     )
