@@ -12,27 +12,22 @@
 --
 -- WHY: warmup-start dates and the resulting day-by-day go-live schedule lived only in
 -- Instantly + a hand-kept Google "Batches" sheet + Slack, and were not queryable in the
--- warehouse. This dimension answers "how many inboxes go Active on day D, in which
--- workspace" for launch coordination (sending-capacity ramp).
+-- warehouse. core.account_registry already holds these inboxes at row grain (vendor /
+-- workspace / batch / cohort) but has no warmup-start date; this cohort dimension adds the
+-- warmup -> go-live SCHEDULE so "how many inboxes go Active on day D, in which workspace"
+-- is answerable for launch coordination (sending-capacity ramp).
 --
--- SOURCE: David's 2026-06-25 Slack update — MilkBox B123-B125 top-up across Funding 1/2/4
--- (warmup-start 2026-06-10 .. 2026-06-20; 14-day warmup; ~59,799 inboxes; 1,145 flagged as
--- an upload error under vendor re-check), and MailIn B126-B128 (not yet uploaded; 2-week
--- warmup assumed; workspace TBD).
+-- DATA LOAD: this DDL is the TABLE + VIEW definition ONLY — it does NOT read any file, so
+-- it always applies cleanly under both the nightly and the moderator apply-now (whose cwd
+-- is /opt/moderator/bin, not the repo root). The rows are loaded box-side by
+-- scripts/load_batch_warmup_schedule.py from the EXTERNAL, gitignored seed
+-- seed_data/batch_warmup_schedule.csv (so inbox-supplier names + infra scale stay out of
+-- the PUBLIC repo — same boundary as core.account_registry / core.funding_partner, and per
+-- the 2026-06-24 box-owner note on DDL 92 that read_csv-in-DDL seeds are unsafe under apply).
 --
--- Loaded from an EXTERNAL, gitignored seed file (seed_data/batch_warmup_schedule.csv) so
--- inbox-supplier names + infra scale are not committed to the PUBLIC repo — same policy
--- as core.funding_partner. The DDL itself carries NO data.
---
--- REFRESH: this is a point-in-time snapshot; statuses change as warmup completes and the
--- 1,145 MilkBox upload error is resolved. The load body below is insert-once (it runs
--- exactly once under version tracking, on the freshly-created empty table). To refresh,
--- update the CSV on the droplet and ship a NEW version DDL that UPSERTs
--- (ON CONFLICT (cohort_id) DO UPDATE SET ...) — non-destructive. The table is keyed on a
--- stable surrogate cohort_id so re-loads / upserts are clean.
---
--- Idempotent + non-destructive: CREATE IF NOT EXISTS + a guarded insert-once. Missing seed
--- file -> table left empty (guarded glob), warehouse still builds.
+-- REFRESH: point-in-time snapshot; statuses change as warmup completes and the 1,145
+-- MilkBox upload error is resolved. To refresh: update the CSV on the box and re-run the
+-- loader (idempotent INSERT OR REPLACE on cohort_id) — non-destructive, no DDL change.
 
 CREATE SCHEMA IF NOT EXISTS core;
 
@@ -48,23 +43,8 @@ CREATE TABLE IF NOT EXISTS core.batch_warmup_schedule (
   source              VARCHAR,
   as_of_date          DATE,                 -- snapshot date of this fact
   notes               VARCHAR,
-  _curated_at         TIMESTAMPTZ NOT NULL
+  _curated_at         TIMESTAMPTZ           -- set by the loader
 );
-
--- Guarded insert-once seed from the external, gitignored CSV (empty strings -> NULL).
--- Non-destructive: ON CONFLICT DO NOTHING (no row removal) — same pattern as core.funding_partner.
-INSERT INTO core.batch_warmup_schedule
-  (cohort_id, provider, batch_key, workspace, warmup_start_date, warmup_length_days,
-   n_accounts, status, source, as_of_date, notes, _curated_at)
-SELECT
-  cohort_id, provider, batch_key, workspace,
-  TRY_CAST(warmup_start_date AS DATE),
-  COALESCE(TRY_CAST(warmup_length_days AS INTEGER), 14),
-  TRY_CAST(n_accounts AS INTEGER),
-  status, source, TRY_CAST(as_of_date AS DATE), notes, now()
-FROM read_csv_auto('seed_data/batch_warmup_schedule.csv', header=true, nullstr='', all_varchar=true)
-WHERE (SELECT count(*) FROM glob('seed_data/batch_warmup_schedule.csv')) > 0
-ON CONFLICT (cohort_id) DO NOTHING;
 
 -- Per-cohort go-live schedule (derived). go_live_date = warmup_start + warmup_length.
 CREATE OR REPLACE VIEW core.v_warmup_golive_schedule AS
@@ -80,9 +60,13 @@ SELECT
   source, as_of_date, notes
 FROM core.batch_warmup_schedule;
 
--- Daily go-live rollup: inboxes becoming Active per (go_live_date, provider, workspace).
--- (Email volume = inboxes x per-account daily send limit; join to the sending-capacity
--- views to attach a limit — deliberately NOT assumed here.)
+-- Daily go-live RAMP: inboxes becoming Active per (go_live_date, provider, workspace).
+-- ONLY operationally-live cohorts (status 'warming'/'active') contribute — 'pending_upload'
+-- and 'upload_error' cohorts are excluded even if a (scheduled) warmup_start_date is present,
+-- so the capacity ramp is never inflated by not-yet-live or broken inboxes. A cohort with
+-- unknown size (n_accounts NULL) contributes 0. (Email volume = inboxes x per-account daily
+-- send limit; join the sending-capacity views to attach a limit — NOT assumed here.)
+-- For the full schedule incl. pending/error cohorts, use core.v_warmup_golive_schedule.
 CREATE OR REPLACE VIEW core.v_warmup_golive_daily AS
 SELECT
   go_live_date,
@@ -91,5 +75,6 @@ SELECT
   SUM(COALESCE(n_accounts, 0)) AS inboxes_going_active
 FROM core.v_warmup_golive_schedule
 WHERE go_live_date IS NOT NULL
+  AND status IN ('warming', 'active')
 GROUP BY 1, 2, 3
 ORDER BY 1, 2, 3;
