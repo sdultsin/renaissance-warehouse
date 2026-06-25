@@ -82,6 +82,19 @@ def main() -> int:
     if bad:
         con.close()
         raise SystemExit(f"ABORT: {bad} row(s) in {SEED} have an unparseable date/int — fix the seed.")
+    # Enforce the warming<->date invariant that core.v_warmup_golive_daily relies on: a
+    # 'warming' cohort MUST carry a warmup_start_date, otherwise its go_live_date is NULL and
+    # it would silently drop out of the go-live ramp (under-counting fresh capacity). Pending /
+    # error / active cohorts may legitimately have no date.
+    bad_warming = con.execute(
+        "SELECT count(*) FROM _seed WHERE status = 'warming' AND coalesce(warmup_start_date, '') = ''"
+    ).fetchone()[0]
+    if bad_warming:
+        con.close()
+        raise SystemExit(
+            f"ABORT: {bad_warming} 'warming' row(s) in {SEED} have no warmup_start_date — "
+            f"they would silently drop from the go-live ramp; set the date or change the status."
+        )
 
     # Explicit column list -> bind by NAME, not position (robust to future column-order
     # drift in either the CSV or DDL 1015). Idempotent INSERT OR REPLACE on the cohort_id PK.
