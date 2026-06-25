@@ -63,8 +63,9 @@ FROM core.batch_warmup_schedule;
 -- Upcoming go-live RAMP: NEW inboxes scheduled to flip Warmup -> Active per
 -- (go_live_date, provider, workspace) = "how much fresh sending capacity comes online on
 -- day D". Scope is exactly status='warming' (the cohorts whose flip is still PENDING):
---   * 'warming' cohorts are warming NOW, so each has a warmup_start_date -> go_live_date is
---     always defined (never a silent drop), and the flip is in the future / just due.
+--   * 'warming' cohorts are warming NOW; the loader (load_batch_warmup_schedule.py) ENFORCES
+--     that every 'warming' row carries a warmup_start_date (fails loud otherwise), so here
+--     go_live_date is always defined and a warming cohort can never silently drop.
 --   * 'active' cohorts have ALREADY come online — they are not "new capacity on day D" and
 --     are deliberately not re-counted here (their flip is history; see the schedule view).
 --   * 'upload_error' / 'pending_upload' are not live and never contribute.
