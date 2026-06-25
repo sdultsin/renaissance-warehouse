@@ -24,8 +24,23 @@ base AS (
          a.reply_count_unique, a.reply_count_automatic_unique, a.total_opportunities, a.total_opportunity_value,
          a.bounced_count, a.completed_count, a.campaign_id AS analytics_cid, a._loaded_at AS analytics_loaded_at,
          a.emails_sent_count,
-         -- canonical sent: analytics, else 45d daily sum, else all-time campaign_data cumulative, else NULL
-         COALESCE(a.emails_sent_count, NULLIF(ps.sent_additive,0), NULLIF(cc.emails_sent,0)) AS sent_fixed,
+         -- canonical sent [2026-06-25 reconciliation]: GREATEST of the three synced sources, NOT first-non-null
+         -- COALESCE. WHY: no single source is reliably the freshest. The analytics table (emails_sent_count) is
+         -- STALE/holey for paused & old campaigns (NULL row, or a frozen low value), so a first-non-null COALESCE
+         -- served catastrophic undercounts (proven vs Instantly API: OFF-Pair15 190,321 vs true 517,606 = -63%;
+         -- CEOs(TOMI) 39,092 vs 262,082 = -85%; KD12-CEOs -12%; ALEADS -24.8%). The daily additive sum (ps) is
+         -- freshest on some campaigns; the campaign_data __ALL__ cumulative (cc) on others; analytics on yet others
+         -- (Test-Dave1: cc=56,649 is the LOW one, analytics 259,322 is correct). GREATEST takes whichever source
+         -- has progressed furthest = the most-recent true count under the lag rule (warehouse <= Instantly).
+         -- VERIFIED across 10 sampled funding campaigns: GREATEST never exceeds the Instantly API truth (10/10
+         -- <= API); every residual gap is lag/freshness only (the freshness monitor catches those).
+         -- NULLIF(...,0): all-sources-absent stays an honest NULL ("unknown sends"), never 0 (preserves D-L2-5).
+         -- MONITOR GUARDS (wired in the nightly reconciliation, see deliverables/2026-06-24-warehouse-accuracy):
+         --   (1) wh_exceeds_api is a HARD RED — GREATEST takes the max of three independently-synced snapshots,
+         --       so a single corrupt/double-counted source would silently push wh>API; never drop this flag.
+         --   (2) populated-source-outlier: a non-zero source >1.5x the 2nd-highest *non-zero* source, with no API
+         --       confirmation, alerts (fleet check 2026-06-25: 0 active-funding campaigns breach it -> safe today).
+         NULLIF(GREATEST(COALESCE(a.emails_sent_count,0), COALESCE(ps.sent_additive,0), COALESCE(cc.emails_sent,0)), 0) AS sent_fixed,
          pr.unique_repliers
   FROM pc
   LEFT JOIN main.raw_instantly_campaign_analytics a ON a.campaign_id = pc.campaign_id
