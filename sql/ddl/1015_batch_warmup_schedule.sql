@@ -60,13 +60,18 @@ SELECT
   source, as_of_date, notes
 FROM core.batch_warmup_schedule;
 
--- Daily go-live RAMP: inboxes becoming Active per (go_live_date, provider, workspace).
--- ONLY operationally-live cohorts (status 'warming'/'active') contribute — 'pending_upload'
--- and 'upload_error' cohorts are excluded even if a (scheduled) warmup_start_date is present,
--- so the capacity ramp is never inflated by not-yet-live or broken inboxes. A cohort with
--- unknown size (n_accounts NULL) contributes 0. (Email volume = inboxes x per-account daily
--- send limit; join the sending-capacity views to attach a limit — NOT assumed here.)
--- For the full schedule incl. pending/error cohorts, use core.v_warmup_golive_schedule.
+-- Upcoming go-live RAMP: NEW inboxes scheduled to flip Warmup -> Active per
+-- (go_live_date, provider, workspace) = "how much fresh sending capacity comes online on
+-- day D". Scope is exactly status='warming' (the cohorts whose flip is still PENDING):
+--   * 'warming' cohorts are warming NOW, so each has a warmup_start_date -> go_live_date is
+--     always defined (never a silent drop), and the flip is in the future / just due.
+--   * 'active' cohorts have ALREADY come online — they are not "new capacity on day D" and
+--     are deliberately not re-counted here (their flip is history; see the schedule view).
+--   * 'upload_error' / 'pending_upload' are not live and never contribute.
+-- A warming cohort with unknown size (n_accounts NULL) contributes 0. Email volume =
+-- inboxes x per-account daily send limit — join the sending-capacity views to attach a
+-- limit; NOT assumed here. For the FULL per-cohort picture incl. active/error/pending and
+-- each cohort's (historical or future) flip date + status, use core.v_warmup_golive_schedule.
 CREATE OR REPLACE VIEW core.v_warmup_golive_daily AS
 SELECT
   go_live_date,
@@ -75,6 +80,6 @@ SELECT
   SUM(COALESCE(n_accounts, 0)) AS inboxes_going_active
 FROM core.v_warmup_golive_schedule
 WHERE go_live_date IS NOT NULL
-  AND status IN ('warming', 'active')
+  AND status = 'warming'
 GROUP BY 1, 2, 3
 ORDER BY 1, 2, 3;
