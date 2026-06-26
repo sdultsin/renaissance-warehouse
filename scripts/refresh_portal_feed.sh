@@ -57,6 +57,18 @@ lensgen dashboard_data.py     "$REPO/dashboards/lens-overview/data.json"
 lensgen kpi_dashboard_data.py "$REPO/dashboards/lens-kpi/data.json"
 CORE_DB_PATH="$SNAP" "$PY" "$WH/scripts/sms_campaign_dashboard_data.py" --out "$REPO/dashboards/lens-sms/data/latest.json" >>/root/lens_feeds.err 2>&1 \
   && echo "  ok lens-sms $(wc -c < "$REPO/dashboards/lens-sms/data/latest.json")B" || echo "  WARN sms feed failed — keeping last-known-good" >&2
+mkdir -p "$REPO/dashboards/lens-sms-performance/data"
+CORE_DB_PATH="$SNAP" "$PY" "$WH/scripts/sms_comms_performance_daily.py" --out "$REPO/dashboards/lens-sms-performance/data/latest.json" >>/root/lens_feeds.err 2>&1 \
+  && echo "  ok lens-sms-performance $(wc -c < "$REPO/dashboards/lens-sms-performance/data/latest.json")B" || echo "  WARN sms-performance feed failed — keeping last-known-good" >&2
+# Campaign Performance (email) — generate latest.json + workspaces.json STRAIGHT INTO the portal
+# repo from the read-only serving snapshot. [2026-06-26] Was previously only generated to
+# /root/lens by nightly.sh and never published, so the portal copy went stale (frozen 2026-06-24).
+mkdir -p "$REPO/dashboards/lens-campaign-performance/data"
+CORE_DB_PATH="$SNAP" CAMPAIGN_PERFORMANCE_JSON_OUT="$REPO/dashboards/lens-campaign-performance/data/latest.json" \
+  "$WH/scripts/refresh_campaign_performance.sh" >>/root/lens_feeds.err 2>&1 \
+  && echo "  ok lens-campaign-performance $(wc -c < "$REPO/dashboards/lens-campaign-performance/data/latest.json")B" || echo "  WARN campaign-performance feed failed — keeping last-known-good" >&2
+"$PY" "$WH/scripts/gen_workspaces.py" >>/root/lens_feeds.err 2>&1 \
+  && echo "  ok lens-campaign-performance workspaces.json" || echo "  WARN campaign-performance workspaces.json failed — keeping last-known-good" >&2
 # lens-sending-truth: the CORRECTED capacity cube from core.account_label (phantom-free MX-infra
 # census + DDL-1003-healed limits) + per-day actuals. Retires the old bespoke account_truth.duckdb
 # pipeline (which left the cube frozen at 2026-06-16/17). Writes gzip straight into the portal repo.
@@ -71,7 +83,7 @@ fi
 # 3) Commit if changed.
 cd "$REPO" || exit 1
 git config --global --add safe.directory "$REPO" 2>/dev/null
-git add portal_data.js dashboards/lens-overview/data.json dashboards/lens-kpi/data.json dashboards/lens-sms/data/latest.json dashboards/lens-sending-truth/data.json.gz 2>/dev/null
+git add portal_data.js dashboards/lens-overview/data.json dashboards/lens-kpi/data.json dashboards/lens-sms/data/latest.json dashboards/lens-sms-performance/data/latest.json dashboards/lens-campaign-performance/data/latest.json dashboards/lens-campaign-performance/data/workspaces.json dashboards/lens-sending-truth/data.json.gz 2>/dev/null
 if git diff --cached --quiet; then
   echo "[3/4] no change in portal feed or Lens data — nothing to publish"; exit 0
 fi
