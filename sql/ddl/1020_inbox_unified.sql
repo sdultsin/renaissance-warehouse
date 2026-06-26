@@ -1,4 +1,4 @@
--- 103_inbox_unified.sql  [2026-06-26]
+-- 1020_inbox_unified.sql  [2026-06-26]
 -- core.inbox — THE canonical company inbox database (single VIEW; merge logic in one place,
 -- so no two-creation-verb split-brain). One row per inbox that has EVER existed (~2.77M),
 -- unifying the provisioning master (core.sending_account_batch) with the live hub
