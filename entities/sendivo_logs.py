@@ -203,7 +203,8 @@ class _BodyCapture:
                 n = cur.rowcount
             self.conn.commit()
             self.inserted += n
-            logger.info("body-capture %s: matched %d, inserted %d", day, len(self.buf), n)
+            day_blast = sum(1 for row in self.buf if row[8] is not None)  # row[8] = blast_id
+            logger.info("body-capture %s: matched %d, inserted %d, blast=%d", day, len(self.buf), n, day_blast)
         except Exception as exc:  # noqa: BLE001
             logger.warning("body-capture flush %s failed (disabling, rollup unaffected): %s", day, exc)
             try:
