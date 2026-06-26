@@ -45,7 +45,7 @@ def resolve_ns(domain: str) -> tuple[str, list[str]]:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--src-db", default="/root/core/warehouse_serving.duckdb",
+    ap.add_argument("--src-db", default="/root/core/warehouse.duckdb",
                     help="read-only DB to pull the domain list from")
     ap.add_argument("--out", required=True)
     ap.add_argument("--all", action="store_true", help="sweep all domains, not just active")

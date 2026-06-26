@@ -170,15 +170,15 @@ SPECS: dict[str, Spec] = {
     # grain (campaign x lead x send_date) so re-sends update sent_count/last_sent_at
     # in place; incremental by updated_at watermark so nightly scans only the
     # recent tail after the one-time backfill. DDL: sql/ddl/1007_contact_frequency_campaign_daily.sql.
-    "contact_frequency_campaign_daily": Spec(
-        mode="upsert",
-        key_sql=_key_concat(["campaign_id", "lead_email", "send_date"]),
-        watermark_col="updated_at",
-        columns=[
-            "workspace_id", "campaign_id", "campaign_name", "lead_email", "lead_domain",
-            "send_date", "sent_count", "first_sent_at", "last_sent_at", "updated_at",
-        ],
-    ),
+    # [ARCHIVED 2026-06-26 — sync stopped per Sam: reaching all leads, no freq cap needed. DDL -> sql/ddl/archived/. Table kept.]  "contact_frequency_campaign_daily": Spec(
+    # mode="upsert",
+    # key_sql=_key_concat(["campaign_id", "lead_email", "send_date"]),
+    # watermark_col="updated_at",
+    # columns=[
+    # "workspace_id", "campaign_id", "campaign_name", "lead_email", "lead_domain",
+    # "send_date", "sent_count", "first_sent_at", "last_sent_at", "updated_at",
+    # ],
+    # ),
     "variant_copy": Spec(
         mode="insert_hash",
         key_sql=_key_concat(["campaign_id", "step", "variant", "content_hash"]),
@@ -215,19 +215,19 @@ SPECS: dict[str, Spec] = {
     # sync (per-workspace Unibox/emails endpoints) feeding the same
     # raw_pipeline_conversation_messages shape — the warehouse contract is the
     # table, not the upstream Supabase.
-    "conversation_messages": Spec(
-        mode="insert",
-        key_sql="CAST(id AS VARCHAR)",
-        watermark_col="message_timestamp",
-        columns=[
-            "id", "thread_id", "campaign_id", "workspace_id", "lead_email",
-            "sender_email", "sender_name", "recipient_email", "recipient_name",
-            "direction", "ue_type", "body_text", "body_html", "subject",
-            "message_timestamp", "step_raw", "step", "variant", "is_unread",
-            "interest_status", "ai_interest_value", "content_preview", "eaccount",
-            "subsequence_id", "synced_at",
-        ],
-    ),
+    # [ARCHIVED 2026-06-26 — obsolete, replaced by raw_instantly_email (registry retired); stop mirroring (OOM'd nightly). Table kept.] "conversation_messages": Spec(
+    # mode="insert",
+    # key_sql="CAST(id AS VARCHAR)",
+    # watermark_col="message_timestamp",
+    # columns=[
+    # "id", "thread_id", "campaign_id", "workspace_id", "lead_email",
+    # "sender_email", "sender_name", "recipient_email", "recipient_name",
+    # "direction", "ue_type", "body_text", "body_html", "subject",
+    # "message_timestamp", "step_raw", "step", "variant", "is_unread",
+    # "interest_status", "ai_interest_value", "content_preview", "eaccount",
+    # "subsequence_id", "synced_at",
+    # ],
+    # ),
 }
 
 
@@ -265,10 +265,22 @@ def _build_sql(table: str, spec: Spec) -> str:
     target_cols = ["_key"] + spec.columns + (["content_hash"] if has_hash else []) + ["_loaded_at", "_run_id"]
     proj = [f"{spec.key_sql} AS _key"] + spec.columns + (["content_hash"] if has_hash else []) + ["now()", "?"]
 
+    # Upsert mode: the source can transiently contain in-batch duplicate keys
+    # (observed 2026-06-26 on reply_auto_reconciliation). ON CONFLICT DO UPDATE cannot
+    # update the same target row twice in one statement -> dedupe to one row per _key
+    # (latest by a recency column when available). R1-approved 2026-06-26.
+    select_body = f"SELECT {', '.join(proj)} FROM src "
+    if spec.mode == "upsert":
+        _order_col = spec.watermark_col or next(
+            (c for c in ("checked_at", "updated_at", "synced_at", "last_sent_at", "_loaded_at")
+             if c in spec.columns), None)
+        _order = f"{_order_col} DESC NULLS LAST" if _order_col else "1"
+        select_body += f"QUALIFY row_number() OVER (PARTITION BY _key ORDER BY {_order}) = 1 "
+
     sql = (
         f"INSERT INTO raw_pipeline_{table} ({', '.join(target_cols)}) "
         f"WITH src AS (SELECT {_src_select(spec)} FROM pg.public.{table} {where}) "
-        f"SELECT {', '.join(proj)} FROM src "
+        + select_body
     )
 
     if spec.mode in ("insert", "insert_hash"):
