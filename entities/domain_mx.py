@@ -74,11 +74,17 @@ def run_domain_mx(ctx: RunContext) -> PhaseResult:
         if not has_mx:
             missing += 1
         prov = (mx or {}).get("mx_provider")
-        ctx.db.execute("DELETE FROM core.account_domain_dns WHERE domain = ?", [dom])
+        # UPSERT only the MX columns — do NOT delete the row, so the SPF/DKIM/DMARC/
+        # registrar columns that the heavy dns_sweep / RDAP jobs fill on the SAME table
+        # are preserved (a DELETE+INSERT here would wipe them — moderator-caught).
         ctx.db.execute(
             "INSERT INTO core.account_domain_dns "
             "(domain, has_mx, mx_provider, dns_checked_at, _loaded_at, _run_id) "
-            "VALUES (?, ?, ?, ?, ?, ?)",
+            "VALUES (?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (domain) DO UPDATE SET "
+            "  has_mx = excluded.has_mx, mx_provider = excluded.mx_provider, "
+            "  dns_checked_at = excluded.dns_checked_at, _loaded_at = excluded._loaded_at, "
+            "  _run_id = excluded._run_id",
             [dom, has_mx, prov, now, now, ctx.run_id],
         )
 
