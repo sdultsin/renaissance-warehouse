@@ -244,6 +244,26 @@ class InstantlyClient:
             params["resource_type"] = resource_type
         yield from self._paginate("/tag-mappings", params=params or None, limit=100)
 
+    def list_custom_tag_mappings(
+        self,
+        resource_type: int | None = None,
+        workspace_id: str | None = None,
+    ) -> Iterator[dict]:
+        """`GET /custom-tag-mappings` — the PUBLIC bulk (tag, resource) edge list.
+
+        Unlike `/tag-mappings` (admin-only; 404s on the public v2 surface — see
+        `list_tag_mappings`), `/custom-tag-mappings` IS reachable with a workspace key
+        and streams EVERY tag edge in one paginated pass (verified live 2026-06-26 on
+        Funding 2). Each item: {"id","tag_id","resource_id","resource_type",...} where
+        `resource_id` is the sending-account EMAIL when resource_type == 1. This is the
+        efficient, faithful source for the full account<->tag mirror — no per-tag
+        `/accounts?tag_ids=` iteration needed.
+        """
+        params: dict = {}
+        if resource_type is not None:
+            params["resource_type"] = resource_type
+        yield from self._paginate("/custom-tag-mappings", params=params or None, limit=100)
+
     def list_accounts(
         self,
         tag_ids: str | None = None,
