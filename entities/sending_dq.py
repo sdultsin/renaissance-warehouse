@@ -247,6 +247,46 @@ def run_sending_dq(ctx: RunContext) -> PhaseResult:
     except Exception as exc:  # core.sending_account_vendor may not exist on a fresh DB -> skip, non-fatal
         logger.warning("D3: esp backfill skipped (%s)", exc)
 
+    # [2026-06-27 esp-census-residual] ESP BACKFILL pass 2 (from the census). The vendor backfill
+    # (D3 above) recovers ~91% of esp-NULL sending rows, but a ~5-8k/day residual stays NULL: accounts
+    # that sent (infra_type='Missing Current Inventory' / account_status=-999) AND are absent from
+    # core.sending_account_vendor (DDL 72) -> no vendor projection. Measured 2026-06-27: 603 such
+    # accounts / 8,139 sends on 06-25, 100% present in core.account_label (DDL 95, the phantom-free
+    # MX-infra census) as Active OTD. account_label IS the canonical infra resolver the Sending-Truth
+    # lens (scripts/sending_truth_dashboard_data.py) and the report's Section-4 join already trust, so
+    # project its infra to esp for whatever the vendor pass left NULL. This closes the esp-NULL hole to
+    # ~0 (100%-or-flag) so esp-grouped reads (e.g. derived.v_sending_volume_daily) match the
+    # account_label-join truth — killing the exact class of "by-infra split disagrees with Grace" bug.
+    # Latest census per email (MX-infra is stable per account). Idempotent; no-op once esp is set.
+    # Live-now twin: sql/ddl/1029_esp_backfill_from_census.sql (byte-identical UPDATE body).
+    # CASE arms stay in lockstep with the inner `WHERE infra IN (...)`; the ELSE sad.esp is
+    # defence-in-depth (a no-op, never a NULL overwrite, if the two lists ever drift).
+    try:
+        db.execute("""
+            UPDATE core.sending_account_daily AS sad
+            SET esp = CASE lab.infra
+                          WHEN 'OTD'     THEN 'otd'
+                          WHEN 'Google'  THEN 'google'
+                          WHEN 'Outlook' THEN 'outlook'
+                          ELSE sad.esp
+                      END
+            FROM (
+                SELECT lower(email) AS email,
+                       arg_max(infra, census_date) AS infra
+                FROM core.account_label
+                WHERE infra IN ('OTD', 'Google', 'Outlook')
+                GROUP BY lower(email)
+            ) AS lab
+            WHERE sad.esp IS NULL
+              AND lab.email = lower(sad.account_id)
+        """)
+        residual = db.execute(
+            "SELECT count(*) FROM core.sending_account_daily WHERE esp IS NULL AND actual_sends > 0"
+        ).fetchone()[0]
+        logger.info("D3b: esp backfilled from account_label census; %d esp-NULL sending rows remain", residual)
+    except Exception as exc:  # core.account_label may not exist on a fresh DB -> skip, non-fatal
+        logger.warning("D3b: esp census backfill skipped (%s)", exc)
+
     canonical_rows = db.execute("SELECT count(*) FROM core.sending_account_daily").fetchone()[0]
     logger.info("D3: core.sending_account_daily rebuilt with %d rows", canonical_rows)
 
