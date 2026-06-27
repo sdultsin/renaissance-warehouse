@@ -80,8 +80,8 @@ OVERRIDES: dict[str, dict] = {
     # sync-ran freshness alone masks an upstream death. Scraper lands D+1, the 07:00 UTC
     # meetings refresh pulls it same morning -> 2-day biz SLA.
     "raw_pipeline_meetings_booked_raw": dict(
-        biz_date_column="posted_at", biz_sla_days=2,
-        notes="meetings ground truth (Slack scrape via pipeline); biz-recency SLA 2d"),
+        cadence="retired", status="retired",
+        notes="ARCHIVED 2026-06-14: Slack scrape retired; meetings now via funding-form -> core.meeting source=sheet (KPI live there)"),
     # 2026-06-11 hygiene Task 4: give the replies feed a business date so the
     # send-sensitive FLAT check runs on data-presence (and is_data_stale FAILs when
     # the feed dies while the sync still reports ok — the June-8→11 silent stall).
@@ -94,8 +94,19 @@ OVERRIDES: dict[str, dict] = {
     # cadence=periodic gave them a phantom 192h SLA they breach on a cycle (239h FAILs).
     # No SQL consumer reads either. Re-snapshot manually if infra inventory changes.
     "raw_cloudflare_zones": dict(
-        cadence="once", source="cloudflare",
-        notes="one-time CF zone snapshot; no automated loader; refresh manually"),
+        cadence="daily", source="cloudflare", freshness_column="_loaded_at",
+        notes="live CF zones (scripts/refresh_cloudflare_zones.py, RG+Sam accounts); feeds core.domain_registry"),
+    # 2026-06-26: retired-by-design feeds — marked retired so the freshness backbone
+    # stops false-alarming. Tables/data preserved (not dropped).
+    "raw_sheets_blacklist_all_domains": dict(cadence="retired", status="retired", notes="retired 2026-06-07 (SHEET_TABS emptied)"),
+    "raw_sheets_blacklist_blocklisted": dict(cadence="retired", status="retired", notes="retired 2026-06-07 (SHEET_TABS emptied)"),
+    "raw_sheets_domain_tech_admin_renaissance": dict(cadence="retired", status="retired", notes="retired 2026-06-07 (SHEET_TABS emptied)"),
+    "raw_sheets_domain_tech_domains": dict(cadence="retired", status="retired", notes="retired 2026-06-07 (SHEET_TABS emptied); still read by rebuild_domain_registry universe"),
+    "raw_sheets_domain_tech_domains_table": dict(cadence="retired", status="retired", notes="retired 2026-06-07 (SHEET_TABS emptied)"),
+    "raw_sheets_domain_tech_main": dict(cadence="retired", status="retired", notes="retired 2026-06-07 (SHEET_TABS emptied)"),
+    "raw_instantly_campaign_sending_tag": dict(cadence="retired", status="retired", notes="campaign-tag sync disabled 2026-06-14 (WAREHOUSE_SYNC_CAMPAIGN_TAGS=0)"),
+    "raw_pipeline_contact_frequency_campaign_daily": dict(cadence="retired", status="retired", notes="ARCHIVED 2026-06-26 (Sam): sync stopped, spec commented in pipeline_mirror.py, table kept"),
+    "raw_cloudflare_zones_bak": dict(cadence="once", status="retired", notes="rolling backup of raw_cloudflare_zones; not a feed"),
     "raw_registrar_domains": dict(
         cadence="once", source="registrar",
         notes="one-time registrar snapshot; no automated loader; refresh manually"),
