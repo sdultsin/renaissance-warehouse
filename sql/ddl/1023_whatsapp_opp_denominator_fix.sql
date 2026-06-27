@@ -31,6 +31,13 @@
 -- source because it is the same demonstrably-correct surface as the opportunity fix and is internally
 -- consistent. deals_won is left from raw_iskra_stats (currently 0; 0 <= meetings_booked, consistent).
 --
+-- WINDOW SEMANTICS (unchanged from DDL 82): one row per (channel, window_from, window_to) latest
+-- snapshot; raw_iskra_stats windows are cumulative-from-window_from. Each opportunities/meetings count
+-- is scoped to its OWN row's [window_from, window_to] (date-inclusive). As with the original
+-- stats-sourced columns, rows are point-in-time snapshots — a consumer must read the relevant window
+-- row, never SUM the column across overlapping windows (that was never valid here; this change does not
+-- alter that property).
+--
 -- Reversible: revert by re-applying DDL 82's definition (or a follow-up CREATE OR REPLACE VIEW).
 
 CREATE OR REPLACE VIEW v_whatsapp_performance AS
@@ -44,20 +51,22 @@ SELECT
   l.messages_sent, l.messages_delivered, l.delivery_rate,
   l.replies, l.reply_rate,
   -- W1f fix: Renaissance positive-intent opportunity (NOT Iskra's any-inbound stats.opportunities).
-  -- CHANNEL-SCOPED via the `l.channel = 'whatsapp'` guard: raw_iskra_meetings is the Iskra
-  -- WhatsApp conversation-tag table and carries NO channel column, so the guard ties the count to the
-  -- whatsapp stats row only — any future non-whatsapp channel row evaluates to 0, never the whatsapp
-  -- total leaking across channels.
+  -- CHANNEL-SCOPED by deriving each conversation's channel from raw_iskra_messages (raw_iskra_meetings
+  -- carries no channel column): the EXISTS ties each meeting to the SAME channel as the stats row it sits
+  -- beside, so every channel returns its OWN count — never a total shared across channels, never a
+  -- hardcoded 0 for a non-whatsapp channel. (100% coverage today: all 134 positive-intent conversations
+  -- resolve a channel via raw_iskra_messages.)
   (SELECT COUNT(*) FROM raw_iskra_meetings m
-     WHERE l.channel = 'whatsapp'
-       AND m.reply_sentiment = 'positive'
-       AND CAST(m.tagged_at AS DATE) BETWEEN l.window_from AND l.window_to) AS opportunities,
-  -- W1f fix: booked from the same conversation-tag truth (keeps opportunities >= meetings_booked),
-  -- channel-scoped the same way.
+     WHERE m.reply_sentiment = 'positive'
+       AND CAST(m.tagged_at AS DATE) BETWEEN l.window_from AND l.window_to
+       AND EXISTS (SELECT 1 FROM raw_iskra_messages mm
+                     WHERE mm.conversation_id = m.conversation_id AND mm.channel = l.channel)) AS opportunities,
+  -- W1f fix: booked from the same conversation-tag truth (keeps opportunities >= meetings_booked), same channel scoping.
   (SELECT COUNT(*) FROM raw_iskra_meetings m
-     WHERE l.channel = 'whatsapp'
-       AND m.meeting_status = 'booked'
-       AND CAST(m.tagged_at AS DATE) BETWEEN l.window_from AND l.window_to) AS meetings_booked,
+     WHERE m.meeting_status = 'booked'
+       AND CAST(m.tagged_at AS DATE) BETWEEN l.window_from AND l.window_to
+       AND EXISTS (SELECT 1 FROM raw_iskra_messages mm
+                     WHERE mm.conversation_id = m.conversation_id AND mm.channel = l.channel)) AS meetings_booked,
   l.deals_won, l.captured_at
 FROM latest l
 WHERE l.rn = 1;
