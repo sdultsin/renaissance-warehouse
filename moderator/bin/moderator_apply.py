@@ -46,6 +46,7 @@ import threading
 import time
 
 import moderator_common as mc
+import moderator_integrity_gate as _integrity_gate  # W1 post-apply integrity gate (dup unique _key)
 
 # Process-level serialization of apply-now. The service runs route handlers in a threadpool, so two
 # concurrent /apply-now calls (two editors, or the standing retry-every-minute rule) would share the
@@ -404,6 +405,19 @@ def _apply_one(core_db, db_path, conn, row) -> dict:
     safe_name = sql_file or f"{ddl_version}_apply_now.sql"
     if not safe_name.startswith(f"{ddl_version}_"):
         safe_name = f"{ddl_version}_{safe_name}"
+    # PRE-APPLY catalog snapshot for the W1 CATALOG-DELTA gate (FIX 1). apply_ddl_file COMMITs
+    # internally, so we MUST capture the per-table unique-on-_key index counts on THIS open writer conn
+    # BEFORE the apply call; the post-check then fails only on a table whose count INCREASED (a NEWLY
+    # introduced duplicate), regardless of how the index DDL was written (USING art, comments — the
+    # QA-D bypass), because the snapshot reads the live catalog (duckdb_indexes()), not the SQL text.
+    # Best-effort: a snapshot failure degrades to {} which the post-check treats as all-zero BEFORE,
+    # i.e. it falls back to the absolute "any dup is newly-introduced" stance (fail-closed, never a
+    # false-pass). Captured only when something will actually be applied is not knowable yet (apply is
+    # idempotent-by-version), so we always snapshot here — it is a cheap catalog read.
+    try:
+        pre_key_index_snapshot = _integrity_gate.snapshot_key_index_counts(conn)
+    except Exception:
+        pre_key_index_snapshot = {}
     with tempfile.TemporaryDirectory(prefix="moderator_apply_") as td:
         from pathlib import Path
         fpath = Path(td) / safe_name
@@ -415,6 +429,45 @@ def _apply_one(core_db, db_path, conn, row) -> dict:
                                "already-applied (version present in core.schema_version) — no-op"))
         except Exception as e:  # noqa: BLE001 — record the failure, keep other rows going.
             out.update(applied=False, status="failed", detail=f"{type(e).__name__}: {e}")
+            return out
+
+    # 4) POST-APPLY INTEGRITY GATE (W1): apply_ddl_file already COMMITted (db.py), so a failed
+    # post-check cannot auto-rollback the same BEGIN/ROLLBACK — instead we BLOCK the row (status
+    # 'failed', which gates the batch -> 207) and record+alert. We only run this when something was
+    # NEWLY applied (an already-applied no-op didn't change the schema). The check is SCOPED to the
+    # tables this DDL touched (raw_pipeline_* expands to the whole upsert blast-radius family) so the
+    # 9 PRE-EXISTING duplicate-index tables can't false-block an unrelated apply. conn is still the
+    # open writer (flock held), so the gate's core.schema_issue / review_learnings writes land in the
+    # SAME live DB + critical section. The gate never raises (returns a structured dict).
+    if out.get("status") == "committed" and out.get("applied"):
+        try:
+            scope = _integrity_gate.tables_touched_by_sql(content or "")
+            # CATALOG-DELTA mode: pass the pre-apply snapshot so the gate fails ONLY on a NEWLY
+            # introduced duplicate unique _key index (regex-independent — kills the QA-D USING/comment
+            # bypass on the apply path) and a pre-existing dup can't false-block. `tables=scope` is kept
+            # for the smoke-test/back-compat, but in delta mode the snapshot watches the whole upsert
+            # blast radius and the BEFORE/AFTER delta is what isolates this apply's effect.
+            gate = _integrity_gate.run_post_apply_integrity(
+                conn, tables=scope or None, ddl_file=safe_name, record=True, smoke_test=True,
+                pre_snapshot=pre_key_index_snapshot)
+            out["integrity_gate"] = {"ok": gate["ok"], "detail": gate["detail"],
+                                     "offenders": gate.get("offenders"),
+                                     "recorded_issues": gate.get("recorded_issues"),
+                                     "learning_appended": gate.get("learning_appended"),
+                                     "alerted": gate.get("alerted")}
+            if not gate["ok"]:
+                # The DDL is committed but it left the warehouse in the dup-unique-_key landmine state.
+                # Mark the row failed (blocks the batch -> 207) and surface the offending tables so a
+                # writer fixes it with a follow-up DROP INDEX (expand/contract) immediately.
+                out.update(applied=False, status="failed",
+                           detail="POST-APPLY INTEGRITY GATE BLOCKED this apply — " + gate["detail"]
+                                  + " — ship a follow-up DROP INDEX (expand/contract) so exactly one "
+                                    "unique index on (_key) remains, then re-gate.")
+        except Exception as e:  # noqa: BLE001 — a gate fault must not strand the row; fail CLOSED.
+            out.update(applied=False, status="failed",
+                       detail=f"post-apply integrity gate fault ({type(e).__name__}: {e}) — failing "
+                              f"closed; the DDL committed but could not be integrity-verified. Inspect "
+                              f"core.schema_issue / duckdb_indexes() for duplicate unique _key indexes.")
     return out
 
 
