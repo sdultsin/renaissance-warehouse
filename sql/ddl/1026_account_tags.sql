@@ -1,4 +1,4 @@
--- 98_account_tags.sql  [2026-06-26]
+-- 1026_account_tags.sql  [2026-06-26]
 -- core.account_tags — ONE row per inbox, with a single column holding ALL of that
 -- inbox's Instantly tags (verbatim, no curation). This is the per-inbox tag column the
 -- Inbox Hub overview reads — NOT an edge table. ~one row per live inbox (~433k), not

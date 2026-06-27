@@ -1,4 +1,4 @@
--- 100_account_campaign_live.sql  [2026-06-26]
+-- 1027_account_campaign_live.sql  [2026-06-26]
 -- core.account_campaign_live — fresh, Instantly-DIRECT campaign membership per inbox.
 -- ONE row per inbox that is in >=1 campaign, with how many campaigns / how many ACTIVE
 -- (status=1) / the campaign names. Populated nightly by entities/account_campaign_live.py
