@@ -5,9 +5,13 @@ Rebuilt DELETE+INSERT (idempotent full rebuild) from three feeders:
 
   • core.meeting                       → agent='im',          type='meeting_booked'
         feeder='slack_meeting' — the original Slack-scrape count feed; NO lead identity.
-  • core.call ⋈ core.call_outcome      → agent='warm_caller', type='appointment_set'
-        WHERE core.call_outcome.outcome_class = 'answered_appt_set'
-        feeder='close_call'
+  • core.call ⋈ core.v_call_outcome_final → agent='warm_caller', type='appointment_set'
+        WHERE outcome_class = 'answered_appt_set'
+        feeder='close_call'. W1i (2026-06-26): the FINAL outcome view coalesces the rep
+        note-regex booking marker ('booked via call', deterministic $0 floor) > the LLM
+        transcript pass (core.call_outcome_llm) > the disposition base (core.call_outcome).
+        classify_outcome() never emits 'answered_appt_set', so before W1i this feeder was
+        always 0 — every call appointment was invisible to the conversion fact.
   • raw_im_bookings (latest snapshot)  → agent='im',          type='meeting_booked'
         feeder='portal_im_bookings' — Scope A (2026-06-09): the identity-bearing feed from
         Darcy's bookings portal (~99.9% email, ~97% phone). This is what makes per-lead
@@ -52,6 +56,11 @@ logger = logging.getLogger("entities.conversion_event")
 
 _DDL = Path(__file__).resolve().parent.parent / "sql" / "ddl" / "45_conversion_event.sql"
 _DDL_FEEDER = Path(__file__).resolve().parent.parent / "sql" / "ddl" / "54_conversion_event_feeder.sql"
+# W1i (2026-06-26): the warm-caller appt-set refinement layer — core.call_outcome_llm (the
+# LLM transcript pass output) + core.v_call_outcome_final (note-regex 'booked via call' >
+# LLM > disposition). Feeder 2 reads the FINAL outcome from this view so call appointments
+# (which classify_outcome never emits) finally land in core.conversion_event. Idempotent.
+_DDL_CALL_OUTCOME_LLM = Path(__file__).resolve().parent.parent / "sql" / "ddl" / "1024_call_outcome_llm.sql"
 
 
 def _table_exists(db, schema: str, name: str) -> bool:
@@ -84,6 +93,7 @@ def rebuild(db, now: datetime) -> dict:
     """DELETE+INSERT rebuild of core.conversion_event from the two feeders. Returns notes."""
     db.execute(_DDL.read_text())  # idempotent CREATE IF NOT EXISTS
     db.execute(_DDL_FEEDER.read_text())  # idempotent ADD COLUMN feeder + backfill
+    db.execute(_DDL_CALL_OUTCOME_LLM.read_text())  # W1i: core.call_outcome_llm + v_call_outcome_final (idempotent)
 
     has_lead = _table_exists(db, "core", "lead")
     has_meeting = _table_exists(db, "core", "meeting")
@@ -208,7 +218,7 @@ def rebuild(db, now: datetime) -> dict:
               ?                                 AS resolved_at,
               'close_call'                      AS feeder
             FROM core.call c
-            JOIN core.call_outcome o ON o.call_id = c.call_id
+            JOIN core.v_call_outcome_final o ON o.call_id = c.call_id
             WHERE o.outcome_class = 'answered_appt_set'
             """,
             [now],
@@ -216,6 +226,24 @@ def rebuild(db, now: datetime) -> dict:
         n_wc = db.execute(
             "SELECT count(*) FROM core.conversion_event WHERE conversion_agent='warm_caller'"
         ).fetchone()[0]
+
+        # W1i: fill core.warm_caller.appt_set_calls (DDL 42 left it NULL — "WS-G fills the
+        # appt-set signal"). Per-rep rows count that user's appt-set calls; the 'ALL' aggregate
+        # = the channel total. Final outcome = note-regex 'booked via call' > LLM > disposition.
+        try:
+            db.execute(
+                """
+                UPDATE core.warm_caller w SET appt_set_calls = COALESCE((
+                    SELECT count(*)
+                    FROM core.call c
+                    JOIN core.v_call_outcome_final o ON o.call_id = c.call_id
+                    WHERE o.outcome_class = 'answered_appt_set'
+                      AND (w.warm_caller_id = 'ALL' OR c.user_id = w.user_id)
+                ), 0)
+                """
+            )
+        except Exception as exc:  # never let the rollup update abort the conversion rebuild
+            logger.warning("warm_caller.appt_set_calls fill skipped (%s)", exc)
     else:
         logger.warning("core.call / core.call_outcome absent — skipping warm-caller feeder")
 
