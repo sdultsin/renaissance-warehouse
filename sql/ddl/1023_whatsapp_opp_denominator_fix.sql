@@ -44,12 +44,19 @@ SELECT
   l.messages_sent, l.messages_delivered, l.delivery_rate,
   l.replies, l.reply_rate,
   -- W1f fix: Renaissance positive-intent opportunity (NOT Iskra's any-inbound stats.opportunities).
+  -- CHANNEL-SCOPED via the `l.channel = 'whatsapp'` guard: raw_iskra_meetings is the Iskra
+  -- WhatsApp conversation-tag table and carries NO channel column, so the guard ties the count to the
+  -- whatsapp stats row only — any future non-whatsapp channel row evaluates to 0, never the whatsapp
+  -- total leaking across channels.
   (SELECT COUNT(*) FROM raw_iskra_meetings m
-     WHERE m.reply_sentiment = 'positive'
+     WHERE l.channel = 'whatsapp'
+       AND m.reply_sentiment = 'positive'
        AND CAST(m.tagged_at AS DATE) BETWEEN l.window_from AND l.window_to) AS opportunities,
-  -- W1f fix: booked from the same conversation-tag truth (keeps opportunities >= meetings_booked).
+  -- W1f fix: booked from the same conversation-tag truth (keeps opportunities >= meetings_booked),
+  -- channel-scoped the same way.
   (SELECT COUNT(*) FROM raw_iskra_meetings m
-     WHERE m.meeting_status = 'booked'
+     WHERE l.channel = 'whatsapp'
+       AND m.meeting_status = 'booked'
        AND CAST(m.tagged_at AS DATE) BETWEEN l.window_from AND l.window_to) AS meetings_booked,
   l.deals_won, l.captured_at
 FROM latest l
