@@ -10,7 +10,9 @@ a per-ingest exception and runs the rest, so one flaky surface never sinks the o
                      is the message grain (run_messages is complete), and v_whatsapp_conversation_
                      performance derives last_message_at from messages — conv_last_message_at is a
                      best-effort snapshot. A periodic full walk would fully refresh old rows.
-  - meetings       : incremental by tagged_at; PK conversation_id; UPSERT (sentiment + meeting tag).
+  - meetings       : COMPLETE full pull every run (v1 /meetings now cursor-paginates; ~6k rows / 7
+                     reqs); PK conversation_id; UPSERT (sentiment + meeting tag). The W1e under-count
+                     fix — the old 500-newest-only cap stalled the table at ~2.2k / ~54 booked.
   - deals          : incremental by updated_at; PK id; UPSERT.
   - numbers        : full snapshot/run, APPEND (asset-health time series) + aggregate snapshot.
   - stats          : the agency funnel for a window, APPEND (reconciliation source-of-truth row).
@@ -38,7 +40,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from core.registry import Registry, RunContext
 from core.sync_run import PhaseResult
-from sources.iskra import IskraClient, MEETINGS_CAP
+from sources.iskra import IskraClient
 
 logger = logging.getLogger("entities.iskra")
 
@@ -178,15 +180,21 @@ def run_messages(ctx: RunContext) -> PhaseResult:
     today = datetime.now(timezone.utc).date()
     since = _since_for(ctx, conn, today, "raw_iskra_messages", "created_at")
 
-    cols = ["id", "channel", "direction", "body", "status", "provider_message_id",
+    # campaign_id/campaign_name/template_id/template_name are NEW v1 outbound identity fields
+    # (DDL 1028). `body` (final rendered copy) is the live copy-attribution key; the four IDs exist
+    # in the API contract but Iskra writes them 100% NULL today — captured now so they auto-fill the
+    # moment Arseny populates them (the incremental overlap re-pull + UPSERT refreshes them in place).
+    cols = ["id", "channel", "direction", "body", "campaign_id", "campaign_name",
+            "template_id", "template_name", "status", "provider_message_id",
             "conversation_id", "contact_phone", "contact_name", "created_at", "_run_id"]
     with IskraClient(api_key) as cli:
         walk = cli.messages(since=since)
         _require_complete(walk, "messages")
-        rows = [(m.get("id"), m.get("channel"), m.get("direction"), m.get("body"), m.get("status"),
-                 m.get("provider_message_id"), m.get("conversation_id"), m.get("contact_phone"),
-                 m.get("contact_name"), m.get("created_at"), run_id) for m in walk.items
-                if m.get("id")]
+        rows = [(m.get("id"), m.get("channel"), m.get("direction"), m.get("body"),
+                 m.get("campaign_id"), m.get("campaign_name"), m.get("template_id"),
+                 m.get("template_name"), m.get("status"), m.get("provider_message_id"),
+                 m.get("conversation_id"), m.get("contact_phone"), m.get("contact_name"),
+                 m.get("created_at"), run_id) for m in walk.items if m.get("id")]
         attempted = _upsert(conn, "raw_iskra_messages", cols, "id", rows)
 
         # Reconcile committed-in-window vs the stats/summary funnel for the SAME date window.
@@ -247,41 +255,39 @@ def run_conversations(ctx: RunContext) -> PhaseResult:
 
 
 def run_meetings(ctx: RunContext) -> PhaseResult:
+    """Pull the COMPLETE meeting-tag set every run (NOT incremental). The v1 /meetings endpoint now
+    cursor-paginates (the old 500-newest-only hard cap is lifted, 2026-06-27), so we walk it in full
+    (since=None, limit=999) and UPSERT on conversation_id. The full set is only ~6,065 rows / 7
+    requests, and the requirement is a COMPLETE meeting count — this is the W1e fix for the old
+    500-cap under-count (it had stalled the warehouse at ~2.2k rows / ~54 booked vs the true
+    ~6.1k / ~181). _require_complete fails loud on a truncated cursor walk (audit E3: no silent
+    truncation). A full pull every night also self-heals any past gap and stays 100% complete via the
+    conversation_id UPSERT, satisfying the 100%-or-wipe rule for the meeting-derived KPIs."""
     conn, run_id = ctx.db, ctx.run_id
     api_key = ctx.credentials.require("ISKRA_API_KEY")
     today = datetime.now(timezone.utc).date()
-    since = _since_for(ctx, conn, today, "raw_iskra_meetings", "tagged_at")
     cols = ["conversation_id", "meeting_status", "meeting_evidence", "deal_outcome",
             "reply_sentiment", "summary", "tagged_at", "_run_id"]
     with IskraClient(api_key) as cli:
-        walk = cli.meetings(since=since)
-        # /meetings can't paginate and hard-caps at 500 (has_more lies = false). A full-cap return
-        # means older tags beyond the newest 500 are unreachable THIS run -> log LOUD (never silent,
-        # SMS audit E3) but don't hard-fail: the newest 500 are the freshest + most relevant, and
-        # incremental nightly pulls (daily volume ~100-220 << 500) keep attribution complete
-        # go-forward. A deep historical backfill is the only case that trips this.
-        capped = len(walk.items) >= MEETINGS_CAP
-        if capped:
-            logger.warning(
-                "iskra meetings: hit the %d-row endpoint cap (no pagination) since=%s — tags older "
-                "than the newest %d are unreachable this run; complete go-forward via nightly increments. "
-                "Vendor gap to raise with Arseny.", MEETINGS_CAP, since, MEETINGS_CAP)
+        walk = cli.meetings()                       # since=None -> the COMPLETE set
+        _require_complete(walk, "meetings")         # a truncated cursor walk is data loss -> fail loud
         rows = [(m.get("conversation_id"), m.get("meeting_status"), m.get("meeting_evidence"),
                  m.get("deal_outcome"), m.get("reply_sentiment"), m.get("summary"),
                  m.get("tagged_at"), run_id) for m in walk.items if m.get("conversation_id")]
         n = _upsert(conn, "raw_iskra_meetings", cols, "conversation_id", rows)
-        # The per-run integrity signal for meetings is `capped` (above) — NOT a booked-vs-stats
-        # reconcile. The /meetings endpoint exposes only the newest 500 tags (no pagination), and
-        # stats.meetings_booked is the CUMULATIVE MTD count, so the table's booked count can never
-        # match it for periods that predate our sync or fall beyond the reachable window. We record
-        # both numbers as OBSERVABILITY (coverage of the agency total), without a false silent-drop
-        # warning. The TRUTH for the agency meetings_booked count is raw_iskra_stats / the funnel
-        # view; this per-conversation layer is "complete within the reachable+accumulated window".
+        # OBSERVABILITY: per-conversation booked count (MTD) vs the agency stats funnel. The table is
+        # now COMPLETE (full cursor walk), so this is a real coverage signal — no false silent-drop
+        # warning. stats.meetings_booked is the cumulative MTD agency total; the conversation-tag
+        # source can still legitimately differ (W1f/DDL 1023 chose the conversation-tag truth as
+        # authoritative for the funnel view). The TRUTH for the agency total = raw_iskra_stats.
         recon_from, recon_to = _month_start(today), today.isoformat()
         recon_to_excl = (today + timedelta(days=1)).isoformat()  # stats `to` is exclusive
         booked = conn.execute(
             "SELECT count(*) FROM raw_iskra_meetings WHERE meeting_status='booked' "
             "AND (tagged_at AT TIME ZONE 'UTC')::date BETWEEN ? AND ?", [recon_from, recon_to]).fetchone()[0]
+        total_rows = conn.execute("SELECT count(*) FROM raw_iskra_meetings").fetchone()[0]
+        total_booked = conn.execute(
+            "SELECT count(*) FROM raw_iskra_meetings WHERE meeting_status='booked'").fetchone()[0]
         stats_booked = None
         try:
             s = cli.stats_summary(CHANNEL, recon_from, recon_to_excl)
@@ -289,11 +295,11 @@ def run_meetings(ctx: RunContext) -> PhaseResult:
         except Exception as exc:  # noqa: BLE001
             logger.warning("meetings recon: stats/summary unavailable: %s", exc)
     booked_coverage = (round(booked / stats_booked, 3) if stats_booked else None)
-    notes = {"since": since, "pages": walk.pages, "walked": len(walk.items), "upserted": n,
-             "capped": capped, "booked_in_table_mtd": booked, "stats_meetings_booked_mtd": stats_booked,
-             "booked_coverage": booked_coverage,
-             "attribution_note": "per-conversation tags limited to newest-500 reachable + accumulated; "
-                                 "agency meetings_booked truth = raw_iskra_stats"}
+    notes = {"pages": walk.pages, "walked": len(walk.items), "upserted": n,
+             "pull_mode": "complete (full cursor walk @ limit=999, since=None)",
+             "total_rows_in_table": total_rows, "total_booked_in_table": total_booked,
+             "booked_in_table_mtd": booked, "stats_meetings_booked_mtd": stats_booked,
+             "booked_coverage": booked_coverage}
     logger.info("iskra meetings: %s", notes)
     return PhaseResult(rows_in=len(walk.items), rows_out=n, notes=notes)
 
