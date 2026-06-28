@@ -97,8 +97,26 @@ class InstantlyClient:
         body = resp.text[:500]
         raise InstantlyError(f"GET {path} -> {resp.status_code} after {retries} retries: {body}")
 
-    def _paginate(self, path: str, params: dict | None = None, limit: int = 100) -> Iterator[dict]:
-        """Yield all items across `next_starting_after` pagination."""
+    # Pagination page-count ceiling. Crossing it means we BAILED before the cursor
+    # was exhausted, i.e. the result set is silently truncated mid-history. Callers
+    # that need full coverage (email-thread-sync full backfill) MUST treat a ceiling
+    # hit as a HARD FAIL and NOT advance their watermark (FINALIZED-SPEC §4.C/R8).
+    PAGINATION_CEILING = 1000
+
+    def _paginate(
+        self,
+        path: str,
+        params: dict | None = None,
+        limit: int = 100,
+        ceiling_flag: dict | None = None,
+    ) -> Iterator[dict]:
+        """Yield all items across `next_starting_after` pagination.
+
+        If `ceiling_flag` (a dict) is passed and the page-count ceiling is hit before
+        the cursor is exhausted, sets `ceiling_flag['hit'] = True` so the caller can
+        detect a silent mid-history truncation (vs a clean end-of-cursor). Without it
+        the historic behaviour is unchanged (log + stop).
+        """
         p = dict(params or {})
         p.setdefault("limit", limit)
         cursor: str | None = None
@@ -116,8 +134,10 @@ class InstantlyClient:
                 return
             # gentle pace + safety
             time.sleep(0.05)
-            if seen_pages > 1000:
+            if seen_pages > self.PAGINATION_CEILING:
                 logger.warning("Pagination ceiling on %s — bailing at %d pages", path, seen_pages)
+                if ceiling_flag is not None:
+                    ceiling_flag["hit"] = True
                 return
 
     # --- endpoints -------------------------------------------------------
@@ -209,6 +229,96 @@ class InstantlyClient:
                     except ValueError:
                         pass
             yield item
+
+    def all_emails(
+        self,
+        since: str | None = None,
+        ceiling_flag: dict | None = None,
+    ) -> Iterator[dict]:
+        """`GET /emails` (paginated, NO email_type filter) — EVERY email in the workspace,
+        all directions (ue_type 1 cold send / 2 prospect reply / 3 our/IM reply), newest-first.
+
+        This is the DISCOVERY stream for email-thread-sync (FINALIZED-SPEC §4.B / R7): the
+        trigger to (re)pull a lead is ANY new email since the per-workspace watermark —
+        received OR sent OR our IM reply — NOT received-only. A received-only discovery
+        (`received_emails`) would MISS a late ue_type=3 reply that produced no new inbound
+        row, defeating R7's incremental-completeness guarantee (idempotency-lens MISS).
+
+        Newest-first ordering lets us stop paginating once we cross `since` (cheap incremental).
+        On a `since=None` full backfill this walks the WHOLE stream; if that crosses the
+        pagination ceiling the lead set is silently truncated, so we thread `ceiling_flag`
+        through `_paginate` and the caller treats a hit as a HARD FAIL for the workspace
+        (no watermark advance) exactly like a per-lead pull truncation (FINALIZED-SPEC §4.C).
+        """
+        from datetime import datetime, timezone
+
+        cutoff = None
+        if since:
+            try:
+                cutoff = datetime.fromisoformat(since.replace("Z", "+00:00"))
+                if cutoff.tzinfo is None:
+                    cutoff = cutoff.replace(tzinfo=timezone.utc)
+            except ValueError:
+                cutoff = None
+
+        for item in self._paginate("/emails", params=None, limit=100, ceiling_flag=ceiling_flag):
+            if cutoff is not None:
+                ts = item.get("timestamp_email") or item.get("timestamp_created")
+                if ts:
+                    try:
+                        t = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+                        if t.tzinfo is None:
+                            t = t.replace(tzinfo=timezone.utc)
+                        if t < cutoff:
+                            # Newest-first: everything after this page is older than the watermark.
+                            return
+                    except ValueError:
+                        pass
+            yield item
+
+    def lead_emails(self, lead_email: str) -> Iterator[dict]:
+        """`GET /api/v2/emails?lead=<email>` (paginated) — a lead's COMPLETE message set.
+
+        Returns every email for one lead across ALL directions and campaigns:
+        ue_type 1 (cold sends), 2 (prospect replies), 3 (our/IM replies) — rendered
+        (spintax already collapsed, merge fields filled), chronological newest-first
+        (cursor = next_starting_after). This is the email-thread-sync pull primitive
+        (FINALIZED-SPEC §2/§4.C): one call captures a replier's entire thread, so the
+        upsert collapses on the per-email id.
+
+        The `?lead=` API value is case-insensitive (`JESI@…` == lowercase), but the
+        warehouse key is NOT — so we lowercase+trim before sending so the discovery
+        set, the request value, and the stored key all agree (FINALIZED-SPEC §2).
+
+        A nonexistent lead returns HTTP 200 with items=[] / next=null — NEVER a 404.
+        Per-lead 404 handling is dead code; the only real failure is a dead workspace
+        KEY (handled by the caller skipping that org). 5xx/429 use _get's retry path.
+
+        Newest-first cursor: we yield in the API's native order (newest first) and do
+        NOT filter by time here — the caller pulls the full history per replied lead
+        (the thread is small) and the upsert is idempotent.
+        """
+        norm = (lead_email or "").lower().strip()
+        if not norm:
+            return
+        yield from self._paginate("/emails", params={"lead": norm}, limit=100)
+
+    def lead_emails_window(self, lead_email: str) -> tuple[list[dict], bool]:
+        """Eager `lead_emails` that also reports whether the pagination ceiling was hit.
+
+        Returns (items, ceiling_hit). A True ceiling_hit means the lead's history was
+        truncated mid-cursor (>1000 pages — pathological for a single lead) and the
+        caller MUST treat that lead/workspace as a HARD FAIL (do not advance the
+        watermark; escalate). Used by the email-thread-sync full-backfill path.
+        """
+        norm = (lead_email or "").lower().strip()
+        if not norm:
+            return [], False
+        flag: dict = {"hit": False}
+        items = list(
+            self._paginate("/emails", params={"lead": norm}, limit=100, ceiling_flag=flag)
+        )
+        return items, bool(flag.get("hit"))
 
     def list_tags(self, workspace_id: str | None = None) -> Iterator[dict]:
         """`GET /custom-tags` — workspace-level tag catalog.
