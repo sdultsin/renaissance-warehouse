@@ -6,8 +6,11 @@ campaign's copy, exposing exactly four copy columns:
 
     subject_raw / subject_clean / body_raw / body_clean
 
-where *_clean = the *_raw text with every spin block resolved to its FIRST option,
-recursively. See the DDL header for the full contract. Key points:
+where *_clean = the *_raw text with every spin block resolved to its FIRST option
+(recursively) AND the HTML stripped to readable plain text (block tags / <br> -> newlines,
+all other tags removed, entities decoded). *_raw keeps the exact authored HTML + spintax.
+The full signature (sign-off, name, title, AND the unsubscribe footer) is retained in both.
+See the DDL header for the full contract. Key points:
 
   * KEY = (campaign_id, step, content_hash) where content_hash = md5(subject_raw +
     0x1F + body_raw). INSERT ... ON CONFLICT DO NOTHING, so identical copy already
@@ -33,6 +36,7 @@ source copy, which this skips.
 from __future__ import annotations
 
 import hashlib
+import html as _html
 import json
 import logging
 import re
@@ -188,6 +192,41 @@ def unspin(s: str | None, _depth: int = 0) -> str | None:
     return "".join(out)
 
 
+# ---------------------------------------------------------------------------
+# HTML -> readable plain text (applied to *_clean only; *_raw keeps the HTML).
+# ---------------------------------------------------------------------------
+_RE_BR = re.compile(r"(?i)<br\s*/?>")
+_RE_BLOCK_END = re.compile(r"(?i)</(div|p|tr|li|h[1-6]|ul|ol|table|blockquote)>")
+_RE_TAG = re.compile(r"<[^>]+>")
+
+
+def html_to_text(s: str | None) -> str | None:
+    """Strip HTML to readable plain text: <br> and block-close tags -> newline, all
+    other tags removed, entities decoded. Personalization tokens ({{firstName}}) and
+    Liquid {% %} tags survive unchanged. Trims each line and collapses runs of blank
+    lines to a single blank line."""
+    if s is None:
+        return None
+    s = s.replace("\r", "")
+    s = _RE_BR.sub("\n", s)
+    s = _RE_BLOCK_END.sub("\n", s)
+    s = _RE_TAG.sub("", s)
+    s = _html.unescape(s)
+    s = s.replace("\xa0", " ")
+    lines = [re.sub(r"[ \t]+", " ", ln).strip() for ln in s.split("\n")]
+    out: list[str] = []
+    blank = False
+    for ln in lines:
+        if ln == "":
+            if not blank:
+                out.append("")
+            blank = True
+        else:
+            out.append(ln)
+            blank = False
+    return "\n".join(out).strip()
+
+
 _SPIN_RESIDUE = re.compile(r"\{\{\s*RANDOM", re.IGNORECASE)
 
 
@@ -260,11 +299,15 @@ def run_variant_copy(ctx: RunContext) -> PhaseResult:
                     variants_seen += 1
                     subject_raw = variant.get("subject") or ""
                     body_raw = variant.get("body") or ""
-                    subject_clean = unspin(subject_raw)
-                    body_clean = unspin(body_raw)
-                    if _is_unparseable(subject_raw, body_raw, subject_clean, body_clean):
+                    # unspin first (resolve spin); the parse check runs on the unspun
+                    # text so residual-spin detection is unaffected by HTML stripping.
+                    subject_unspun = unspin(subject_raw)
+                    body_unspun = unspin(body_raw)
+                    if _is_unparseable(subject_raw, body_raw, subject_unspun, body_unspun):
                         skipped_variants += 1
                         continue
+                    subject_clean = html_to_text(subject_unspun)
+                    body_clean = html_to_text(body_unspun)
                     h = _content_hash(subject_raw, body_raw)
                     before = db.execute(
                         "SELECT count(*) FROM core.variant_copy "
