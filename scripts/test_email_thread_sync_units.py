@@ -406,6 +406,61 @@ def test_enumerate_dedups_by_workspace_id_not_org():
           diag["dup_collapsed"] == ["ren5b"], repr(diag["dup_collapsed"]))
 
 
+def test_enumerate_allowlist_pins_to_the_9():
+    """WAREHOUSE_THREADS_ORG_ALLOWLIST (handoff 2026-06-28): when set, ONLY the listed env-slugs are
+    even probed — dead/free/duplicate keys are never hit, so the canonical reply-thread source can
+    contain EXACTLY Sam's 9 workspaces. When unset, every key is enumerated (back-compat)."""
+    import os
+
+    import duckdb
+
+    from entities import email_thread_sync as ets
+
+    payloads = {
+        "k-maxs":     {"id": "ws-maxs",   "organization_id": None},
+        "k-funding4": {"id": "ws-f4",     "organization_id": None},
+        "k-eagles":   {"id": "ws-eagles", "organization_id": None},  # NOT allowlisted -> skipped
+    }
+    _FakeWorkspaceClient._BY_KEY = payloads
+    creds = _FakeCreds({"new-maxs": "k-maxs", "new-funding4sam": "k-funding4",
+                        "new-theeagles": "k-eagles"})
+    con = duckdb.connect(":memory:")
+    con.execute("CREATE SCHEMA IF NOT EXISTS core")
+    con.execute("CREATE TABLE core.workspace (workspace_id VARCHAR, slug VARCHAR)")
+    con.execute("INSERT INTO core.workspace VALUES "
+                "('ws-maxs','the-gatekeepers'),('ws-f4','koi-and-destroy'),('ws-eagles','the-eagles')")
+
+    orig = ets.InstantlyClient
+    ets.InstantlyClient = _FakeWorkspaceClient
+    os.environ["WAREHOUSE_THREADS_ORG_ALLOWLIST"] = "new-maxs, new-funding4sam"
+    try:
+        workspaces, diag = ets.enumerate_orgs(creds, con)
+    finally:
+        ets.InstantlyClient = orig
+        del os.environ["WAREHOUSE_THREADS_ORG_ALLOWLIST"]
+    con.close()
+
+    check("only allowlisted workspaces enumerated (the-eagles dropped)",
+          set(workspaces.keys()) == {"ws-maxs", "ws-f4"}, repr(sorted(workspaces.keys())))
+    check("non-allowlisted key recorded as skipped",
+          diag["skipped_not_allowlisted"] == ["new-theeagles"], repr(diag["skipped_not_allowlisted"]))
+    check("allowlist surfaced in diag", diag["allowlist"] == ["new-funding4sam", "new-maxs"],
+          repr(diag["allowlist"]))
+
+    # unset -> all keys enumerated (back-compat)
+    con2 = duckdb.connect(":memory:")
+    con2.execute("CREATE SCHEMA IF NOT EXISTS core")
+    con2.execute("CREATE TABLE core.workspace (workspace_id VARCHAR, slug VARCHAR)")
+    ets.InstantlyClient = _FakeWorkspaceClient
+    try:
+        ws_all, diag_all = ets.enumerate_orgs(creds, con2)
+    finally:
+        ets.InstantlyClient = orig
+    con2.close()
+    check("unset allowlist -> all 3 workspaces enumerated (back-compat)",
+          len(ws_all) == 3 and diag_all["allowlist"] is None, repr(diag_all.get("allowlist")))
+
+
 # ── apply: a NULL-degraded re-pull must NOT wipe committed-good columns (FIX 2) ───
 def test_degraded_repull_does_not_null_out_columns():
     """FIX 2 (idempotency, blocking): a later re-pull of an EXISTING message_id that arrives with
@@ -518,6 +573,7 @@ def main() -> int:
         test_n_seq_sends_dedups_within_lead_not_across_leads,
         test_ceiling_hit_excludes_ws_and_idempotent,
         test_enumerate_dedups_by_workspace_id_not_org,
+        test_enumerate_allowlist_pins_to_the_9,
         test_degraded_repull_does_not_null_out_columns,
     ]
     for t in tests:

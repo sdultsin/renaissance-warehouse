@@ -217,6 +217,21 @@ def enumerate_orgs(
         logger.warning("core.workspace not readable — falling back to env slugs only")
 
     keys = creds.instantly_workspace_keys()
+    # Optional ALLOWLIST (handoff 2026-06-28: pin the canonical reply-thread source to EXACTLY the 9
+    # verified workspaces — drop the 12 dead keys, "The Eagles" (free plan, dormant), and the PREIPO
+    # duplicate). WAREHOUSE_THREADS_ORG_ALLOWLIST = comma-separated env-slugs
+    # (INSTANTLY_KEY_<X> -> x.lower().replace('_','-'); e.g. "new-maxs,new-funding1samuel"). When SET,
+    # ONLY those slugs are even probed — so dead keys are never hit (no wasted 402/401 round-trips) and
+    # the canonical source can contain ONLY Sam's 9. This also pins the NIGHTLY to the 9 (set the var in
+    # /root/core/.env.threads). When UNSET, every key is enumerated (back-compat / unchanged behaviour).
+    allow_raw = os.environ.get("WAREHOUSE_THREADS_ORG_ALLOWLIST", "").strip()
+    allowlist = (
+        {s.strip().lower() for s in allow_raw.split(",") if s.strip()} if allow_raw else None
+    )
+    skipped_not_allowlisted: list[str] = []
+    if allowlist is not None:
+        logger.info("workspace allowlist active: %d slugs -> %s", len(allowlist), sorted(allowlist))
+
     # ws_uuid -> (canonical_slug, api_key, organization_id). DEDUP KEY = the workspace UUID
     # (w['id']), so two DISTINCT workspaces that share one parent org are BOTH kept (never
     # collapsed). The real organization_id rides along so (a) it is preserved as provenance and
@@ -229,6 +244,9 @@ def enumerate_orgs(
     key_errors: list[dict] = []
 
     for slug in sorted(keys.keys()):
+        if allowlist is not None and slug not in allowlist:
+            skipped_not_allowlisted.append(slug)  # not in the pinned 9 -> never probed
+            continue
         api_key = keys[slug]
         try:
             with InstantlyClient(api_key) as client:
@@ -264,6 +282,8 @@ def enumerate_orgs(
         "dup_collapsed": dup_collapsed,
         "key_errors": key_errors,
         "workspaces": sorted({v[0] for v in workspaces.values()}),
+        "allowlist": sorted(allowlist) if allowlist is not None else None,
+        "skipped_not_allowlisted": skipped_not_allowlisted,
     }
     logger.info(
         "workspace enum: distinct_workspaces=%d dead_keys=%d dup_collapsed=%d key_errors=%d",
@@ -293,6 +313,7 @@ def discover_replied_leads(
     org_id: str,
     ws_uuid: str | None,
     since_ws,
+    skip_live_walk: bool = False,
 ) -> tuple[set[str], dict]:
     """Lowercased lead set to (re)pull for one org since `since_ws`.
 
@@ -351,9 +372,14 @@ def discover_replied_leads(
         logger.warning("discovery: raw_instantly_email not queryable (%s) — local set empty", exc)
 
     # --- INCREMENTAL ONLY: broadened live trigger for a late ue_type=3 with no new inbound ---
+    # skip_live_walk forces LOCAL-ONLY discovery even for a non-null since_ws — used by a bounded
+    # `--since-override`/`--local-only` window BACKFILL (e.g. the IM first-reply baseline pull),
+    # where the all_emails walk is both unnecessary (we want the local replied-lead set in a fixed
+    # window, not late-ue3 deltas) AND risky (a big workspace's recent stream can cross the
+    # pagination ceiling and HARD-FAIL the ws). The nightly incremental (no flags) is unaffected.
     ceiling_hit = False
     n_seen = 0
-    if since_ws is not None:
+    if since_ws is not None and not skip_live_walk:
         cutoff_iso = since_ws.astimezone(timezone.utc).isoformat()
         flag: dict = {"hit": False}
         for e in client.all_emails(since=cutoff_iso, ceiling_flag=flag):
@@ -535,12 +561,27 @@ def run_fetch(
     run_id: str,
     stage_path: str,
     read_conn: duckdb.DuckDBPyConnection,
+    since_override=None,
+    full_backfill: bool = False,
+    local_only: bool = False,
 ) -> dict:
     """Phase A. Enumerate orgs, discover replied leads per org (per-workspace watermark),
     pull each lead's full thread, append rows to the JSONL staging file. NO DB WRITES.
 
     Returns a diagnostics dict including per-ws RUNLOG metrics and ceiling-hit workspaces
     whose watermark must NOT advance.
+
+    `since_ws` per workspace is chosen as (highest precedence first):
+      * `full_backfill=True`  -> since_ws=None  (FULL local discovery, ignore the watermark). This is
+        what makes a re-runnable full backfill safe AFTER the atom is already partly populated (e.g.
+        after a focused window pull): the watermark would otherwise be non-null and silently turn the
+        big historical pull into a tiny incremental delta, dropping every pre-watermark replier.
+      * `since_override` set -> since_ws=that datetime for every ws (a fixed window backfill, e.g. the
+        baseline pull `--since-override 2026-06-22`). Pair with `local_only=True` to skip the all_emails
+        walk (a fixed window wants the local replied-lead set, not late-ue3 deltas).
+      * else -> the per-workspace watermark (R7 — the unchanged nightly incremental path).
+    `local_only=True` forces local-only discovery (no all_emails live walk) even for a non-null since_ws.
+    With no flags, behaviour is exactly the original watermark-based incremental.
     """
     _assert_no_writer_lock_held()  # G8/R8: never pull over the network under the writer lock
     workspaces, diag = enumerate_orgs(creds, read_conn)
@@ -566,7 +607,12 @@ def run_fetch(
         new_failed: list[dict] = []
         retried_ws: set[str] = set()  # ws whose pull loop ran (its prior-failed were retried)
         for ws_uuid, (ws_slug, api_key, organization_id) in workspaces.items():
-            since_ws = workspace_watermark(read_conn, ws_slug)
+            if full_backfill:
+                since_ws = None                       # FULL discovery — ignore the watermark
+            elif since_override is not None:
+                since_ws = since_override              # fixed-window backfill (e.g. baseline pull)
+            else:
+                since_ws = workspace_watermark(read_conn, ws_slug)  # nightly incremental (R7)
             ws_ceiling = False
             try:
                 with InstantlyClient(api_key) as client:
@@ -574,7 +620,8 @@ def run_fetch(
                     # AND the ws UUID (DDL 36 stored `organization_id or ws.id`) so no existing
                     # lead is missed regardless of which the inbound row carries.
                     replied_leads, dd = discover_replied_leads(
-                        read_conn, client, organization_id, ws_uuid, since_ws
+                        read_conn, client, organization_id, ws_uuid, since_ws,
+                        skip_live_walk=(local_only or full_backfill),
                     )
                     # union back the prior-run failures for this ws (one retry — §4.F)
                     replied_leads = set(replied_leads) | prior_failed_by_ws.get(ws_slug, set())
@@ -1001,11 +1048,33 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     f = sub.add_parser("fetch", help="Phase A — pull replied-lead threads to JSONL (NO lock)")
     f.add_argument("--stage", default=_STAGE_DEFAULT)
+    f.add_argument("--full-backfill", action="store_true",
+                   help="FULL local discovery (since_ws=None) ignoring the watermark — the safe "
+                        "re-runnable historical backfill even after the atom is partly populated.")
+    f.add_argument("--since-override", default=None,
+                   help="ISO8601 lower bound used as since_ws for EVERY workspace (fixed-window "
+                        "backfill, e.g. the baseline pull --since-override 2026-06-22). Pair with "
+                        "--local-only. Mutually exclusive with --full-backfill.")
+    f.add_argument("--local-only", action="store_true",
+                   help="Local-only discovery (skip the all_emails live walk) even for a non-null "
+                        "since_ws — for a bounded window backfill that must not risk the page ceiling.")
     a = sub.add_parser("apply", help="Phase B — bulk upsert staging (run under with_warehouse_lock.sh)")
     a.add_argument("--stage", default=_STAGE_DEFAULT)
     r = sub.add_parser("run", help="fetch then apply (DEV ONLY — apply takes the writer lock)")
     r.add_argument("--stage", default=_STAGE_DEFAULT)
+    r.add_argument("--full-backfill", action="store_true")
+    r.add_argument("--since-override", default=None)
+    r.add_argument("--local-only", action="store_true")
     args = ap.parse_args(argv)
+
+    since_override = None
+    if getattr(args, "since_override", None):
+        if getattr(args, "full_backfill", False):
+            print("--since-override and --full-backfill are mutually exclusive.", file=sys.stderr)
+            return 2
+        since_override = datetime.fromisoformat(args.since_override.replace("Z", "+00:00"))
+        if since_override.tzinfo is None:
+            since_override = since_override.replace(tzinfo=timezone.utc)
 
     if os.environ.get("WAREHOUSE_PULL_THREADS") != "1":
         print("WAREHOUSE_PULL_THREADS != 1 — refusing to run (flag-gated).", file=sys.stderr)
@@ -1018,7 +1087,12 @@ def main(argv=None) -> int:
     if args.cmd in ("fetch", "run"):
         read_conn = db_module.connect(read_only=True)
         try:
-            diag = run_fetch(creds, run_id, args.stage, read_conn)
+            diag = run_fetch(
+                creds, run_id, args.stage, read_conn,
+                since_override=since_override,
+                full_backfill=getattr(args, "full_backfill", False),
+                local_only=getattr(args, "local_only", False),
+            )
         finally:
             read_conn.close()
         print(json.dumps({k: v for k, v in diag.items() if k != "per_ws_runlog"}, default=str, indent=2))
