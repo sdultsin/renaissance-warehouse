@@ -30,11 +30,7 @@ logger = logging.getLogger("sources.iskra")
 BASE_URL = "https://xglfamaaotmwulglwcui.supabase.co/functions/v1/public-api"
 _TIMEOUT = 60.0
 _PAGE_LIMIT = 100            # max page size the paginated list endpoints honour
-_MEETINGS_PAGE_LIMIT = 999   # /meetings now CURSOR-PAGINATES (v1, 2026-06-27; old 500 hard cap lifted).
-                             # Page at 999, NOT 1000: at exactly limit=1000 the API returns
-                             # has_more=false + NO next_cursor mid-set (a vendor cursor off-by-one),
-                             # silently stopping at 1000 -> under-count. 999 paginates correctly to
-                             # exhaustion (~6,065 rows / 7 pages). Raise the off-by-one with Arseny.
+MEETINGS_CAP = 500           # /meetings hard cap: no pagination, has_more always false (vendor gap)
 _MIN_INTERVAL_S = 1.05       # 60 req/min/key -> >=1.0s between requests; 1.05 for headroom
 _MAX_RETRIES = 4
 
@@ -182,15 +178,13 @@ class IskraClient:
                              stop_before=stop_before, stop_field="created_at")
 
     def meetings(self, since: str | None = None, max_pages: int = 2000) -> PageWalk:
-        """GET /v1/meetings — v1 (verified 2026-06-27) now CURSOR-PAGINATES; the old 500 hard cap is
-        LIFTED. Page at limit=999 and walk next_cursor to exhaustion (~6,065 rows / 7 pages). Do NOT
-        call limit=1000: at exactly 1000 the API returns has_more=false + NO next_cursor mid-set (a
-        vendor cursor off-by-one) and silently stops at the first 1000 -> under-count. paginate()
-        sets completed=True ONLY when it reached has_more=false, so a truncated walk fails loud (E3).
-        `since` IS a working lower bound, but the ingest pulls the COMPLETE set (since=None) because
-        the set is small and COMPLETENESS (not incrementality) is the requirement — this is the W1e
-        fix for the old 500-newest-only meeting under-count."""
-        params = {"limit": _MEETINGS_PAGE_LIMIT}
+        """GET /v1/meetings — VENDOR LIMITATION (verified 2026-06-18): no cursor pagination,
+        has_more is ALWAYS false, and the endpoint hard-caps at MEETINGS_CAP (500) rows newest-first.
+        `since` IS a working lower bound. So we request the max page (500); the caller treats a
+        full-cap return as potential truncation (older tags beyond the newest 500 are unreachable).
+        Daily tag volume is ~100-220, so an incremental since=watermark pull stays well under the
+        cap and is complete go-forward; only a deep historical backfill hits the cap."""
+        params = {"limit": MEETINGS_CAP}
         if since:
             params["since"] = since
         return self.paginate("/v1/meetings", params, max_pages=max_pages)
