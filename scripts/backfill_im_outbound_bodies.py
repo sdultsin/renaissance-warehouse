@@ -16,24 +16,28 @@ SAFETY / SHAPE:
     currently NULL/empty (never overwrites real text), and writes every touched id to a
     manifest file for trivial rollback.
   * Two phases so the slow network fetch never holds the single-writer flock:
-      fetch  — GET each target email, store the VERBATIM body.html to a parquet (no DB write).
-      apply  — read parquet, extract the clean top message, UPDATE under the writer flock.
-    Re-running apply with cleaning tweaks needs no re-fetch (raw html is persisted).
+      fetch  — GET each target email, append the VERBATIM body.html to a JSONL file (no DB write).
+      apply  — read JSONL, extract the clean top message, UPDATE under the writer flock.
+    The fetch CHECKPOINTS incrementally (one JSONL line per email, flushed in batches) so a
+    crash/restart resumes from where it left off and never loses the pull. Re-running apply
+    with cleaning tweaks needs no re-fetch (raw html is persisted). Stdlib JSONL only — the
+    droplet venv has duckdb but no pyarrow/pandas; duckdb reads the JSONL natively.
 
 USAGE (on the droplet):
   export INSTANTLY_BACKFILL_KEY_RENAISSANCE_4=...   # Funding 1 api_key_new_2026_04_13
   export INSTANTLY_BACKFILL_KEY_RENAISSANCE_5=...   # Funding 2 api_key_new_2026_04_13
   .venv/bin/python scripts/backfill_im_outbound_bodies.py fetch \
-      --out /root/core/backfill_im_bodies.parquet
+      --out /root/core/backfill_im_bodies.jsonl
   WAREHOUSE_LOCK_WAIT_S=3600 scripts/with_warehouse_lock.sh \
       .venv/bin/python scripts/backfill_im_outbound_bodies.py apply \
-      --in /root/core/backfill_im_bodies.parquet
+      --in /root/core/backfill_im_bodies.jsonl
 """
 from __future__ import annotations
 
 import argparse
 import datetime as dt
 import html as htmllib
+import json
 import os
 import re
 import sys
@@ -135,22 +139,32 @@ def _get_email(client: httpx.Client, email_id: str) -> tuple[int, dict]:
             return 200, {}
 
 
+def _resume_done(out_path: str) -> set[str]:
+    """Ids already in the JSONL checkpoint (so a restart resumes, never re-fetches)."""
+    done: set[str] = set()
+    if not os.path.exists(out_path):
+        return done
+    with open(out_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                done.add(json.loads(line)["id"])
+            except (ValueError, KeyError):
+                continue
+    return done
+
+
 def run_fetch(out_path: str, workers: int) -> int:
     con = duckdb.connect(WAREHOUSE, read_only=True)
     targets = _targets(con)
     con.close()
     print(f"[fetch] {len(targets):,} target ue_type=3 rows (body NULL) across {len(TARGET_SLUGS)} workspaces", flush=True)
 
-    # restartable: skip ids already in the out parquet
-    done: set[str] = set()
-    if os.path.exists(out_path):
-        d = duckdb.connect()
-        try:
-            done = {r[0] for r in d.execute(f"SELECT id FROM read_parquet('{out_path}')").fetchall()}
-        except Exception:
-            done = set()
-        d.close()
-        print(f"[fetch] resume: {len(done):,} already fetched", flush=True)
+    done = _resume_done(out_path)
+    if done:
+        print(f"[fetch] resume: {len(done):,} already in {out_path}", flush=True)
     todo = [(i, w) for (i, w) in targets if i not in done]
     if not todo:
         print("[fetch] nothing to do", flush=True)
@@ -168,7 +182,6 @@ def run_fetch(out_path: str, workers: int) -> int:
         for slug in TARGET_SLUGS
     }
 
-    results: list[dict] = []
     now = dt.datetime.now(dt.timezone.utc).isoformat()
     n_ok = n_miss = 0
 
@@ -187,54 +200,41 @@ def run_fetch(out_path: str, workers: int) -> int:
             "fetched_at": now,
         }
 
+    # Append-mode JSONL checkpoint: every completed email is written immediately and flushed
+    # in small batches, so a crash/restart loses nothing and resumes via _resume_done().
     t0 = time.time()
-    with ThreadPoolExecutor(max_workers=workers) as ex:
+    with open(out_path, "a") as out, ThreadPoolExecutor(max_workers=workers) as ex:
         futs = [ex.submit(work, it) for it in todo]
         for n, fut in enumerate(as_completed(futs), 1):
             rec = fut.result()
-            results.append(rec)
+            out.write(json.dumps(rec) + "\n")
             if rec["http_status"] == 200 and (rec["html"] or rec["text"]):
                 n_ok += 1
             else:
                 n_miss += 1
+            if n % 200 == 0:
+                out.flush()
+                os.fsync(out.fileno())
             if n % 500 == 0:
                 rate = n / max(time.time() - t0, 1e-9)
                 print(f"[fetch] {n:,}/{len(todo):,}  ok={n_ok:,} miss={n_miss:,}  {rate:.1f}/s", flush=True)
+        out.flush()
+        os.fsync(out.fileno())
     for c in clients.values():
         c.close()
 
-    # merge with any prior results and write the full parquet (atomic-ish via temp rename)
-    d = duckdb.connect()
-    d.register("new_rows", _as_arrow(results))
-    if done:
-        d.execute(
-            f"COPY (SELECT * FROM read_parquet('{out_path}') UNION ALL BY NAME SELECT * FROM new_rows) "
-            f"TO '{out_path}.tmp' (FORMAT parquet)"
-        )
-    else:
-        d.execute(f"COPY (SELECT * FROM new_rows) TO '{out_path}.tmp' (FORMAT parquet)")
-    d.close()
-    os.replace(f"{out_path}.tmp", out_path)
-    print(f"[fetch] wrote {out_path}: +{len(results):,} rows (ok={n_ok:,} miss={n_miss:,})", flush=True)
+    print(f"[fetch] done: appended {len(todo):,} rows to {out_path} (ok={n_ok:,} miss={n_miss:,})", flush=True)
     return n_miss
-
-
-def _as_arrow(records: list[dict]):
-    import pyarrow as pa
-    if not records:
-        cols = ["id", "workspace_id", "html", "text", "content_preview", "timestamp_email", "http_status", "fetched_at"]
-        return pa.table({c: [] for c in cols})
-    keys = list(records[0].keys())
-    return pa.table({k: [r.get(k) for r in records] for k in keys})
 
 
 # --- apply phase --------------------------------------------------------------
 def run_apply(in_path: str) -> None:
     if not os.path.exists(in_path):
-        sys.exit(f"input parquet not found: {in_path}")
+        sys.exit(f"input JSONL not found: {in_path}")
     stage = duckdb.connect()
     rows = stage.execute(
-        f"SELECT id, workspace_id, html, text FROM read_parquet('{in_path}') WHERE http_status = 200"
+        f"SELECT id, workspace_id, html, text FROM read_json_auto('{in_path}', format='newline_delimited') "
+        f"WHERE http_status = 200"
     ).fetchall()
     stage.close()
     cleaned = []
@@ -292,10 +292,10 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
     f = sub.add_parser("fetch")
-    f.add_argument("--out", default="/root/core/backfill_im_bodies.parquet")
+    f.add_argument("--out", default="/root/core/backfill_im_bodies.jsonl")
     f.add_argument("--workers", type=int, default=6)
     a = sub.add_parser("apply")
-    a.add_argument("--in", dest="in_path", default="/root/core/backfill_im_bodies.parquet")
+    a.add_argument("--in", dest="in_path", default="/root/core/backfill_im_bodies.jsonl")
     args = ap.parse_args()
     if args.cmd == "fetch":
         run_fetch(args.out, args.workers)
