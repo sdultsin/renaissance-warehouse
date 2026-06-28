@@ -80,7 +80,14 @@ SELECT
 FROM core.v_sms_booking_phone b
 LEFT JOIN raw_sendivo_blast_deal d
        ON d.contact_phone10 = b.phone10
-      OR lower(d.contact_email) = b.email;
+      OR lower(d.contact_email) = b.email
+-- Guard the phone-OR-email join: if two deal rows match one booking (one on phone, one on email),
+-- keep exactly ONE so a booking never fans out / inflates v_sms_blast_performance. Prefer a won deal,
+-- then the most recent. (Independent review finding, 2026-06-28.)
+QUALIFY row_number() OVER (
+    PARTITION BY b.meeting_id
+    ORDER BY d.is_closed_won DESC NULLS LAST, d.booked_at DESC NULLS LAST, d.deal_id
+) = 1;
 
 -- ---------------------------------------------------------------------------
 -- Per-blast performance: OUR bookings-attributed (origin) vs Sendivo's last-touch deals_won.
