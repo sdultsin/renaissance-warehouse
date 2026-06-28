@@ -36,6 +36,10 @@ from sources.instantly import InstantlyClient, InstantlyError
 logger = logging.getLogger("entities.instantly_replies")
 
 _OVERLAP = timedelta(days=2)
+# A never-before-pulled / recovered workspace backfills at most this far. Bounds the
+# initial pull (so adding a high-volume workspace like Warm leads can't trigger an
+# unbounded full-history scrape) while still covering the recent tail + cutover overlap.
+_BACKFILL_FLOOR = timedelta(days=45)
 
 _COLS = [
     "email_id", "campaign_id", "workspace_id", "lead_email", "from_address_email",
@@ -81,24 +85,19 @@ def run_instantly_replies_ingest(ctx: RunContext) -> PhaseResult:
         logger.warning("No INSTANTLY_KEY_* env vars found — skipping reply ingest")
         return PhaseResult(notes={"reason": "no_keys"})
 
-    # Incremental watermark: latest reply already stored, minus overlap.
-    # FULL-BACKFILL MODE (Step 2a, reversible/env-gated): when
-    # WAREHOUSE_REPLIES_FULL_BACKFILL=1, force since=None so EVERY workspace pulls
-    # its complete received-email history. Required because the watermark below is
-    # GLOBAL (max over the whole table): once one workspace reaches "now", the
-    # derived `since` would skip the full history of workspaces never backfilled.
-    # Upserts are idempotent on email_id, so repeated full passes are safe.
-    if os.environ.get("WAREHOUSE_REPLIES_FULL_BACKFILL") == "1":
-        since = None
-        logger.info("Reply ingest watermark since=(FULL BACKFILL forced)")
-    else:
-        row = ctx.db.execute(
-            "SELECT max(reply_timestamp) FROM raw_instantly_email"
-        ).fetchone()
-        since = None
-        if row and row[0] is not None:
-            since = (row[0] - _OVERLAP).astimezone(timezone.utc).isoformat()
-        logger.info("Reply ingest watermark since=%s", since or "(full backfill)")
+    # PER-WORKSPACE incremental watermark (computed inside the loop below, once the
+    # workspace_id is known). This replaces the prior GLOBAL watermark (max over the
+    # WHOLE table), whose flaw was structural: once any one workspace reached "now",
+    # the global `since` jumped forward and PERMANENTLY skipped the unfetched history
+    # of any quiet / newly-added / key-recovered workspace (e.g. Warm leads was never
+    # in the pull at all; a 402'd-then-fixed key could never backfill its gap). A
+    # per-workspace watermark self-heals each of those: an established workspace pulls
+    # incrementally from ITS OWN max; a never-seen one does a bounded backfill.
+    # FULL-BACKFILL escape hatch (WAREHOUSE_REPLIES_FULL_BACKFILL=1) forces since=None
+    # for every workspace; idempotent UPSERT-on-email_id makes repeated passes safe.
+    full_backfill = os.environ.get("WAREHOUSE_REPLIES_FULL_BACKFILL") == "1"
+    if full_backfill:
+        logger.info("Reply ingest: FULL BACKFILL forced for all workspaces")
 
     now = datetime.now(timezone.utc)
     rows_out = 0
@@ -119,6 +118,22 @@ def run_instantly_replies_ingest(ctx: RunContext) -> PhaseResult:
                     logger.info("Skipping duplicate workspace slug=%s", slug)
                     continue
                 seen_workspace_ids.add(workspace_id)
+
+                # Per-workspace watermark: incremental from THIS workspace's own max
+                # reply (minus overlap); a never-pulled workspace does a bounded
+                # backfill (not the global max, which would skip its history).
+                if full_backfill:
+                    since = None
+                else:
+                    wm = ctx.db.execute(
+                        "SELECT max(reply_timestamp) FROM raw_instantly_email WHERE workspace_id = ?",
+                        [workspace_id],
+                    ).fetchone()
+                    if wm and wm[0] is not None:
+                        since = (wm[0] - _OVERLAP).astimezone(timezone.utc).isoformat()
+                    else:
+                        since = (now - _BACKFILL_FLOOR).astimezone(timezone.utc).isoformat()
+                logger.info("Workspace %s watermark since=%s", slug, since or "(full)")
 
                 w_rows = 0
                 for e in client.received_emails(since=since, workspace_id=workspace_id):
@@ -159,5 +174,9 @@ def run_instantly_replies_ingest(ctx: RunContext) -> PhaseResult:
     return PhaseResult(
         rows_in=rows_out,
         rows_out=rows_out,
-        notes={"workspaces_done": workspaces_done, "failures": failures, "since": since},
+        notes={
+            "workspaces_done": workspaces_done,
+            "failures": failures,
+            "watermark": "per-workspace" if not full_backfill else "full-backfill",
+        },
     )
