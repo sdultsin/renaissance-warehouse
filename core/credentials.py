@@ -39,11 +39,15 @@ class Credentials:
     def instantly_workspace_keys(self) -> dict[str, str]:
         """Returns {workspace_slug: api_key} from INSTANTLY_KEY_<SLUG> conventions.
 
-        Excludes meta-keys (PERSONAL, SAM_TEST, WARM_LEADS, etc.) — those belong
-        in CONSUMER_WORKSPACE_KEYS or similar separate vars when needed.
+        Excludes only true meta-keys (PERSONAL, SAM_TEST) — not real cold-email
+        workspaces. WARM_LEADS was previously excluded here, which left the live
+        Warm leads workspace (15-30k sends/day) OFF the native reply ingest and
+        surviving only on the n8n pipeline feed — so retiring n8n would have
+        silently darkened it. It is an active funding-adjacent workspace; it
+        belongs in the native pull. (warehouse reply-pipe remediation 2026-06-28)
         """
         keys = {}
-        excluded = {"INSTANTLY_KEY_PERSONAL", "INSTANTLY_KEY_SAM_TEST", "INSTANTLY_KEY_WARM_LEADS"}
+        excluded = {"INSTANTLY_KEY_PERSONAL", "INSTANTLY_KEY_SAM_TEST"}
         for k, v in self._values.items():
             if k.startswith("INSTANTLY_KEY_") and k not in excluded and v:
                 slug = k.removeprefix("INSTANTLY_KEY_").lower().replace("_", "-")
