@@ -101,7 +101,8 @@ class InstantlyClient:
     # was exhausted, i.e. the result set is silently truncated mid-history. Callers
     # that need full coverage (email-thread-sync full backfill) MUST treat a ceiling
     # hit as a HARD FAIL and NOT advance their watermark (FINALIZED-SPEC §4.C/R8).
-    PAGINATION_CEILING = 1000
+    PAGINATION_CEILING = 100_000  # runaway BACKSTOP, not a data limit (~10M records). Real
+                                  # pulls complete via cursor exhaustion; never cut short silently.
 
     def _paginate(
         self,
@@ -121,6 +122,7 @@ class InstantlyClient:
         p.setdefault("limit", limit)
         cursor: str | None = None
         seen_pages = 0
+        seen_cursors: set[str] = set()
         while True:
             if cursor:
                 p["starting_after"] = cursor
@@ -132,13 +134,22 @@ class InstantlyClient:
             seen_pages += 1
             if not cursor:
                 return
-            # gentle pace + safety
-            time.sleep(0.05)
+            # Infinite-loop guard: a cursor that repeats is a real bug, not legitimate volume.
+            if cursor in seen_cursors:
+                raise InstantlyError(
+                    f"{path}: pagination cursor not advancing at page {seen_pages} — aborting infinite loop")
+            seen_cursors.add(cursor)
+            time.sleep(0.05)  # gentle pace
             if seen_pages > self.PAGINATION_CEILING:
-                logger.warning("Pagination ceiling on %s — bailing at %d pages", path, seen_pages)
+                # Never silently return a partial set. A caller that explicitly handles a short
+                # pull gets the flag; anyone else fails LOUD instead of getting incomplete data.
+                logger.error("Pagination backstop %d hit on %s — refusing to return a partial set",
+                             self.PAGINATION_CEILING, path)
                 if ceiling_flag is not None:
                     ceiling_flag["hit"] = True
-                return
+                    return
+                raise InstantlyError(
+                    f"{path}: exceeded {seen_pages} pages — refusing to return a partial set")
 
     # --- endpoints -------------------------------------------------------
 
