@@ -34,7 +34,9 @@ CREATE TABLE IF NOT EXISTS core.sms_offer_override (
 CREATE OR REPLACE VIEW main.v_sms_sends_by_offer AS
 SELECT
     d.metric_date,
-    COALESCE(o.offer, c.offer, '(offer-unknown)')   AS offer,
+    -- override ALWAYS wins (explicit precedence so it cannot be misread); else classifier; else unknown
+    CASE WHEN o.offer IS NOT NULL THEN o.offer
+         ELSE COALESCE(c.offer, '(offer-unknown)') END   AS offer,
     SUM(d.sent)                                      AS sent,
     COUNT(DISTINCT d.campaign_id)                    AS campaigns
 FROM main.v_sms_campaign_performance d
