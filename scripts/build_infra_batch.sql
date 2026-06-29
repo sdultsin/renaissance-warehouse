@@ -1,14 +1,29 @@
 -- Populate the infra-batch layer (DDL 61) from the compact parquet extracts.
--- Run when a fresh manual export drops (point-in-time snapshots, NOT a nightly
--- feed). Idempotent: DELETE + INSERT preserves the DDL-defined schema/keys.
+-- Idempotent FULL RECONCILE: DELETE + INSERT makes core.* EQUAL to the parquet,
+-- so it is a TRUE MIRROR of the source sheets (adds appear, removes drop — never
+-- append/upsert). Preserves the DDL-defined schema/keys.
 --
 --   duckdb /root/core/warehouse.duckdb < scripts/build_infra_batch.sql
+--
+-- The parquets are produced by scripts/export_infra_batch.py (re-runnable) and
+-- this build is driven WEEKLY by scripts/refresh_infra_batch.sh (cron) — no
+-- longer a manual one-off snapshot. rg_tag_1 / rg_tag_2 now flow through the
+-- export+INSERT (was a one-time hashed backfill in DDL 1008, which went stale).
 --
 -- Semantics (Sam-corrected, 2026-06-12):
 --   * -R = replacement set (new inboxes/domains). Never merged with its base.
 --   * Decimals = one batch split across N workspaces; CSV uses the base label.
 --   * Bridge = (email, batch_key) membership; is_current_batch = latest generation.
 SET VARIABLE pq = '/root/core/build/infra-batch';
+
+-- ATOMICITY: wrap the whole reconcile (steps 1-6) in ONE transaction. DuckDB
+-- auto-commits each statement otherwise, so a DELETE that committed before a
+-- failing INSERT (e.g. a parquet column mismatch or a missing file) would leave
+-- a core table WIPED. Inside a transaction any failure rolls the whole reconcile
+-- back to the prior correct state — "stale-but-correct beats fresh-but-broken".
+-- (The run-log summary SELECT is deliberately AFTER the COMMIT so a transient
+-- read error in the summary can never fail an already-good load.)
+BEGIN TRANSACTION;
 
 -- ── 1. core.infra_batch (per Sheet label) ────────────────────────────────────
 DELETE FROM core.infra_batch;
@@ -23,6 +38,7 @@ SELECT email AS account_email, batch_key, batch_family,
        NULL::BOOLEAN AS is_current_batch,    -- filled in step 5
        domain, raw_workspace, provider_tag, email_tag, offer,
        first_name, last_name, status_csv, n_source_rows,
+       rg_tag_1, rg_tag_2,                   -- RG attribution carried from the export (2026-06-28)
        now() AS _loaded_at
 FROM read_parquet(getvariable('pq') || '/account_batch.parquet');
 
@@ -128,11 +144,20 @@ WHERE r.account_email = b.account_email
   AND r.batch_key IS NOT DISTINCT FROM b.batch_key;
 
 -- ── 6. core.domain_infra_csv ──────────────────────────────────────────────────
+-- NOT owned by export_infra_batch.py (domain-purchase data comes from the domain
+-- registry on its own cadence); this build only RE-loads the existing parquet so
+-- the table isn't left empty. refresh_infra_batch.sh ASSERTS this file exists
+-- before invoking the build, so a missing file is caught with a clear error up
+-- front. Should it ever be absent here, the read errors INSIDE the transaction
+-- and the whole reconcile rolls back (no partial wipe of any core table).
 DELETE FROM core.domain_infra_csv;
 INSERT INTO core.domain_infra_csv BY NAME
 SELECT domain, tld, accounts_per_domain, expiration_date, n_accounts_in_csv,
        now() AS _loaded_at
 FROM read_parquet(getvariable('pq') || '/domain_purchase.parquet');
+
+-- Commit the full reconcile atomically (all steps land, or none do).
+COMMIT;
 
 -- ── run-log summary ───────────────────────────────────────────────────────────
 SELECT 'cold_start_median_gap_days' AS metric, getvariable('cold_gap')::VARCHAR AS value
@@ -141,4 +166,6 @@ UNION ALL SELECT 'batch_keys', count(*)::VARCHAR FROM core.infra_batch_key
 UNION ALL SELECT 'keys_by_join_type', (SELECT string_agg(join_type || '=' || n, ', ') FROM (SELECT join_type, count(*) n FROM core.infra_batch_key GROUP BY 1))
 UNION ALL SELECT 'memberships', count(*)::VARCHAR FROM core.sending_account_batch
 UNION ALL SELECT 'current_memberships', count(*) FILTER (WHERE is_current_batch)::VARCHAR FROM core.sending_account_batch
+UNION ALL SELECT 'rg_tag_1_filled', count(*) FILTER (WHERE rg_tag_1 IS NOT NULL)::VARCHAR FROM core.sending_account_batch
+UNION ALL SELECT 'rg_tag_2_filled', count(*) FILTER (WHERE rg_tag_2 IS NOT NULL)::VARCHAR FROM core.sending_account_batch
 UNION ALL SELECT 'domains', count(*)::VARCHAR FROM core.domain_infra_csv;
