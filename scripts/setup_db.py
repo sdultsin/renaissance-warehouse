@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import subprocess
 import sys
 from pathlib import Path
 
@@ -16,6 +17,31 @@ from core import db as db_module
 from core.config import REPO_ROOT
 
 logger = logging.getLogger("scripts.setup_db")
+
+
+def _committed_ddl_names(ddl_dir: Path) -> set[str] | None:
+    """Filenames in sql/ddl that are TRACKED at HEAD and NOT locally modified — i.e. the gated,
+    committed DDL set. Returns None (fail-open) only if git is unavailable, with a loud warning.
+
+    WHY: the box runs from a git checkout that, by design, cannot push (ticket A4), so a chat can
+    leave an UNTRACKED or locally-edited DDL on the box. Globbing sql/ddl/*.sql blindly would then
+    apply that un-gated code straight into the live warehouse on the nightly rebuild — the exact
+    hole behind the 2026-06-29 `98_sms_campaign_offer.sql` incident. Restricting to committed-at-HEAD
+    files means the nightly only ever materializes DDL that went through the moderator/two-key gate.
+    """
+    try:
+        tracked = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "ls-files", "sql/ddl/*.sql"],
+            capture_output=True, text=True, check=True, timeout=20).stdout.split()
+        modified = subprocess.run(
+            ["git", "-C", str(REPO_ROOT), "diff", "--name-only", "HEAD", "--", "sql/ddl"],
+            capture_output=True, text=True, check=True, timeout=20).stdout.split()
+        committed = {Path(p).name for p in tracked} - {Path(p).name for p in modified}
+        return committed
+    except Exception as exc:  # noqa: BLE001 — git missing/odd: fail OPEN (don't break the nightly) but LOUD
+        logger.warning("committed-DDL filter unavailable (%s) — applying ALL sql/ddl/*.sql incl. any "
+                       "untracked/uncommitted (un-gated) files this run", exc)
+        return None
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -39,8 +65,17 @@ def main(argv: list[str] | None = None) -> int:
         except ValueError:
             return None
 
-    versioned = [(v, f) for f in ddl_dir.glob("*.sql") if (v := _version_of(f)) is not None]
-    skipped = [f for f in ddl_dir.glob("*.sql") if _version_of(f) is None]
+    # Gate: never apply an untracked/uncommitted DDL left on the box (un-gated code). committed=None
+    # => git unavailable => fail-open (already warned). committed=set => apply only those.
+    committed = _committed_ddl_names(ddl_dir)
+    all_sql = list(ddl_dir.glob("*.sql"))
+    ungated = [f for f in all_sql if committed is not None and f.name not in committed]
+    for f in ungated:
+        logger.warning("SKIPPING un-gated DDL %s — not committed at HEAD (untracked or locally modified); "
+                       "ship it via /warehouse-ship so the nightly can apply it", f.name)
+    candidate_sql = [f for f in all_sql if committed is None or f.name in committed]
+    versioned = [(v, f) for f in candidate_sql if (v := _version_of(f)) is not None]
+    skipped = [f for f in candidate_sql if _version_of(f) is None]
     for f in skipped:
         logger.warning("Skipping %s — filename does not start with version int", f.name)
     if not versioned:
