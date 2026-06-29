@@ -16,9 +16,12 @@ SEMANTICS (table now holds exactly two snapshot generations):
     each run deletes any prior live snapshot(s) and inserts a fresh full pull (~40k rows).
 Consumers wanting current state read WHERE _snapshot_date = (SELECT max(_snapshot_date) …).
 
-SOURCE: PostgREST on the bookings-portal Supabase project, table im_bookings, paged by id
-(publishable / anon-role key — RLS-gated read). Credentials from .env:
-  IM_BOOKINGS_SUPABASE_URL / IM_BOOKINGS_SUPABASE_ANON_KEY
+SOURCE: PostgREST on the bookings-portal Supabase project, table im_bookings, paged by id.
+Credentials from .env: IM_BOOKINGS_SUPABASE_URL + a key. The portal's `anon` role lost its
+SELECT GRANT on im_bookings ~2026-06-29 (direct reads now 401 "permission denied for table
+im_bookings"), so we prefer the project SERVICE-ROLE key (IM_BOOKINGS_SUPABASE_SERVICE_ROLE_KEY)
+and fall back to the legacy anon key (IM_BOOKINGS_SUPABASE_ANON_KEY) only if it is restored.
+Service-role bypasses RLS — used read-only here.
 
 SAFETY: the portal table only ever grows (~40.7k rows on 2026-06-09). If a pull returns
 fewer than MIN_EXPECTED_ROWS (key rotated? RLS changed? portal truncated?) we raise WITHOUT
@@ -44,12 +47,19 @@ FROZEN_SNAPSHOT_DATE = "2026-05-31"      # the one-time analysis freeze — neve
 SOURCE_TAG = "portal_im_bookings_nightly"
 MIN_EXPECTED_ROWS = 36_000               # portal is append-mostly; below this = broken pull
 
-# Column order must match sql/ddl/27_raw_im_bookings.sql (the 22 source cols, in table order).
+# Source columns mirrored verbatim. The INSERT lists columns explicitly, so this is the set of
+# im_bookings keys to pull (order need only match the payload build below, not the table). The
+# original 22 cols are in sql/ddl/27_raw_im_bookings.sql; the booking-SLOT + lifecycle cols
+# (meeting_date/time/tz, created_at, deleted_at, lead_type, subject_line) are added in DDL 1048 and
+# feed core.v_meeting_reminders.meeting_slot_at. Unknown-to-source keys come back as NULL (.get).
 SOURCE_COLUMNS = [
     "id", "type", "date", "offer", "partner", "advisor", "owner_name", "company",
     "first_name", "last_name", "email", "phone", "job_title", "num_employees",
     "annual_revenue", "workspace", "our_email", "campaign", "status", "inbox_manager",
     "campaign_manager", "interested_in",
+    # booking-slot + lifecycle (DDL 1048) — the reminder-time source:
+    "meeting_date", "meeting_time", "meeting_tz", "created_at", "deleted_at",
+    "lead_type", "subject_line",
 ]
 
 
@@ -83,9 +93,11 @@ def _fetch_all(base_url: str, anon_key: str) -> list[dict]:
 def run(ctx: RunContext) -> PhaseResult:
     db = ctx.db
     base_url = ctx.credentials.require("IM_BOOKINGS_SUPABASE_URL").rstrip("/")
-    anon_key = ctx.credentials.require("IM_BOOKINGS_SUPABASE_ANON_KEY")
+    # Prefer the service-role key (anon SELECT was revoked ~2026-06-29); fall back to anon if restored.
+    api_key = (ctx.credentials.optional("IM_BOOKINGS_SUPABASE_SERVICE_ROLE_KEY")
+               or ctx.credentials.require("IM_BOOKINGS_SUPABASE_ANON_KEY"))
 
-    rows = _fetch_all(base_url, anon_key)
+    rows = _fetch_all(base_url, api_key)
     logger.info("fetched %d im_bookings rows from portal", len(rows))
     if len(rows) < MIN_EXPECTED_ROWS:
         # Fail LOUD, write nothing — keep last-known-good live snapshot.
