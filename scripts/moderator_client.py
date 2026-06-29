@@ -57,7 +57,14 @@ RENAISSANCE_ENV = os.environ.get(
 WAREHOUSE_HOST = os.environ.get("WAREHOUSE_HOST", "renaissance-worker")
 # The ONLY repo Renaissance ships to. Overridable for tests/forks; defaults to the canonical slug.
 REPO_SLUG = os.environ.get("WAREHOUSE_REPO_SLUG", "sdultsin/renaissance-warehouse")
-PY_CONSUMER_DIRS = ("entities", "sources", "scripts")
+# Python paths the gate reviews: schema-consumer code (entities/sources/scripts), the warehouse
+# control plane (core/ — orchestrator.py, db.py, sync_run.py, registry.py, config.py), AND the gate's
+# own engine (moderator/ — moderator_engine/apply/server/integrity_gate). core/ + moderator/ were added
+# 2026-06-29 so a core-only (or gate-engine-only) PR flows through the gate the same as the others
+# (PR #87 hit the gap: a core-only change got ZERO automated review and was unmergeable except by admin
+# bypass, because the required `moderator-gate` check never triggered/reported on that path). The two
+# workflows' path triggers + file-selection regexes were widened to match this list.
+PY_CONSUMER_DIRS = ("entities", "sources", "scripts", "core", "moderator")
 MAX_LOOP = 6
 
 
