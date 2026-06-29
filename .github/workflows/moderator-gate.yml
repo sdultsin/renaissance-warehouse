@@ -1,5 +1,6 @@
 name: moderator-gate
-# Schema Moderator CI gate (BUILD-SPEC-v2 §7.2). On a PR touching DDL / entity / sync code, it
+# Schema Moderator CI gate (BUILD-SPEC-v2 §7.2). On a PR touching DDL / entity / sync / core
+# control-plane code, it
 # POSTs each changed sql/ddl/*.sql to the moderator /review (the single authority) and verifies a
 # matching approval_ledger row exists for the head content hash. GitHub Actions reaches both the
 # Tailscale Funnel and Supabase. ADVISORY by default (held WARN week); set repo variable
@@ -12,6 +13,8 @@ on:
       - 'entities/**'
       - 'sources/**'
       - 'scripts/**'
+      - 'core/**'
+      - 'moderator/**'
 
 jobs:
   moderator-gate:
@@ -30,7 +33,7 @@ jobs:
         run: |
           BASE="origin/${{ github.base_ref }}"
           git fetch origin "${{ github.base_ref }}" --depth=1 || true
-          FILES=$(git diff --name-only "$BASE"...HEAD -- 'sql/ddl/**' 'entities/**' 'sources/**' 'scripts/**' | grep -E '\.(sql|py)$' | tr '\n' ' ')
+          FILES=$(git diff --name-only "$BASE"...HEAD -- 'sql/ddl/**' 'entities/**' 'sources/**' 'scripts/**' 'core/**' 'moderator/**' | grep -E '\.(sql|py)$' | tr '\n' ' ')
           echo "files=$FILES" >> "$GITHUB_OUTPUT"
           echo "changed: $FILES"
 
