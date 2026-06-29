@@ -47,6 +47,30 @@ DAYS_BACK = int(os.environ.get("SMS_WATCHDOG_DAYS", "7"))
 TOL_FRAC = float(os.environ.get("SMS_WATCHDOG_TOL_FRAC", "0.01"))  # 1%
 TOL_ABS = int(os.environ.get("SMS_WATCHDOG_TOL_ABS", "1000"))
 
+# Read the PUBLISHED serving snapshot, never the live writer DB. The nightly orchestrator holds the
+# warehouse writer lock and (lately) runs past this watchdog's 07:30 slot, so opening DB_PATH
+# read-only RACED the lock and the watchdog silently SKIPPED every run since 2026-06-23 ("Conflicting
+# lock is held"). The serving snapshot is a static, published read-only copy -> no contention, always
+# openable. (committed-vs-API uses the published numbers, which is exactly what we want to validate.)
+SERVING_GLOB = os.environ.get(
+    "WAREHOUSE_SERVING_GLOB", "/mnt/volume_nyc1_1781398428838/serving/snapshots/warehouse_*.duckdb"
+)
+SERVING_KNOWN_GOOD = Path("/opt/duckdb/snapshots/_known_good")
+
+
+def serving_snapshot() -> str:
+    """Path to the latest PUBLISHED warehouse serving snapshot (read-only, never lock-contended)."""
+    try:
+        if SERVING_KNOWN_GOOD.exists():
+            return str(SERVING_KNOWN_GOOD.resolve())
+    except OSError:
+        pass
+    import glob
+    snaps = sorted(glob.glob(SERVING_GLOB), key=os.path.getmtime)
+    if snaps:
+        return snaps[-1]
+    raise FileNotFoundError(f"no serving snapshot ({SERVING_KNOWN_GOOD} / {SERVING_GLOB})")
+
 
 def load_env(path: Path) -> dict:
     env: dict[str, str] = {}
@@ -115,9 +139,15 @@ def api_total_for_day(cli: SendivoClient, day: str) -> int | None:
         return None
 
 
-def evaluate(conn, cli, days: list[str]) -> list[dict]:
+def evaluate(conn, cli, days: list[str], max_published: str | None = None) -> list[dict]:
     issues = []
     for day in days:
+        # A day NEWER than the published snapshot's latest committed metric_date is not a gap --
+        # it simply hasn't been published yet (e.g. a long-running nightly that pulled it but has
+        # not promoted the snapshot). Skip it so the watchdog never false-alarms on not-yet-published
+        # days. Real gaps (a missing/short day WITHIN the published range) are still caught.
+        if max_published is not None and day > max_published:
+            continue
         committed = committed_for_day(conn, day)
         total = api_total_for_day(cli, day)
         if not isinstance(total, int) or total <= 0:
@@ -163,10 +193,15 @@ def main(argv=None) -> int:
     days = [(today - timedelta(days=i)).isoformat() for i in range(args.days, 0, -1)]
 
     try:
-        conn = db_module.connect(DB_PATH, read_only=True)
-    except Exception as exc:  # noqa: BLE001 — DB mid-swap / locked: skip silently, retry next run
-        print(f"watchdog: cannot open warehouse read-only ({exc}); skipping this run", flush=True)
+        snap = serving_snapshot()
+        conn = db_module.connect(Path(snap), read_only=True)
+    except Exception as exc:  # noqa: BLE001 — no published snapshot yet: skip, retry next run
+        print(f"watchdog: cannot open serving snapshot read-only ({exc}); skipping this run", flush=True)
         return 0
+
+    # Latest metric_date present in the PUBLISHED snapshot -> the high-water mark we can judge.
+    row = conn.execute("SELECT max(metric_date) FROM raw_sendivo_campaign_daily").fetchone()
+    max_pub = row[0].isoformat() if row and row[0] is not None else None
 
     key = load_env(ENV_PATH).get("SENDIVO_API_KEY")
     if not key:
@@ -174,7 +209,7 @@ def main(argv=None) -> int:
         return 0
 
     with SendivoClient(key) as cli:
-        issues = evaluate(conn, cli, days)
+        issues = evaluate(conn, cli, days, max_pub)
     conn.close()
 
     healed_note = ""
