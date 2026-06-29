@@ -560,7 +560,6 @@ def run_fetch(
     creds: Credentials,
     run_id: str,
     stage_path: str,
-    read_conn: duckdb.DuckDBPyConnection,
     since_override=None,
     full_backfill: bool = False,
     local_only: bool = False,
@@ -582,9 +581,20 @@ def run_fetch(
       * else -> the per-workspace watermark (R7 — the unchanged nightly incremental path).
     `local_only=True` forces local-only discovery (no all_emails live walk) even for a non-null since_ws.
     With no flags, behaviour is exactly the original watermark-based incremental.
+
+    LOCK DISCIPLINE (parallel-safe, beyond R8): every DuckDB read is done on a SHORT-LIVED read-only
+    connection that is CLOSED before the long per-lead network pull. A read-only DuckDB connection takes a
+    *shared* file lock, and DuckDB refuses a read-WRITE open while any shared lock is held — so holding a
+    read conn across a multi-hour pull (as the original single-conn shape did) would block the nightly
+    orchestrator's RW open AND every apply for the whole run. The serial+post-orchestrator spec never hit
+    this; running N pullers in parallel ACROSS the nightly window does. So the pull holds NO DuckDB lock.
     """
     _assert_no_writer_lock_held()  # G8/R8: never pull over the network under the writer lock
-    workspaces, diag = enumerate_orgs(creds, read_conn)
+    _enum_conn = db_module.connect(read_only=True)
+    try:
+        workspaces, diag = enumerate_orgs(creds, _enum_conn)
+    finally:
+        _enum_conn.close()
     fetched_at = datetime.now(timezone.utc).isoformat()
     failed_path = stage_path + ".failed"
 
@@ -607,22 +617,30 @@ def run_fetch(
         new_failed: list[dict] = []
         retried_ws: set[str] = set()  # ws whose pull loop ran (its prior-failed were retried)
         for ws_uuid, (ws_slug, api_key, organization_id) in workspaces.items():
-            if full_backfill:
-                since_ws = None                       # FULL discovery — ignore the watermark
-            elif since_override is not None:
-                since_ws = since_override              # fixed-window backfill (e.g. baseline pull)
-            else:
-                since_ws = workspace_watermark(read_conn, ws_slug)  # nightly incremental (R7)
             ws_ceiling = False
             try:
                 with InstantlyClient(api_key) as client:
-                    # discovery matches raw_instantly_email.workspace_id against BOTH the org UUID
-                    # AND the ws UUID (DDL 36 stored `organization_id or ws.id`) so no existing
-                    # lead is missed regardless of which the inbound row carries.
-                    replied_leads, dd = discover_replied_leads(
-                        read_conn, client, organization_id, ws_uuid, since_ws,
-                        skip_live_walk=(local_only or full_backfill),
-                    )
+                    # ── discovery phase: a SHORT-LIVED read-only conn, CLOSED before the pull ──
+                    # so the long per-lead network pull below holds NO DuckDB shared lock (which would
+                    # otherwise block the nightly's RW open + every apply for the whole run).
+                    disc_conn = db_module.connect(read_only=True)
+                    try:
+                        if full_backfill:
+                            since_ws = None                       # FULL discovery — ignore the watermark
+                        elif since_override is not None:
+                            since_ws = since_override              # fixed-window backfill (baseline pull)
+                        else:
+                            since_ws = workspace_watermark(disc_conn, ws_slug)  # nightly incremental (R7)
+                        # discovery matches raw_instantly_email.workspace_id against BOTH the org UUID
+                        # AND the ws UUID (DDL 36 stored `organization_id or ws.id`) so no existing
+                        # lead is missed regardless of which the inbound row carries.
+                        replied_leads, dd = discover_replied_leads(
+                            disc_conn, client, organization_id, ws_uuid, since_ws,
+                            skip_live_walk=(local_only or full_backfill),
+                        )
+                        total_cold_sends_window = _cold_send_count(disc_conn, ws_slug, since_ws)
+                    finally:
+                        disc_conn.close()   # release the shared lock BEFORE the multi-hour pull
                     # union back the prior-run failures for this ws (one retry — §4.F)
                     replied_leads = set(replied_leads) | prior_failed_by_ws.get(ws_slug, set())
                     if dd.get("discovery_ceiling_hit"):
@@ -635,7 +653,6 @@ def run_fetch(
                             "HARD FAIL, watermark NOT advanced, ws rows quarantined.", ws_slug,
                         )
                     replied_lead_delta = len(replied_leads)
-                    total_cold_sends_window = _cold_send_count(read_conn, ws_slug, since_ws)
                     leads_pulled = 0
                     api_calls = 0
                     messages_upserted = 0
@@ -1085,16 +1102,15 @@ def main(argv=None) -> int:
 
     ceiling_hit = False
     if args.cmd in ("fetch", "run"):
-        read_conn = db_module.connect(read_only=True)
-        try:
-            diag = run_fetch(
-                creds, run_id, args.stage, read_conn,
-                since_override=since_override,
-                full_backfill=getattr(args, "full_backfill", False),
-                local_only=getattr(args, "local_only", False),
-            )
-        finally:
-            read_conn.close()
+        # run_fetch opens its OWN short-lived read-only connections (one per discovery, closed before
+        # each pull) so the multi-hour network pull holds no DuckDB shared lock — parallel pullers must
+        # not block the nightly's RW open or apply (see run_fetch docstring).
+        diag = run_fetch(
+            creds, run_id, args.stage,
+            since_override=since_override,
+            full_backfill=getattr(args, "full_backfill", False),
+            local_only=getattr(args, "local_only", False),
+        )
         print(json.dumps({k: v for k, v in diag.items() if k != "per_ws_runlog"}, default=str, indent=2))
         if diag.get("ceiling_hit_ws"):
             ceiling_hit = True
