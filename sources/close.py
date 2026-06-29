@@ -124,9 +124,11 @@ class CloseClient:
                 return
             skip += _PAGE_LIMIT
             time.sleep(0.1)  # gentle pace
-            if seen_pages > 5000:
-                logger.warning("Close call pagination ceiling at %d pages — bailing", seen_pages)
-                return
+            if seen_pages > 50_000:
+                # Never silently stop with a partial feed (the newest-first watermark/has_more
+                # are the real stops). Only a true runaway reaches this — fail LOUD.
+                raise CloseError(
+                    f"Close call pagination exceeded {seen_pages} pages — refusing to return a partial feed")
 
     def get_lead(self, lead_id: str) -> dict | None:
         """`GET /lead/{lead_id}/` — the Close lead. Carries:
