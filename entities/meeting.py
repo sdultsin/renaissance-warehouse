@@ -547,6 +547,23 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
         """
     )
 
+    # -- 2c2. Call + WhatsApp channel offer = Business Funding. These are Business-Funding-ONLY
+    #         outreach channels: SDR phone calls (Close / Big Think Capital desk) dial funding leads —
+    #         there is no Pre-IPO call program; and the WhatsApp outreach program is funding-only
+    #         (core.v_whatsapp_conversation_offer carries only 'Business Funding'/NULL across 44k+
+    #         conversations — zero Pre-IPO). Pre-IPO bookings on these channels come exclusively via the
+    #         Collins/Summit partner sheets, which already carry offer='Pre-IPO' (match_method=
+    #         'partner_sheet') — so the `offer IS NULL` guard preserves them and makes this idempotent.
+    #         Before this, Call/WhatsApp meetings were 100%/98% offer=NULL and silently dropped from
+    #         every per-offer meeting rollup (DW-TICKET-2 / ticket B9, 2026-06-29).
+    db.execute(
+        """
+        UPDATE core.meeting
+        SET offer = 'Business Funding'
+        WHERE channel IN ('Call', 'WhatsApp') AND offer IS NULL
+        """
+    )
+
     # -- 2d. WARN on any col-O label that did NOT resolve via core.workspace_alias, so a new/renamed
     #        workspace surfaces loudly instead of silently landing in the '(unmapped)' reporting
     #        segment. (The single empty/NULL col-O row is expected and intentionally '(unmapped)'.)
