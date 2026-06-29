@@ -547,6 +547,29 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
         """
     )
 
+    # -- 2c-bis. Program-derived offer fallback (RC-5 / DW-ticket-T2 + friction-B9). Call, WhatsApp,
+    #        LinkedIn and the residual sheet Email meetings carry a program ('Funding' | 'Pre-IPO')
+    #        from the partner-desk / Funding-Form label but no offer: there was NO offer step for the
+    #        non-email channels at all, and 2c only fires when the meeting's campaign carries a
+    #        non-NULL offer (it misses the sheet rows whose campaign_id isn't in core.campaign). The
+    #        program<->offer correspondence is 1:1 wherever both are set (Funding->Business Funding,
+    #        Pre-IPO->Pre-IPO; zero cross-contamination, verified read-only 2026-06-29), and the
+    #        Funding-Form (Business-Funding-only) + partner desks are program-authoritative for offer.
+    #        ADDITIVE: only fills offer IS NULL, so the more-precise campaign offer from 2c is never
+    #        clobbered; program-NULL pre-cutover / unattributed rows correctly stay NULL. Resolves the
+    #        per-offer meeting under-count for Call (113/113), WhatsApp (125/127), LinkedIn (2/2) and
+    #        the 174 residual sheet Email meetings (MTD verified).
+    db.execute(
+        """
+        UPDATE core.meeting
+        SET offer = CASE program
+                      WHEN 'Funding' THEN 'Business Funding'
+                      WHEN 'Pre-IPO' THEN 'Pre-IPO'
+                    END
+        WHERE offer IS NULL AND program IN ('Funding', 'Pre-IPO')
+        """
+    )
+
     # -- 2d. WARN on any col-O label that did NOT resolve via core.workspace_alias, so a new/renamed
     #        workspace surfaces loudly instead of silently landing in the '(unmapped)' reporting
     #        segment. (The single empty/NULL col-O row is expected and intentionally '(unmapped)'.)
