@@ -13,11 +13,15 @@ The full signature (sign-off, name, title, AND the unsubscribe footer) is retain
 See the DDL header for the full contract. Key points:
 
   * KEY = (campaign_id, step, content_hash) where content_hash = md5(subject_raw +
-    0x1F + body_raw). INSERT ... ON CONFLICT DO NOTHING, so identical copy already
-    present is a no-op and only new/changed copy adds a row.
-  * STRICTLY NON-DESTRUCTIVE: we only ever INSERT. A variant or campaign that
-    disappears from Instantly is never deleted or blanked -- its rows persist. (This
-    is why it is a TABLE, not a view.)
+    0x1F + body_raw). INSERT ... ON CONFLICT DO UPDATE SET _loaded_at, so identical copy
+    already present adds NO new row but its _loaded_at is advanced to the current run
+    (freshness / last-seen-live signal); only new/changed copy adds a row. first_seen_at
+    is preserved on conflict (it marks when this exact copy first entered the warehouse).
+  * STRICTLY NON-DESTRUCTIVE for COPY: we only ever INSERT new copy (and refresh the
+    _loaded_at of copy we re-see). A variant or campaign that disappears from Instantly is
+    never deleted or blanked -- its rows persist, and their _loaded_at simply stops
+    advancing (which is how you tell retired copy from live). (This is why it is a TABLE,
+    not a view.)
   * SKIP GRACEFULLY (no row, no error): campaigns with empty/unparseable sequence_raw
     (completed/deleted campaigns land here), and individual variants whose raw copy is
     malformed (unbalanced braces, or spin that will not fully resolve).
@@ -268,6 +272,7 @@ def run_variant_copy(ctx: RunContext) -> PhaseResult:
 
     variants_seen = 0
     inserted = 0
+    refreshed = 0
     skipped_campaigns = 0
     skipped_variants = 0
 
@@ -314,36 +319,44 @@ def run_variant_copy(ctx: RunContext) -> PhaseResult:
                         "WHERE campaign_id = ? AND step = ? AND content_hash = ?",
                         [campaign_id, step_idx, h],
                     ).fetchone()[0]
-                    if before:
-                        continue  # identical copy already present -> no-op
+                    # Always upsert. New/changed copy (before == 0) INSERTs a row; copy we have
+                    # seen before (before > 0) adds NO row but advances _loaded_at to this run,
+                    # so max(_loaded_at) tracks "refreshed tonight" and the per-row value tracks
+                    # "last seen live in Instantly". first_seen_at is preserved on conflict.
                     db.execute(
                         """
                         INSERT INTO core.variant_copy
                           (campaign_id, step, content_hash, workspace_id, channel,
                            sequence_index, variant_index, step_type,
                            subject_raw, subject_clean, body_raw, body_clean,
-                           first_seen_at, _run_id)
-                        VALUES (?, ?, ?, ?, 'instantly', ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        ON CONFLICT (campaign_id, step, content_hash) DO NOTHING
+                           first_seen_at, _loaded_at, _run_id)
+                        VALUES (?, ?, ?, ?, 'instantly', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT (campaign_id, step, content_hash)
+                        DO UPDATE SET _loaded_at = excluded._loaded_at
                         """,
                         [
                             campaign_id, step_idx, h, workspace_id,
                             seq_idx, var_idx, step_type,
                             subject_raw, subject_clean, body_raw, body_clean,
-                            now, ctx.run_id,
+                            now, now, ctx.run_id,
                         ],
                     )
-                    inserted += 1
+                    if before:
+                        refreshed += 1
+                    else:
+                        inserted += 1
 
     logger.info(
-        "variant_copy: %d variants seen, %d new rows inserted, "
-        "%d campaigns skipped (empty/unparseable seq), %d variants skipped (malformed)",
-        variants_seen, inserted, skipped_campaigns, skipped_variants,
+        "variant_copy: %d variants seen, %d new rows inserted, %d existing refreshed "
+        "(_loaded_at advanced), %d campaigns skipped (empty/unparseable seq), "
+        "%d variants skipped (malformed)",
+        variants_seen, inserted, refreshed, skipped_campaigns, skipped_variants,
     )
     return PhaseResult(
         rows_in=variants_seen,
         rows_out=inserted,
         notes={
+            "refreshed": refreshed,
             "skipped_campaigns": skipped_campaigns,
             "skipped_variants": skipped_variants,
         },
