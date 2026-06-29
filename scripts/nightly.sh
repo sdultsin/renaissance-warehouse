@@ -232,6 +232,31 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     "$PYTHON" scripts/build_deliv_reply_lag.py 2>&1 | tee -a "$LOG_FILE" \
         || echo "WARN deliv_reply_lag_build_failed (continuing)" | tee -a "$LOG_FILE"
 
+    # Email-thread sync (DoD-4) — keep core.email_thread / core.email_message current with new replies
+    # + their IM responses (ue_type=3 capture is owned by THIS entity, not pipeline_mirror which
+    # DO-NOTHINGs). Runs AFTER the orchestrator released the writer lock: `fetch` is lock-free (it opens
+    # only short-lived read conns, closed before each network pull — see entities/email_thread_sync.py),
+    # then `apply` upserts under core/db.py's in-process writer flock (acquire-or-wait, same as the steps
+    # above). Flag-gated (WAREHOUSE_PULL_THREADS=1) + pinned to the 9 canonical workspaces via
+    # WAREHOUSE_THREADS_ORG_ALLOWLIST (both in /root/core/.env.threads, which also carries the per-ws keys).
+    # --local-only: incremental discovery from the synced inbound atom only (NO all_emails live walk),
+    # which would otherwise cross the 1000-page ceiling on the high-volume funding workspaces (~200k
+    # sends/day) and HARD-FAIL them every night. A new replier's FULL thread is re-pulled, so their IM
+    # responses ARE captured; the only uncovered edge is an IM message on a thread with no NEW prospect
+    # reply (rare cold-thread chase) — acceptable vs a nightly that ceilings.
+    THREADS_NIGHTLY_STAGE=/root/core/threads_nightly_stage.jsonl
+    echo "email-thread sync (native reply threads — nightly incremental, local-only)" | tee -a "$LOG_FILE"
+    ( set -a; [ -f /root/core/.env.threads ] && . /root/core/.env.threads; set +a
+      export WAREHOUSE_PULL_THREADS=1
+      rm -f "$THREADS_NIGHTLY_STAGE" "$THREADS_NIGHTLY_STAGE".* 2>/dev/null
+      "$PYTHON" -m entities.email_thread_sync fetch --local-only --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE"
+      "$PYTHON" -m entities.email_thread_sync apply --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE"
+      rm -f "$THREADS_NIGHTLY_STAGE" "$THREADS_NIGHTLY_STAGE".* 2>/dev/null ) \
+        || echo "WARN email_thread_sync_nightly_failed (continuing)" | tee -a "$LOG_FILE"
+    # keep apply manifests out of the repo working tree (gitignored too, belt + suspenders)
+    mkdir -p /root/core/threads_bf/manifests 2>/dev/null
+    mv /root/renaissance-warehouse/core/email_thread_manifest_*.txt /root/core/threads_bf/manifests/ 2>/dev/null || true
+
     # Instantly credits: pull per-workspace lead-list quota from the Instantly billing
     # API (read-only) and UPSERT a daily snapshot into core.instantly_credit (drops the
     # "The Eagles" free-trial junk row). Self-contained (runs portal_credits.py internally).
