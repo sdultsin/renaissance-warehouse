@@ -38,3 +38,5 @@ class Registry:
 
     def by_phase(self, phase_name: str) -> list[Registration]:
         return [r for r in self.items if r.phase_name == phase_name]
+
+# gate-coverage probe 20260629T002119Z (throwaway; revert)
