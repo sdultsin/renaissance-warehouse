@@ -51,7 +51,10 @@ MIN_EXPECTED_ROWS = 36_000               # portal is append-mostly; below this =
 # im_bookings keys to pull (order need only match the payload build below, not the table). The
 # original 22 cols are in sql/ddl/27_raw_im_bookings.sql; the booking-SLOT + lifecycle cols
 # (meeting_date/time/tz, created_at, deleted_at, lead_type, subject_line) are added in DDL 1048 and
-# feed core.v_meeting_reminders.meeting_slot_at. Unknown-to-source keys come back as NULL (.get).
+# feed core.v_meeting_reminders.meeting_slot_at; the channel + provenance cols (channel, source,
+# booking_id, industry, inbox_manager_email) are added in DDL 1054 and feed the core.meeting Funding
+# rewire (>=2026-06-29 sources from im_bookings; the Funding-Form Sheet is retired). Unknown-to-source
+# keys come back as NULL (.get) — harmless on historical rows that predate a column.
 SOURCE_COLUMNS = [
     "id", "type", "date", "offer", "partner", "advisor", "owner_name", "company",
     "first_name", "last_name", "email", "phone", "job_title", "num_employees",
@@ -60,6 +63,8 @@ SOURCE_COLUMNS = [
     # booking-slot + lifecycle (DDL 1048) — the reminder-time source:
     "meeting_date", "meeting_time", "meeting_tz", "created_at", "deleted_at",
     "lead_type", "subject_line",
+    # channel + provenance (DDL 1054) — the core.meeting Funding-rewire source:
+    "channel", "source", "booking_id", "industry", "inbox_manager_email",
 ]
 
 

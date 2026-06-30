@@ -55,7 +55,10 @@ logger = logging.getLogger("entities.meeting")
 
 RAW = "raw_pipeline_meetings_booked_raw"
 FF = "main.raw_sheets_funding_form_data"
+IMB = "raw_im_bookings"                       # the bookings-portal mirror (entities/im_bookings.py)
+IMB_SOURCE_TAG = "portal_im_bookings_nightly" # the live (not frozen 2026-05-31) snapshot tag
 CUTOVER = "2026-06-01"  # sheet is canonical on/after this date; Slack stays untouched before it
+IMB_CUTOVER = "2026-06-29"  # im_bookings is the Funding booking source on/after this date.
 # NOTE (boundary): Slack posted_at is TIMESTAMPTZ→DATE in UTC; the sheet's Submission time is a naive
 # local timestamp→DATE. The two branches are disjoint (< vs >=) so DOUBLE-counting is impossible. A
 # near-midnight booking on 2026-05-31 could land in neither branch (single-digit, one-time gap on the
@@ -63,6 +66,19 @@ CUTOVER = "2026-06-01"  # sheet is canonical on/after this date; Slack stays unt
 # TZ-normalization pass for a handful of boundary-day meetings.
 # WS5 v3: the sheet branch now gates on col A (meeting_date), with a col-C-date fallback. CUTOVER stays
 # 2026-06-01 so the slack(<=May-31) / sheet(>=Jun-01) branches never overlap on either date column.
+#
+# im_bookings cutover [2026-06-30, handoffs/2026-06-29-meeting-source-rewire-im-bookings-BUILD.md] —
+# THREE date-disjoint Funding sources now feed source='sheet', so no booking is ever double-counted:
+#   meeting_date <  2026-06-01  -> Slack (step 1, source='slack')
+#   meeting_date in [06-01, 06-28] -> Funding-Form Google Sheet (step 2, meeting_id 'sheet:%') — FROZEN:
+#                                  the sheet is RETIRED, so this reads its last-good snapshot for history.
+#   meeting_date >= 2026-06-29  -> bookings-portal im_bookings (step 2-IMB, meeting_id 'imb:%'). The
+#                                  portal is now the channel-rich canonical Funding source (native
+#                                  channel/advisor/workspace/email/phone per booking). source stays
+#                                  'sheet' (40+ views gate on it — hard contract). FORWARD-ONLY: we do
+#                                  NOT rebuild pre-06-29 history from im_bookings (it is materially
+#                                  incomplete before the cutover — would silently delete real meetings).
+#   (Pre-IPO partner desks, step 2.5, are unchanged — im_bookings is 100% Funding.)
 
 # -- Pre-IPO partner booking desks (2026-06-25, deliverables/2026-06-25-partner-booking-sheets-ingest) --
 # Pre-IPO meetings are logged by partner desks in their OWN Google Sheets — the master Funding-Form is
@@ -186,6 +202,74 @@ def _partner_union_sql() -> str:
     return "\n  UNION ALL\n".join(parts)
 
 
+def _im_dedup_pairs(rows: list) -> list:
+    """email-OR-phone UNION-FIND dedup for im_bookings meetings (Sam's rule, 2026-06-30): within a
+    single booking date, collapse rows that share *either* a normalized email OR a normalized phone
+    (a connected component, NOT a COALESCE(email,phone) partition — so emailA/phoneP + emailB/phoneP
+    merge via the shared phone). Canonical = the EARLIEST created_at (NULLS LAST, then id asc); every
+    other member is a duplicate. Different-day bookings are never merged. SOFT-FLAG only: returns the
+    (duplicate_meeting_id, canonical_meeting_id) pairs to write into is_duplicate_of — nothing is
+    deleted (the daily report already filters is_duplicate_of IS NULL).
+
+      rows: (meeting_id, meeting_date, email_k, phone_k, created_ts, id) — email_k/phone_k already
+            normalized (lower-trim email; last-10-digits phone); '' / None when absent.
+    """
+    from collections import defaultdict
+
+    parent: dict = {}
+
+    def find(x):
+        parent.setdefault(x, x)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        while parent[x] != root:       # path-compress
+            parent[x], x = root, parent[x]
+        return root
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for r in rows:
+        find(r[0])
+
+    by_date: dict = defaultdict(list)
+    for r in rows:
+        by_date[r[1]].append(r)
+    for _dt, group in by_date.items():
+        first_by_email: dict = {}
+        first_by_phone: dict = {}
+        for mid, _md, ek, pk, _cts, _id in group:
+            if ek:
+                if ek in first_by_email:
+                    union(first_by_email[ek], mid)
+                else:
+                    first_by_email[ek] = mid
+            if pk:
+                if pk in first_by_phone:
+                    union(first_by_phone[pk], mid)
+                else:
+                    first_by_phone[pk] = mid
+
+    info = {r[0]: r for r in rows}
+    comps: dict = defaultdict(list)
+    for r in rows:
+        comps[find(r[0])].append(r[0])
+
+    pairs = []
+    for _root, members in comps.items():
+        if len(members) < 2:
+            continue
+        # earliest created_at canonical (NULLS LAST), deterministic id tiebreak.
+        members.sort(key=lambda mid: (info[mid][4] is None, info[mid][4], info[mid][5]))
+        canonical = members[0]
+        for mid in members[1:]:
+            pairs.append((mid, canonical))
+    return pairs
+
+
 def register(registry: Registry) -> None:
     registry.add_phase("canonical", "meeting", run_meeting)
 
@@ -281,6 +365,9 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
           -- WS5: posted_ts = col C (audit/back-compat). meeting_date = CANONICAL col A, with a
           --   col-C-date fallback (so a blank/unparseable col A never drops the row). The cutover
           --   GATE moves to meeting_date so the floor sits on the same column the views bucket on.
+          -- im_bookings cutover: the FF branch is now FROZEN to [CUTOVER, IMB_CUTOVER) — meetings on
+          --   or after IMB_CUTOVER come from im_bookings (step 2-IMB). The sheet is retired, so this
+          --   reads its last-good snapshot for the 06-01..06-28 history only.
           SELECT *,
             TRY_CAST(submission_time AS TIMESTAMP) AS posted_ts,
             COALESCE(
@@ -293,6 +380,10 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
                   CAST(TRY_STRPTIME(date_display, ['%b %-d, %Y','%B %-d, %Y']) AS DATE),
                   CAST(TRY_CAST(submission_time AS TIMESTAMP) AS DATE)
                 ) >= DATE '{CUTOVER}'
+            AND COALESCE(
+                  CAST(TRY_STRPTIME(date_display, ['%b %-d, %Y','%B %-d, %Y']) AS DATE),
+                  CAST(TRY_CAST(submission_time AS TIMESTAMP) AS DATE)
+                ) <  DATE '{IMB_CUTOVER}'
         ),
         ff_keyed AS (
           SELECT *, 'sheet:' || COALESCE(submission_id, md5(row_json)) AS meeting_id FROM ff_typed
@@ -367,6 +458,136 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
         FROM ws_resolved
         """
     )
+
+    # -- 2-IMB. Post-cutover FUNDING rows from the bookings-portal im_bookings mirror (meeting_date >=
+    #          IMB_CUTOVER). The Funding-Form Google Sheet is retired; im_bookings carries a NATIVE
+    #          channel / advisor / workspace / lead email / phone per booking, so meetings attribute
+    #          DIRECTLY (no row_json positions). source STAYS 'sheet' (40+ views gate on it), meeting_id
+    #          namespaced 'imb:<id>'. Reuses the SAME campaign norm-name join, core.workspace_alias D6
+    #          resolution, and D7 sub-account/program/offer derivation as step 2 (im_bookings is 100%
+    #          Funding offer; the workspace_alias + sub_acct map default program='Funding' correctly).
+    #          Reads ONLY the latest LIVE snapshot, excludes cancelled bookings (deleted_at), and is a
+    #          true idempotent rebuild. The email-OR-phone union-find dedup (Sam's rule) runs as a
+    #          second pass right after, flagging is_duplicate_of.
+    db.execute(
+        f"""
+        INSERT INTO core.meeting
+          (meeting_id, source, source_event_id, posted_at, partner, campaign_id,
+           campaign_name_raw, cm, channel, lead_email, match_method, match_confidence,
+           is_duplicate_of, cost_per_meeting_usd_estimated, raw_text,
+           advisor, advisor_name, advisor_partner, inbox_manager,
+           meeting_date, submission_ts, workspace_name, workspace_slug, workspace_canonical,
+           cm_workspace, program, offer, sendivo_sub_account)
+        WITH imb AS (
+          SELECT
+            id,
+            NULLIF(trim(channel), '')                            AS channel,
+            NULLIF(trim(partner), '')                            AS partner,
+            NULLIF(trim(advisor), '')                            AS advisor,
+            NULLIF(trim(workspace), '')                          AS workspace_name,
+            NULLIF(trim(inbox_manager), '')                      AS inbox_manager_raw,
+            NULLIF(lower(trim(email)), '')                       AS lead_email,
+            NULLIF(trim(campaign_manager), '')                   AS campaign_manager,
+            NULLIF(trim(campaign), '')                           AS campaign_name,
+            TRY_CAST("date" AS DATE)                             AS meeting_date
+          FROM {IMB}
+          -- the live (not frozen 2026-05-31) snapshot, latest generation only.
+          WHERE _source = '{IMB_SOURCE_TAG}'
+            AND _snapshot_date = (SELECT max(_snapshot_date) FROM {IMB}
+                                  WHERE _source = '{IMB_SOURCE_TAG}')
+            AND deleted_at IS NULL                  -- cancelled bookings excluded (never count a dead booking)
+            AND TRY_CAST("date" AS DATE) >= DATE '{IMB_CUTOVER}'
+        ),
+        camp AS (  -- one campaign per normalized name: most-recent, fully deterministic tiebreak (== step 2)
+          SELECT nk, campaign_id FROM (
+            SELECT main.norm_campaign_name(name) AS nk, campaign_id,
+                   ROW_NUMBER() OVER (PARTITION BY main.norm_campaign_name(name)
+                                      ORDER BY instantly_created_at DESC NULLS LAST, campaign_id DESC) AS rn
+            FROM main.raw_pipeline_campaigns
+            WHERE name IS NOT NULL AND name <> ''
+          ) WHERE rn = 1
+        ),
+        matched AS (
+          SELECT f.*, c.campaign_id AS matched_cid
+          FROM imb f
+          LEFT JOIN camp c ON c.nk = main.norm_campaign_name(f.campaign_name)
+        ),
+        ws_resolved AS (
+          -- D6 workspace_alias resolution + D7 Sendivo sub-account — identical mechanism to step 2.
+          SELECT f.*,
+                 a.warehouse_slug          AS ws_slug,
+                 a.canonical_current_name  AS ws_canon,
+                 a.cm                       AS ws_cm,
+                 sub.sub_account_name       AS sub_acct
+          FROM matched f
+          LEFT JOIN core.workspace_alias a ON a.alias_name = f.workspace_name
+          LEFT JOIN (VALUES ('Sendivo (Renaissance 1)','Renaissance 1'),
+                            ('Sendivo (Renaissance 2)','Renaissance 2'))
+               sub(lbl, sub_account_name) ON sub.lbl = f.workspace_name
+        )
+        SELECT
+          'imb:' || CAST(id AS VARCHAR)            AS meeting_id,
+          'sheet'                                  AS source,            -- KEEP (hard contract: 40+ views)
+          CAST(id AS VARCHAR)                      AS source_event_id,
+          CAST(meeting_date AS TIMESTAMP)          AS posted_at,         -- portal booking carries no time-of-day; date = booking day
+          partner,
+          matched_cid                              AS campaign_id,
+          campaign_name                            AS campaign_name_raw,
+          upper(campaign_manager)                  AS cm,                -- raw audit CM (UNCHANGED)
+          channel,                                                       -- native portal channel (Email/SMS/Call/WhatsApp)
+          lead_email,
+          CASE WHEN matched_cid IS NOT NULL THEN 'sheet_norm' ELSE 'unmatched' END AS match_method,
+          CASE WHEN matched_cid IS NOT NULL THEN 1.0 ELSE NULL END                 AS match_confidence,
+          NULL                                     AS is_duplicate_of,   -- set by the union-find pass below
+          NULL                                     AS cost_per_meeting_usd_estimated,
+          NULL                                     AS raw_text,
+          advisor                                  AS advisor,           -- raw "<prefix>: <name>"
+          NULLIF(trim(regexp_replace(advisor, '^[^:]*:', '')), '') AS advisor_name,
+          {_advisor_partner_case('advisor')}       AS advisor_partner,
+          {_im_norm_case('inbox_manager_raw')}     AS inbox_manager,     -- im_bookings is full-name; passthrough-safe
+          meeting_date                             AS meeting_date,      -- CANONICAL (im_bookings.date = booking date)
+          CAST(meeting_date AS TIMESTAMP)          AS submission_ts,
+          workspace_name                           AS workspace_name,
+          ws_slug                                  AS workspace_slug,
+          ws_canon                                 AS workspace_canonical,
+          ws_cm                                    AS cm_workspace,      -- WORKSPACE-credited CM (D6)
+          CASE WHEN sub_acct = 'Renaissance 2' THEN 'Pre-IPO' ELSE 'Funding' END AS program,
+          CASE WHEN channel = 'SMS' AND sub_acct = 'Renaissance 2' THEN 'Pre-IPO'
+               WHEN channel = 'SMS'                                THEN 'Business Funding'
+               ELSE NULL END                       AS offer,            -- email offer set in 2c; Call/WhatsApp in 2c2
+          sub_acct                                 AS sendivo_sub_account
+        FROM ws_resolved
+        """
+    )
+
+    # -- 2-IMB dedup: email-OR-phone UNION-FIND over the im_bookings rows just inserted (Sam's rule
+    #    2026-06-30). Soft-flag duplicates (same booking date sharing email OR phone) via is_duplicate_of
+    #    = the earliest-created canonical meeting_id; never hard-delete. Pure no-op when there are no
+    #    same-date email/phone collisions (the current ≥06-29 window has none — a go-forward guard).
+    dup_rows = db.execute(
+        f"""
+        SELECT 'imb:' || CAST(id AS VARCHAR)                                        AS meeting_id,
+               TRY_CAST("date" AS DATE)                                             AS meeting_date,
+               NULLIF(lower(trim(email)), '')                                       AS email_k,
+               NULLIF(right(regexp_replace(coalesce(phone,''),'[^0-9]','','g'),10),'') AS phone_k,
+               TRY_CAST(created_at AS TIMESTAMP)                                     AS created_ts,
+               id
+        FROM {IMB}
+        WHERE _source = '{IMB_SOURCE_TAG}'
+          AND _snapshot_date = (SELECT max(_snapshot_date) FROM {IMB}
+                                WHERE _source = '{IMB_SOURCE_TAG}')
+          AND deleted_at IS NULL
+          AND TRY_CAST("date" AS DATE) >= DATE '{IMB_CUTOVER}'
+        """
+    ).fetchall()
+    dup_pairs = _im_dedup_pairs(dup_rows)
+    if dup_pairs:
+        db.executemany(
+            "UPDATE core.meeting SET is_duplicate_of = ? WHERE meeting_id = ?",
+            [(canonical, dup) for dup, canonical in dup_pairs],
+        )
+    logger.info("core.meeting im_bookings dedup: %d duplicate booking(s) soft-flagged "
+                "(email-OR-phone union-find, same booking date)", len(dup_pairs))
 
     # -- 2.5 PRE-IPO PARTNER BOOKING DESKS (Summit Ventures SMS + Collins email/SMS/WhatsApp). Additional
     #        source='sheet' rows (so every source='sheet' view picks them up), offer/program='Pre-IPO',
@@ -445,12 +666,13 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
           'Pre-IPO'                          AS offer,
           NULL                               AS sendivo_sub_account
         FROM ps_dedup d
-        -- DEDUP vs the Funding-Form rows inserted in step 2: drop a partner row whose (lead_email,
-        -- meeting_date) already exists as a Funding-Form meeting (same booking logged twice). 0 today
-        -- (verified net-new); a go-forward guard. Funding-Form rows carry meeting_id 'sheet:%'.
+        -- DEDUP vs the Funding rows inserted in steps 2 + 2-IMB: drop a partner row whose (lead_email,
+        -- meeting_date) already exists as a Funding meeting (same booking logged twice). 0 today
+        -- (verified net-new); a go-forward guard. Funding rows carry meeting_id 'sheet:%' (frozen FF
+        -- ≤06-28) or 'imb:%' (im_bookings ≥06-29).
         WHERE NOT EXISTS (
           SELECT 1 FROM core.meeting ff
-          WHERE ff.meeting_id LIKE 'sheet:%'
+          WHERE (ff.meeting_id LIKE 'sheet:%' OR ff.meeting_id LIKE 'imb:%')
             AND d.lead_email IS NOT NULL
             AND ff.lead_email = d.lead_email
             AND ff.meeting_date = d.meeting_date
@@ -488,7 +710,7 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
             FROM core.meeting m2
             JOIN main.raw_pipeline_reply_data r ON lower(r.lead_email) = m2.lead_email
             WHERE m2.source = 'sheet' AND m2.channel = 'Email' AND m2.campaign_id IS NULL
-              AND m2.meeting_id LIKE 'sheet:%'   -- Funding-Form rows only; partner-sheet rows (Pre-IPO, no Instantly campaign) are exempt
+              AND (m2.meeting_id LIKE 'sheet:%' OR m2.meeting_id LIKE 'imb:%')   -- Funding rows (FF ≤06-28 + im_bookings ≥06-29); partner Pre-IPO rows (no Instantly campaign) exempt
               AND m2.lead_email IS NOT NULL AND m2.lead_email <> ''
               AND r.campaign_id IS NOT NULL
           ) WHERE rn = 1
@@ -542,7 +764,7 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
         SET offer = c.offer
         FROM core.campaign c
         WHERE m.campaign_id = c.campaign_id AND m.channel = 'Email'
-          AND m.source = 'sheet' AND m.meeting_id LIKE 'sheet:%'  -- Funding-Form rows only; never clobber the partner Pre-IPO tag
+          AND m.source = 'sheet' AND (m.meeting_id LIKE 'sheet:%' OR m.meeting_id LIKE 'imb:%')  -- Funding rows only; never clobber the partner Pre-IPO tag
           AND c.offer IS NOT NULL
         """
     )
@@ -583,16 +805,19 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
         """
     )
 
-    # -- 2d. WARN on any col-O label that did NOT resolve via core.workspace_alias, so a new/renamed
-    #        workspace surfaces loudly instead of silently landing in the '(unmapped)' reporting
-    #        segment. (The single empty/NULL col-O row is expected and intentionally '(unmapped)'.)
+    # -- 2d. WARN on any workspace label (Funding-Form col-O OR im_bookings.workspace) that did NOT
+    #        resolve via core.workspace_alias, so a new/renamed/dirty workspace surfaces loudly instead
+    #        of silently landing in the '(unmapped)' reporting segment. (im_bookings carries dirtier
+    #        labels than the FF col-O — e.g. 'Sendivo R1' / 'R1' / 'Sendivo R3' — which are SMS
+    #        sub-accounts that correctly carry cm_workspace=NULL; seed them in workspace_alias to also
+    #        resolve workspace_slug for segmentation. The empty/NULL label is expected '(unmapped)'.)
     unmapped = db.execute(
         "SELECT DISTINCT workspace_name FROM core.meeting "
         "WHERE source='sheet' AND workspace_name IS NOT NULL AND workspace_slug IS NULL"
     ).fetchall()
     if unmapped:
         logger.warning(
-            "core.meeting: col-O labels unresolved by core.workspace_alias "
+            "core.meeting: workspace labels unresolved by core.workspace_alias "
             "(add to the WS1 seed or the 107.0 supplemental seed): %s",
             [u[0] for u in unmapped],
         )
@@ -601,19 +826,29 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
     by_source = db.execute(
         "SELECT source, count(*) FROM core.meeting GROUP BY 1 ORDER BY 1"
     ).fetchall()
-    # Funding-Form email-attribution health — scoped to 'sheet:%' so the partner Pre-IPO email rows
-    # (intentionally campaign_id NULL) don't pollute the Funding-Form attribution %.
+    # Funding email-attribution health — scoped to the Funding rows (frozen FF 'sheet:%' ≤06-28 +
+    # im_bookings 'imb:%' ≥06-29) so the partner Pre-IPO email rows (intentionally campaign_id NULL)
+    # don't pollute the Funding attribution %.
     sheet_unmatched = db.execute(
         "SELECT count(*) FROM core.meeting WHERE source='sheet' AND channel='Email' AND campaign_id IS NULL "
-        "AND meeting_id LIKE 'sheet:%'"
+        "AND (meeting_id LIKE 'sheet:%' OR meeting_id LIKE 'imb:%')"
     ).fetchone()[0]
     sheet_backfilled = db.execute(
         "SELECT count(*) FROM core.meeting WHERE match_method='email_reply_backfill'"
     ).fetchone()[0]
     sheet_email_total = db.execute(
-        "SELECT count(*) FROM core.meeting WHERE source='sheet' AND channel='Email' AND meeting_id LIKE 'sheet:%'"
+        "SELECT count(*) FROM core.meeting WHERE source='sheet' AND channel='Email' "
+        "AND (meeting_id LIKE 'sheet:%' OR meeting_id LIKE 'imb:%')"
     ).fetchone()[0]
     sheet_attr_pct = round(100.0 * (sheet_email_total - sheet_unmatched) / sheet_email_total, 2) if sheet_email_total else None
+    # im_bookings cutover footprint (>= IMB_CUTOVER) — meetings by channel + soft-flagged duplicates.
+    imb_by_channel = db.execute(
+        "SELECT channel, count(*) FROM core.meeting WHERE meeting_id LIKE 'imb:%' GROUP BY 1 ORDER BY 1"
+    ).fetchall()
+    imb_total = sum(c for _, c in imb_by_channel)
+    imb_dupes = db.execute(
+        "SELECT count(*) FROM core.meeting WHERE meeting_id LIKE 'imb:%' AND is_duplicate_of IS NOT NULL"
+    ).fetchone()[0]
     # Pre-IPO partner-desk rows (Summit + Collins) — net-new meetings by channel, all offer='Pre-IPO'.
     partner_by_channel = db.execute(
         "SELECT channel, count(*) FROM core.meeting WHERE match_method='partner_sheet' GROUP BY 1 ORDER BY 1"
@@ -626,14 +861,19 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
         logger.warning("core.meeting: %d partner-sheet rows have an unmapped channel "
                        "(unrecognized 'Sending Account') — they fall out of all channel-scoped views",
                        partner_unmapped)
-    logger.info("core.meeting rebuilt: %d rows %s; sheet email-meetings unmatched=%d "
-                "(reply-backfilled=%d, sheet-email-attribution=%.2f%%); partner Pre-IPO meetings=%d %s",
+    logger.info("core.meeting rebuilt: %d rows %s; Funding email-meetings unmatched=%d "
+                "(reply-backfilled=%d, email-attribution=%.2f%%); im_bookings meetings=%d %s "
+                "(soft-flagged dupes=%d); partner Pre-IPO meetings=%d %s",
                 n, dict(by_source), sheet_unmatched, sheet_backfilled, sheet_attr_pct or 0.0,
+                imb_total, dict(imb_by_channel), imb_dupes,
                 partner_total, dict(partner_by_channel))
     return PhaseResult(
         rows_in=n, rows_out=n,
         notes={"by_source": dict(by_source), "sheet_email_unmatched": sheet_unmatched,
                "sheet_email_backfilled": sheet_backfilled, "sheet_email_attr_pct": sheet_attr_pct,
-               "cutover": CUTOVER, "partner_preipo_meetings": partner_total,
+               "cutover": CUTOVER, "imb_cutover": IMB_CUTOVER,
+               "imb_meetings": imb_total, "imb_by_channel": dict(imb_by_channel),
+               "imb_soft_flagged_dupes": imb_dupes,
+               "partner_preipo_meetings": partner_total,
                "partner_preipo_by_channel": dict(partner_by_channel)},
     )
