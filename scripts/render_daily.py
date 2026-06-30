@@ -228,31 +228,43 @@ def consolidated_bookings(date):
     _book_cache[date] = out
     return out
 
-# Pre-IPO meeting sheets (count by booking-made Date) -> yellow-block "SMS IPO"
+# Pre-IPO (Ren2 / "SMS IPO") meetings = the TWO Pre-IPO booking desks Sam named: COLLINS + SUMMIT.
+# Counted by booking-made Date, deduped within each sheet by email|phone. The two desks are ADDITIVE
+# (a lead books one OR the other — Collins overflow goes to Summit per Grace), so do NOT cross-dedup.
+# (Jun 29 = 23 Collins + 11 Summit = 34.)  (sid, tab, desk)
 PREIPO_SHEETS = [
-    ("1oKlY_2qI-p0oH4d8UAOE3GpceiFU4OIWx1aDAM5RzRY", "Sheet1"),   # Pre-IPO SMS (Craig Diana)
-    ("1IZzmCXtbtrpZYbxuU1qkxoOkITL4zmP2In6glpffmYw", "Collins"),  # Collins desk
+    ("1IZzmCXtbtrpZYbxuU1qkxoOkITL4zmP2In6glpffmYw", "Collins", "Collins"),
+    ("1oKlY_2qI-p0oH4d8UAOE3GpceiFU4OIWx1aDAM5RzRY", "Sheet1", "Summit"),
 ]
 _preipo_cache = {}
 def preipo_meetings(date):
     if date in _preipo_cache:
         return _preipo_cache[date]
-    d = datetime.date.fromisoformat(date); want = _date_variants(d) | {date, d.strftime("%-m/%-d/%Y"), d.strftime("%m/%d/%Y")}
+    d = datetime.date.fromisoformat(date); want = _date_variants(d)
     total = 0
-    for sid, tab in PREIPO_SHEETS:
+    for sid, tab, desk in PREIPO_SHEETS:
         try:
             rows = gget(sid, f"{tab}!A1:Z")
         except Exception as e:
-            print(f"WARN preipo {sid}: {e}", file=sys.stderr); continue
+            print(f"WARN preipo {desk} {sid}: {e}", file=sys.stderr); continue
         if not rows:
             continue
         hdr = rows[0]; ix = {h.strip().lower(): i for i, h in enumerate(hdr)}
-        di = ix.get("date")
+        di = ix.get("date"); ei = ix.get("email"); pi = ix.get("phone")
         if di is None:
             continue
+        seen = set(); n = 0
         for r in rows[1:]:
             if di < len(r) and r[di] and str(r[di]).strip() in want:
-                total += 1
+                key = (r[ei].strip().lower() if ei is not None and ei < len(r) and r[ei] else "")
+                if not key and pi is not None and pi < len(r) and r[pi]:
+                    key = r[pi].strip()
+                if key and key in seen:
+                    continue
+                if key:
+                    seen.add(key)
+                n += 1
+        total += n  # desks are additive (Collins + Summit)
     _preipo_cache[date] = total
     return total
 
