@@ -54,7 +54,10 @@ logger = logging.getLogger("scripts.build_sla_reply_time")
 # DDL renumbered placeholder-68 -> 69 at apply time (post-cutover writer window 2026-06-14).
 _DDL = REPO_ROOT / "sql" / "ddl" / "69_sla_reply_time.sql"
 
-_CONV = "main.raw_pipeline_conversation_messages"
+# Repointed 2026-06-30 to core.email_message (the native, current source) in lockstep with
+# entities/iam_response_time.py — the old raw_pipeline_conversation_messages froze the SLA chain
+# at 2026-06-23. workspace_id holds the slug; join key id -> message_id.
+_CONV = "core.email_message"
 
 
 def build(db, snapshot_days: int | None, run_id: str) -> None:
@@ -91,7 +94,7 @@ def build(db, snapshot_days: int | None, run_id: str) -> None:
             ?                                        AS _run_id
         FROM core.iam_response_time irt
         JOIN {_CONV} m
-          ON m.id = irt.email_id AND m.ue_type = 2
+          ON m.message_id = irt.email_id AND m.ue_type = 2
         """,
         [run_id],
     )
