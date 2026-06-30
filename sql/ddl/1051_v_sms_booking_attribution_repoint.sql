@@ -13,7 +13,16 @@
 -- sendivo_last_reply_blast_id = blast of the outbound at/before the LAST reply <= booking, to reconcile
 -- against Sendivo's last-reply deals_won. Coverage is go-forward (>= 2026-06-26, where blast_id exists);
 -- pre-06-26 attribution closes automatically when Larry backfills historical blast_id.
--- Validated read-only 2026-06-29: 197 go-forward booked phones -> 114 attributed (90 first_reply, 24 last_outbound).
+--
+-- Implementation notes (addresses two-key reviewer on PR #110):
+--   * "Latest outbound at/before T" is picked with a standard row_number() window (NOT ASOF JOIN),
+--     deterministic via (sent_at DESC, sendivo_log_id DESC). Verified read-only 2026-06-29 to give the
+--     identical result as the ASOF form AND an independent Python re-implementation:
+--     197 go-forward booked phones -> 114 attributed (90 first_reply, 24 last_outbound).
+--   * raw_sendivo_blast_deal (DDL 1034) supplies contact_phone10 / origin_blast_id / origin_blast_name /
+--     last_touch_blast_id; it is DE-DUPed to one row per phone here so the LEFT JOIN can never fan-out
+--     booking rows when the vendor export eventually populates it.
+--   * attributed_blast_id and _name are taken from the SAME source via aligned CASE (never mixed).
 -- Output columns unchanged from DDL 1034 (v_sms_blast_performance depends on them).
 --
 -- @gate: add
@@ -22,6 +31,15 @@ CREATE OR REPLACE VIEW core.v_sms_booking_attribution AS
 WITH bk AS (
   SELECT meeting_id, email, phone10, program, sendivo_sub_account, booking_ts
   FROM core.v_sms_booking_phone
+),
+-- vendor export de-duped to one row per phone (empty today; future-proofs the LEFT JOIN against fan-out)
+vd AS (
+  SELECT contact_phone10, origin_blast_id, origin_blast_name, last_touch_blast_id
+  FROM (
+    SELECT contact_phone10, origin_blast_id, origin_blast_name, last_touch_blast_id,
+           row_number() OVER (PARTITION BY contact_phone10 ORDER BY _loaded_at DESC) AS rn
+    FROM raw_sendivo_blast_deal
+  ) WHERE rn = 1
 ),
 -- first inbound reply at/before booking (per booked phone)
 fr AS (
@@ -43,27 +61,36 @@ lr AS (
   WHERE b.phone10 IS NOT NULL
   GROUP BY 1, 2
 ),
--- blast of the latest outbound at/before the FIRST reply (our KPI)
+-- latest outbound blast at/before the FIRST reply (our KPI)
 origin AS (
-  SELECT fr.meeting_id, o.blast_id, o.blast_name
-  FROM fr
-  ASOF JOIN v_sendivo_outbound_blast o
-    ON o.phone10 = fr.phone10 AND fr.first_reply_at >= o.sent_at
+  SELECT meeting_id, blast_id, blast_name FROM (
+    SELECT fr.meeting_id, o.blast_id, o.blast_name,
+           row_number() OVER (PARTITION BY fr.meeting_id ORDER BY o.sent_at DESC, o.sendivo_log_id DESC) AS rn
+    FROM fr
+    JOIN v_sendivo_outbound_blast o
+      ON o.phone10 = fr.phone10 AND o.sent_at <= fr.first_reply_at
+  ) WHERE rn = 1
 ),
--- blast of the latest outbound at/before the LAST reply (reconcile vs Sendivo deals_won)
+-- latest outbound blast at/before the LAST reply (reconcile vs Sendivo deals_won)
 lastblast AS (
-  SELECT lr.meeting_id, o.blast_id
-  FROM lr
-  ASOF JOIN v_sendivo_outbound_blast o
-    ON o.phone10 = lr.phone10 AND lr.last_reply_at >= o.sent_at
+  SELECT meeting_id, blast_id FROM (
+    SELECT lr.meeting_id, o.blast_id,
+           row_number() OVER (PARTITION BY lr.meeting_id ORDER BY o.sent_at DESC, o.sendivo_log_id DESC) AS rn
+    FROM lr
+    JOIN v_sendivo_outbound_blast o
+      ON o.phone10 = lr.phone10 AND o.sent_at <= lr.last_reply_at
+  ) WHERE rn = 1
 ),
--- fallback: blast of the latest outbound at/before booking (no reply captured)
+-- fallback: latest outbound blast at/before booking (no inbound reply captured)
 lob AS (
-  SELECT b.meeting_id, o.blast_id, o.blast_name
-  FROM bk b
-  ASOF JOIN v_sendivo_outbound_blast o
-    ON o.phone10 = b.phone10 AND b.booking_ts >= o.sent_at
-  WHERE b.phone10 IS NOT NULL
+  SELECT meeting_id, blast_id, blast_name FROM (
+    SELECT b.meeting_id, o.blast_id, o.blast_name,
+           row_number() OVER (PARTITION BY b.meeting_id ORDER BY o.sent_at DESC, o.sendivo_log_id DESC) AS rn
+    FROM bk b
+    JOIN v_sendivo_outbound_blast o
+      ON o.phone10 = b.phone10 AND o.sent_at <= b.booking_ts
+    WHERE b.phone10 IS NOT NULL
+  ) WHERE rn = 1
 )
 SELECT
   b.meeting_id,
@@ -72,18 +99,26 @@ SELECT
   b.program,
   b.sendivo_sub_account,
   b.booking_ts,
-  COALESCE(vd.origin_blast_id, origin.blast_id, lob.blast_id)        AS attributed_blast_id,
-  COALESCE(vd.origin_blast_name, origin.blast_name, lob.blast_name)  AS attributed_blast_name,
-  COALESCE(vd.last_touch_blast_id, lastblast.blast_id)               AS sendivo_last_reply_blast_id,
+  CASE
+    WHEN vd.origin_blast_id IS NOT NULL THEN vd.origin_blast_id
+    WHEN origin.blast_id    IS NOT NULL THEN origin.blast_id
+    WHEN lob.blast_id       IS NOT NULL THEN lob.blast_id
+  END                                                       AS attributed_blast_id,
+  CASE
+    WHEN vd.origin_blast_id IS NOT NULL THEN vd.origin_blast_name
+    WHEN origin.blast_id    IS NOT NULL THEN origin.blast_name
+    WHEN lob.blast_id       IS NOT NULL THEN lob.blast_name
+  END                                                       AS attributed_blast_name,
+  COALESCE(vd.last_touch_blast_id, lastblast.blast_id)      AS sendivo_last_reply_blast_id,
   CASE
     WHEN b.phone10 IS NULL               THEN 'unattributed_no_phone'
     WHEN vd.origin_blast_id IS NOT NULL  THEN 'vendor_export'
     WHEN origin.blast_id IS NOT NULL     THEN 'first_reply'
     WHEN lob.blast_id IS NOT NULL        THEN 'last_outbound'
     ELSE 'unattributed_no_blast'
-  END                                                                AS attribution_method
+  END                                                       AS attribution_method
 FROM bk b
-LEFT JOIN raw_sendivo_blast_deal vd ON vd.contact_phone10 = b.phone10
-LEFT JOIN origin    ON origin.meeting_id    = b.meeting_id
+LEFT JOIN vd        ON vd.contact_phone10  = b.phone10
+LEFT JOIN origin    ON origin.meeting_id   = b.meeting_id
 LEFT JOIN lastblast ON lastblast.meeting_id = b.meeting_id
-LEFT JOIN lob       ON lob.meeting_id       = b.meeting_id;
+LEFT JOIN lob       ON lob.meeting_id      = b.meeting_id;
