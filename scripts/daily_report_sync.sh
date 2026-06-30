@@ -44,6 +44,7 @@ TAB="$(date -d "$REPORT_DATE" +'%b %-d')"   # e.g. "Jun 29" (matches Jun 22-26 /
 PROMOTE_LOG="$REPO_DIR/logs/daily_report_promote.log"   # detached publisher gets its own file
 READER_TOK="$(awk -F'\t' '$2=="cc-service-reader"{print $1}' /opt/duckdb/allowed_tokens.txt)"
 WH_API="https://renaissance-droplet.tailae5c80.ts.net/query"
+WLOCK="${WAREHOUSE_WRITE_LOCK_PATH:-/root/core/warehouse.write.lock}"
 
 log(){ echo "[$(date -u +%FT%TZ)] $*"; }
 alert(){ .venv/bin/python scripts/alert_slack.py "$1" >/dev/null 2>&1 || true; }
@@ -73,16 +74,30 @@ if ! $PY scripts/stage_funding_form.py; then
     log "WARN funding-form stage failed (consumer will use prior snapshot)"
 fi
 
+# ---- 1b) writer-lock PRE-PROBE — resilience against a long/stuck warehouse writer ----
+# The report-path phases below each acquire-or-WAIT on the warehouse writer lock. If the heavy
+# nightly (or any writer) is stuck holding it, an unguarded run would HANG here indefinitely (the
+# antithesis of "auto-produces nightly with zero hand-holding"). Probe the lock non-blocking: if a
+# writer holds it, SKIP the phases + promote and render straight from the existing serving snapshot +
+# the LIVE APIs — §1 (Instantly), §2 (sendivo), §4-Actual are promote-independent, so the report
+# still produces (meetings/§6 are then as-of the last promote). Normal evening runs (writer idle at
+# 9 PM ET, nightly is later) take the full path.
+SKIP_WAREHOUSE=0
+if flock -n "$WLOCK" -c true 2>/dev/null; then
+    log "writer lock free — running full warehouse-refresh path"
+else
+    SKIP_WAREHOUSE=1
+    log "WARN warehouse writer lock HELD (long/stuck writer) — SKIPPING phases + promote; rendering from the existing snapshot + live APIs"
+    alert ":warning: *daily_report_sync ($MODE)* — warehouse writer busy at run time; report rendered from the existing snapshot + live APIs (email/SMS/§4-actual current; meetings/§6 as of the last promote). If this persists, the nightly writer is likely stuck."
+fi
+
 # ---- 2) report-path phases (each self-locks the warehouse writer) ----
-# NOTE [2026-06-30]: core.meeting is currently built from the Funding-Form SHEET (entities/meeting.py,
-# source='sheet'). A rewire to the Renaissance Portal Supabase `im_bookings` is IN PROGRESS
-# ([[reference_renaissance_portal_supabase_booking_source_20260629]]). We refresh BOTH sources
-# (sheets + im_bookings) before canonical meeting so the report stays correct whichever one it reads.
-if [[ "$MODE" == "relock" ]]; then
+# NOTE [2026-06-30]: core.meeting is built from im_bookings for Funding >=2026-06-29 (PR #115).
+if [[ "$SKIP_WAREHOUSE" == "0" && "$MODE" == "relock" ]]; then
     run_phase sheets            --phase sheets
     run_phase im_bookings       --phase im_bookings
     run_phase canonical_meeting --phase canonical --ingest meeting
-else
+elif [[ "$SKIP_WAREHOUSE" == "0" ]]; then
     $PY scripts/setup_db.py || log "WARN setup_db failed (continuing)"
     run_phase pipeline_mirror   --phase pipeline_mirror
     run_phase sheets            --phase sheets
@@ -96,6 +111,11 @@ fi
 
 # ---- 3) promote serving snapshot (DETACHED — a foreground SSH-wrapped publisher drops on
 #         broken-pipe; nohup + poll the read-API snapshot_id is the robust pattern) ----
+# Skipped when the writer was busy (nothing new staged to promote; the publisher's own writer-lock
+# guard would benign-abort anyway). The render then uses the existing snapshot + live APIs.
+if [[ "$SKIP_WAREHOUSE" != "0" ]]; then
+    log "skipping promote (writer busy / phases skipped) — render uses existing snapshot + live APIs"
+else
 PREV_SNAP="$(snap_id)"
 log "promoting serving snapshot (detached -> $PROMOTE_LOG); prev=$PREV_SNAP  (full ~161GB copy, ~20-25 min)"
 nohup /opt/duckdb/venv/bin/python /opt/duckdb/bin/publisher.py --reason "daily_report_$MODE" >>"$PROMOTE_LOG" 2>&1 &
@@ -119,8 +139,9 @@ if [[ "$NEW_SNAP" == "$PREV_SNAP" ]]; then
 else
     log "promoted: $NEW_SNAP"
 fi
+fi   # end: skip-promote-when-writer-busy guard
 
-# ---- 4) render the day's tab (reads the freshly promoted serving snapshot) ----
+# ---- 4) render the day's tab (reads the freshly promoted serving snapshot; ALWAYS runs) ----
 log "rendering tab '$TAB' for $REPORT_DATE ..."
 if $PY scripts/render_daily.py "$REPORT_DATE" "$TAB"; then
     log "================ daily_report_sync DONE MODE=$MODE tab='$TAB' ================"
