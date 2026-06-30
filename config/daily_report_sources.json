@@ -1,0 +1,197 @@
+{
+  "_meta": {
+    "title": "Daily RevOps Report — canonical source-per-metric registry",
+    "purpose": "The SINGLE machine-readable map of metric -> {source type, exact id, tab, desk/owner, dedup key, reconciliation anchor} for the Daily RevOps Report. scripts/render_daily.py resolves its human-managed / drift-prone sources (Pre-IPO desks, booking sheet, sendivo sub-accounts, workspace roster) FROM this file, so registry = code = reality (no comment-vs-code drift). A chat building or QAing the report reads THIS to answer 'am I sourcing the right thing for this metric?' WITHOUT a human hand-feeding it. Run `render_daily.py <date> --verify` to confirm every source is live, correctly-shaped, and (for Pre-IPO) reconciles to the team tally.",
+    "verified": "2026-06-30",
+    "verified_against": "live renderer scripts/render_daily.py PR #117/#123; reference_daily_report_canonical_sources_20260630; handoffs/2026-06-30-DATA-TICKET-preipo-source-mapping-incompleteness.md",
+    "owners": "RevOps orchestrator (registry) + Grace (Pre-IPO desks / mid-funnel)",
+    "schema": {
+      "source_type": "sheet | warehouse | api  — where the metric is read from",
+      "sheet": "{ spreadsheet_id, tab, date_column, dedup_key, owner } (Google Sheet)",
+      "warehouse": "{ relation, key_columns } (DuckDB serving snapshot via read API)",
+      "api": "{ service, endpoint | identifiers, key_ref }",
+      "dedup_key": "the field(s) collapsed to one booking, e.g. 'email|phone' = lower(email) else phone",
+      "reconciliation": "{ type, source, pattern, rule } — the independent tally a render reconciles to so drift is flagged, not silently rendered (NULL = structural health-gate only)"
+    },
+    "change_capture": "When a desk/sheet is ADDED, RENAMED, or a sub-account/key changes: update THIS file in the same PR that touches the renderer (or before). Never let the report discover drift by Sam eyeballing a wrong number. Pre-IPO desks specifically: the authoritative desk roster is owned by the #pre-ipo-success team (see open_questions[0]); add a desk here the moment it appears in that channel.",
+    "self_verify_protocol": "A QA/build chat confirms a metric with zero hand-feeding by: (1) reading this registry for the metric's declared source(s); (2) running `render_daily.py <date> --verify` which probes each source is reachable + has its declared columns + parses non-degenerate, and reconciles Pre-IPO per-desk counts to the anchor; (3) any DRIFT / UNREACHABLE / column-missing prints LOUDLY and the verify exits non-zero (drift is flagged, never silently rendered)."
+  },
+
+  "workspaces": {
+    "_note": "Workspace identity is shared across §1 Instantly key slug, §4 account_label.workspace_slug, §6 email_message.workspace_id, and core.workspace.slug — ONE slug end-to-end. Render order = list order. renaissance-2 is Funding 5 (Eyver) for EMAIL; it is ALSO the SMS Pre-IPO sub-account (13922) — do not conflate the two channels.",
+    "roster": [
+      { "slug": "renaissance-4",   "display": "Funding 1 (Samuel)",        "instantly_key_slug": "renaissance-4" },
+      { "slug": "renaissance-5",   "display": "Funding 2 (Ido)",           "instantly_key_slug": "renaissance-5" },
+      { "slug": "prospects-power", "display": "Funding 3 (Leo)",           "instantly_key_slug": "prospects-power" },
+      { "slug": "koi-and-destroy", "display": "Funding 4 (Sam)",           "instantly_key_slug": "koi-and-destroy" },
+      { "slug": "renaissance-2",   "display": "Funding 5 (Eyver)",         "instantly_key_slug": "renaissance-2" },
+      { "slug": "renaissance-1",   "display": "Renaissance 1 (Instantly)", "instantly_key_slug": "renaissance-1" },
+      { "slug": "the-gatekeepers", "display": "Max's workspace",           "instantly_key_slug": "the-gatekeepers" },
+      { "slug": "warm-leads",      "display": "Warm leads",                "instantly_key_slug": "warm-leads" }
+    ]
+  },
+
+  "metrics": {
+    "email_sent_opps": {
+      "section": "§1 Email + Warm leads / §4 Actual",
+      "what": "Email sent + opportunities per workspace. This ONE fetch also feeds §4 'Actual' (so §1 sent and §4 Actual can never disagree).",
+      "source_type": "api",
+      "api": {
+        "service": "instantly",
+        "endpoint": "GET /campaigns/analytics/daily?start_date=&end_date= (per workspace)",
+        "key_ref": "core.credentials.instantly_workspace_keys()[slug]  (per-workspace Bearer; warehouse slug == key slug)",
+        "read_fields": ["sent", "opportunities"]
+      },
+      "wrong_sources": ["pipeline raw_pipeline_campaign_daily_metrics drops 140k-270k sends/day into a NULL bucket (Funding 5 read 91k vs real 232k)"],
+      "reconciliation": { "type": "loud_missing_workspace", "rule": "a REPORTING workspace absent from the API result renders 0 sent/opps (wrong-but-plausible zero, e.g. dead/rotated key) -> WARN loudly, never silent." }
+    },
+
+    "email_meetings_leadtype": {
+      "section": "§1 Meetings + Cheap/Regular split",
+      "what": "Email-channel meetings per workspace (count) + cheap-vs-regular MCA split.",
+      "source_type": "sheet",
+      "sheet": {
+        "spreadsheet_id": "1vaExhxu319o2CSoQtjWRV49lq5GowOeJzo1_GHXIIqM",
+        "tab": "Data",
+        "filter": "Channel == 'Email'",
+        "date_column": "Date",
+        "dedup_key": "email|phone",
+        "owner": "portal-fed consolidated booking sheet (Channel + Workspace + Partner per booking)",
+        "required_columns": ["Date", "Channel", "Workspace", "Partner", "Email", "Phone"]
+      },
+      "leadtype_source": {
+        "source_type": "warehouse",
+        "relation": "main.raw_im_bookings",
+        "key_columns": ["email", "phone", "lead_type", "offer", "date", "_snapshot_date", "deleted_at"],
+        "rule": "offer='Funding', cheap = lead_type='cheap', joined to booking by email|phone"
+      },
+      "reconciliation": null
+    },
+
+    "sms_sent": {
+      "section": "§2 SMS Sent",
+      "what": "SMS sent per sub-account.",
+      "source_type": "api",
+      "api": {
+        "service": "sendivo",
+        "endpoint": "billing_report(date,date) -> sms_fees.quantity per sub_account_id",
+        "key_ref": "SENDIVO_API_KEY",
+        "sub_accounts": [
+          { "id": 12720, "label": "Renaissance 1",                "channel": "Funding SMS" },
+          { "id": 13922, "label": "Renaissance 2 (SMS · Pre-IPO)", "channel": "Pre-IPO SMS" },
+          { "id": 14603, "label": "RG3 webform",                  "channel": "RG3 webform" }
+        ]
+      },
+      "wrong_sources": ["sendivo delivery_metrics returns the DEFAULT account (~178) regardless of sub_account_id — NOT the SMS-sent source"],
+      "reconciliation": null
+    },
+
+    "sms_replies_human": {
+      "section": "§2 SMS Human RR",
+      "what": "Human (non-opt-out) inbound SMS replies per sub-account.",
+      "source_type": "warehouse",
+      "warehouse": { "relation": "main.raw_sendivo_inbound", "key_columns": ["sub_account_name", "received_at", "is_opt_out"] },
+      "reconciliation": null
+    },
+
+    "whatsapp": {
+      "section": "§2 WhatsApp (ISKRA)",
+      "what": "WhatsApp sent / delivered / failed / replies (ISKRA 'sent' runs ~30-37% failed; KPI = delivered/mtg).",
+      "source_type": "warehouse",
+      "warehouse": { "relation": "main.v_sms_dash_wa_daily", "filter": "channel='whatsapp'", "key_columns": ["sent", "delivered", "failed", "replies_total", "metric_date"] },
+      "meetings_source": "consolidated booking sheet, Channel == 'WhatsApp'",
+      "reconciliation": null
+    },
+
+    "preipo_meetings": {
+      "section": "§2 Ren2 (SMS · Pre-IPO) meetings + yellow block 'SMS IPO'",
+      "what": "Pre-IPO ('SMS IPO') meetings = the sum of bookings across the active Pre-IPO booking DESKS. THIS is the metric that the data ticket was opened for: the desks were not enumerated/labeled in a way a chat could confirm, and a human had to hand-feed 'Collins + Summit'.",
+      "source_type": "sheet",
+      "additive": true,
+      "additive_rule": "A lead books ONE desk or the other (Collins overflow -> Summit, per Grace). Desks are ADDITIVE; count each desk independently and SUM. Do NOT cross-dedup between desks. Dedup ONLY within each desk by email|phone.",
+      "count_rule": "Count rows whose 'Date' (booking-made date) == report day, deduped within the desk by email|phone.",
+      "desks": [
+        {
+          "desk": "Collins",
+          "owner": "Collins desk (advisor names per the sheet: Tsvi Bort / Lawrence Michelson — NOT stated in Slack, treat as sheet-internal)",
+          "spreadsheet_id": "1IZzmCXtbtrpZYbxuU1qkxoOkITL4zmP2In6glpffmYw",
+          "tab": "Collins",
+          "date_column": "Date",
+          "dedup_key": "email|phone",
+          "required_columns": ["Date"],
+          "label_provenance": "Grace -> Sam DM 2026-06-29 explicitly maps 1IZzmCXt… = collins; Ido posted this sheet in #pre-ipo-success 2026-04-27."
+        },
+        {
+          "desk": "Summit",
+          "owner": "Summit Ventures desk (Grace).",
+          "spreadsheet_id": "1oKlY_2qI-p0oH4d8UAOE3GpceiFU4OIWx1aDAM5RzRY",
+          "tab": "Sheet1",
+          "date_column": "Date",
+          "dedup_key": "email|phone",
+          "required_columns": ["Date"],
+          "label_provenance": "Grace -> Sam DM 2026-06-29 explicitly maps 1oKlY_2qI… = summit; Ido posted it in #pre-ipo-chat 2026-06-10. The earlier 'Craig Diana' label was WRONG ('Craig' was only an advisor first-name at setup); do NOT re-mislabel this sheet."
+        }
+      ],
+      "wrong_sources": ["reference_renaissance_portal_supabase_booking_source_20260629 (im_bookings) does NOT contain Pre-IPO bookings", "the consolidated 1vaExhxu sheet does NOT carry the Pre-IPO desks"],
+      "known_good": { "date": "2026-06-29", "by_desk": { "Collins": 23, "Summit": 11 }, "total": 34, "source": "#pre-ipo-success per-desk counter (Jamil Matias run, peaked Collins 23 / Summit 11); matches both sheets." },
+      "reconciliation": {
+        "type": "slack_desk_counter",
+        "source": "#pre-ipo-success",
+        "channel_id": "C0B0K3VCDMX",
+        "line_regex": "(?im)^\\s*([A-Za-z][\\w.&'\\-]*)\\s+Booked\\s+(\\d+)\\b",
+        "line_regex_note": "Desk-AGNOSTIC on purpose: it captures '<Word> Booked <N>' at the start of any line, so a NEW desk posting in the channel (e.g. the way 'Summit' was once new + uncaptured) is detected as an unknown-desk drift signal. Known vs unknown is decided against desks[] in code, not baked into the regex. Anchored to line-start to avoid mid-sentence 'we booked 3' false matches.",
+        "aggregate": "max",
+        "rule": "Each desk posts a running per-desk counter that RESETS to 1 each ET calendar day; multiple bookers each run their own 1..N. So group matched lines by desk within the report ET day (by message POST date — NOT the 'June DD' script-name in the text) and take MAX N per desk. Reconcile that to the rendered per-desk sheet count. On mismatch FLAG drift. A desk label seen in the channel that is NOT in desks[] is itself drift (a new/renamed desk -> update this registry).",
+        "caveats": "There is NO canonical desk list / pinned roster in Slack and NO end-of-day grand-total message — the max-of-counter is the only signal (see open_questions[0]). Darcy is wiring an automated 'Renny' bot (~2026-06-30) to post all future bookings tagged with partner + channel; when it lands the line format may change and this regex may need updating.",
+        "degrade": "If Slack creds/scopes are unavailable, --verify falls back to known_good when the verify date matches, else reports ANCHOR_UNAVAILABLE (explicit, not a pass). The structural health-gate (reachable + Date column present + non-degenerate parse) ALWAYS runs."
+      }
+    },
+
+    "close_calls": {
+      "section": "§3 Close CRM — warm calling",
+      "what": "Dials / distinct leads / connects (>=60s real convo, ET day). Close is the system of record; it UNDER-captures vs the warm-callers' own EOD tallies — note it, do not 'fix' it.",
+      "source_type": "warehouse",
+      "warehouse": { "relation": "core.call", "key_columns": ["occurred_at", "duration_seconds", "close_lead_id"], "connect_threshold_seconds": 60 },
+      "meetings_source": "consolidated booking sheet, Channel == 'Call'",
+      "reconciliation": null
+    },
+
+    "sending_truth_expected": {
+      "section": "§4 Sending Volume Truth — Expected (no lag)",
+      "what": "Expected = sum of ACTIVE accounts' configured daily_limit per workspace x infra (OTD/Google; Outlook excluded), latest census, same-day (no lag).",
+      "source_type": "warehouse",
+      "warehouse": { "relation": "core.account_label", "key_columns": ["workspace_slug", "infra", "daily_limit", "lifecycle", "census_date"], "filter": "lifecycle='Active' AND infra IN ('OTD','Google'), census_date = max" },
+      "actual_source": "Instantly daily per workspace = the SAME fetch as metrics.email_sent_opps (so §4 Actual == §1 sent)",
+      "wrong_sources": ["raw_account_truth_daily_actuals lags 2-3d (the '150k on a June-29 tab' bug)", "core.v_sending_truth_pit is OTD-only + lagged"],
+      "reconciliation": null
+    },
+
+    "bookings_by_partner": {
+      "section": "§5 Bookings by partner",
+      "what": "Meetings booked grouped by partner.",
+      "source_type": "sheet",
+      "sheet": { "spreadsheet_id": "1vaExhxu319o2CSoQtjWRV49lq5GowOeJzo1_GHXIIqM", "tab": "Data", "date_column": "Date", "dedup_key": "email|phone", "group_by": "Partner" },
+      "reconciliation": null
+    },
+
+    "im_reply_time": {
+      "section": "§6 IM reply-time",
+      "what": "First-reply latency per workspace (daily/weekly/monthly): first prospect reply (ue_type 2) -> first our reply (ue_type 3) per thread.",
+      "source_type": "warehouse",
+      "warehouse": { "relation": "core.email_message", "key_columns": ["thread_id", "workspace_id", "ue_type", "message_at", "message_id"] },
+      "wrong_sources": ["raw_pipeline_conversation_messages chain froze iam_response_time / v_sla_reply_time_daily at 2026-06-23"],
+      "pending": "SMS + WhatsApp first-reply time not yet computed (rendered 'pending')",
+      "reconciliation": null
+    }
+  },
+
+  "open_questions": [
+    {
+      "id": "preipo_canonical_desk_roster",
+      "for": "Grace / the Pre-IPO team",
+      "question": "Is there a single canonical/authoritative list of ALL active Pre-IPO booking desks + their Google Sheet IDs (so a new desk like 'Summit' is captured automatically next time), or does each desk just have its own sheet known only ad-hoc in Slack? And will the team commit to updating that list (and this registry) when a desk is added/renamed? Specifically: will the new 'Renny' automation (Darcy, ~2026-06-30) become the authoritative, machine-readable booking source for Pre-IPO (with partner + channel + desk per booking) — and if so, should the renderer read Pre-IPO meetings FROM Renny's output instead of the two desk sheets?",
+      "why": "Confirmed 2026-06-30 via Slack: there is NO pinned roster/canvas/doc in #pre-ipo-success and NO auto-discoverable desk list — a newly-added desk only appears as a new '<Desk> Booked' label in the post stream, so it would silently drop out of the Pre-IPO total until Sam eyeballs a wrong number. This registry's preipo_meetings.desks must equal that roster. The Renny automation may make this whole sheet-scrape obsolete.",
+      "status": "OPEN — routed to Sam 2026-06-30 (to relay to Grace/Darcy); registered in reference_people_pending_asks_20260629"
+    }
+  ]
+}

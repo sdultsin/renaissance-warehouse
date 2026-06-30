@@ -34,12 +34,24 @@ except Exception as _e:  # dry/off-box fallback: external fetchers degrade, ware
     _CREDS = None
     print(f"WARN: credentials unavailable ({_e}); Instantly/sendivo sections will be empty", file=sys.stderr)
 
+# Canonical source-per-metric REGISTRY (config/daily_report_sources.json). The renderer resolves its
+# human-managed / drift-prone sources (Pre-IPO desks, booking sheet, sendivo subs, workspace roster)
+# FROM here so registry = code = reality. A missing/invalid registry FAILS LOUD — never silently
+# render the wrong source (the bug this registry exists to kill).
+from core import daily_report_sources as REG
+_REG_ERRS = REG.validate_registry()
+if _REG_ERRS:
+    print("ERROR: daily-report source registry (config/daily_report_sources.json) is INVALID:\n  - "
+          + "\n  - ".join(_REG_ERRS), file=sys.stderr)
+    sys.exit(3)
+
 SID = "1vL77hVTY3P5_0e-K34qjWWpes_hymx4XiC630llyF34"
 TOK = os.environ.get("GOOGLE_TOKEN", "/root/.config/mcp-google-sheets/token.json")
 BASE = f"https://sheets.googleapis.com/v4/spreadsheets/{SID}"
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 DRY = "--dry" in sys.argv
+VERIFY = "--verify" in sys.argv  # source self-check: probe every source + reconcile Pre-IPO; no sheet write
 # Default to TODAY (ET), never a hardcoded past date — a mis-templated cron must not silently render
 # a stale day into a today-named tab (M6). The sync always passes REPORT_DATE explicitly.
 try:
@@ -53,17 +65,9 @@ DAILY = REPORT_DATE
 DAILY_TAB = args[1] if len(args) > 1 else _d.strftime("%b %-d")  # "Jun 29"
 
 # ---------------------------- workspace identity ----------------------------
-# warehouse slug (== Instantly key slug == account_label.workspace_slug == email_message.workspace_id)
-WS = [  # (slug, display name)  — render order
-    ("renaissance-4",   "Funding 1 (Samuel)"),
-    ("renaissance-5",   "Funding 2 (Ido)"),
-    ("prospects-power", "Funding 3 (Leo)"),
-    ("koi-and-destroy", "Funding 4 (Sam)"),
-    ("renaissance-2",   "Funding 5 (Eyver)"),
-    ("renaissance-1",   "Renaissance 1 (Instantly)"),
-    ("the-gatekeepers", "Max's workspace"),
-    ("warm-leads",      "Warm leads"),
-]
+# warehouse slug (== Instantly key slug == account_label.workspace_slug == email_message.workspace_id),
+# render order — FROM the registry (config/daily_report_sources.json -> workspaces.roster).
+WS = REG.workspace_roster()  # [(slug, display)]
 SLUG2NAME = dict(WS)
 REPORT_SLUGS = [s for s, _ in WS]
 SLUGS_SQL = ",".join("'" + s + "'" for s in REPORT_SLUGS)
@@ -186,8 +190,8 @@ def gget(sid, rng):
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {_gtok()}"})
     return json.load(urllib.request.urlopen(req, timeout=60)).get("values", [])
 
-# consolidated booking sheet (Channel + Workspace + Partner per booking; portal-fed)
-BOOKINGS_SID = "1vaExhxu319o2CSoQtjWRV49lq5GowOeJzo1_GHXIIqM"
+# consolidated booking sheet (Channel + Workspace + Partner per booking; portal-fed) — FROM registry
+BOOKINGS_SID, BOOKINGS_TAB = REG.bookings_sheet()
 def _date_variants(d):
     # booking sheets are human/automation-touched — tolerate every format we've seen so a rendering
     # change can't silently zero the meeting columns (M4): "Jun 29, 2026", "June 29, 2026",
@@ -201,7 +205,7 @@ def consolidated_bookings(date):
         return _book_cache[date]
     d = datetime.date.fromisoformat(date); want = _date_variants(d)
     try:
-        rows = gget(BOOKINGS_SID, "Data!A1:R")
+        rows = gget(BOOKINGS_SID, f"{BOOKINGS_TAB}!A1:R")
     except Exception as e:
         print(f"WARN consolidated_bookings sheet read failed {date}: {e}", file=sys.stderr)
         _book_cache[date] = []; return []
@@ -228,31 +232,34 @@ def consolidated_bookings(date):
     _book_cache[date] = out
     return out
 
-# Pre-IPO (Ren2 / "SMS IPO") meetings = the TWO Pre-IPO booking desks Sam named: COLLINS + SUMMIT.
-# Counted by booking-made Date, deduped within each sheet by email|phone. The two desks are ADDITIVE
-# (a lead books one OR the other — Collins overflow goes to Summit per Grace), so do NOT cross-dedup.
-# (Jun 29 = 23 Collins + 11 Summit = 34.)  (sid, tab, desk)
-PREIPO_SHEETS = [
-    ("1IZzmCXtbtrpZYbxuU1qkxoOkITL4zmP2In6glpffmYw", "Collins", "Collins"),
-    ("1oKlY_2qI-p0oH4d8UAOE3GpceiFU4OIWx1aDAM5RzRY", "Sheet1", "Summit"),
-]
-_preipo_cache = {}
-def preipo_meetings(date):
+# Pre-IPO (Ren2 / "SMS IPO") meetings = the active Pre-IPO booking DESKS (Collins + Summit) — resolved
+# FROM the registry (config/daily_report_sources.json -> metrics.preipo_meetings.desks), NOT hardcoded
+# here, so a new/renamed desk is a one-line registry edit. Counted by booking-made Date, deduped within
+# each desk by email|phone. The desks are ADDITIVE (a lead books one OR the other — Collins overflow ->
+# Summit per Grace), so do NOT cross-dedup. (Jun 29 = 23 Collins + 11 Summit = 34.)
+PREIPO_SHEETS = [(d["spreadsheet_id"], d["tab"], d["desk"]) for d in REG.preipo_desks()]
+_preipo_cache = {}  # date -> {"by_desk": {desk:n}, "health": {desk:"OK"|reason}}
+def preipo_by_desk(date):
+    """{desk: meetings} for `date` + per-desk source health, for the reconciliation/verify gate.
+    A desk whose sheet 404s or is missing its Date column reports health != 'OK' AND count 0 — that is
+    drift (flagged by --verify), never a silent genuine zero."""
     if date in _preipo_cache:
         return _preipo_cache[date]
     d = datetime.date.fromisoformat(date); want = _date_variants(d)
-    total = 0
+    by_desk = {}; health = {}
     for sid, tab, desk in PREIPO_SHEETS:
+        by_desk[desk] = 0
         try:
             rows = gget(sid, f"{tab}!A1:Z")
         except Exception as e:
-            print(f"WARN preipo {desk} {sid}: {e}", file=sys.stderr); continue
+            print(f"WARN preipo {desk} {sid}: {e}", file=sys.stderr)
+            health[desk] = f"UNREACHABLE: {e}"; continue
         if not rows:
-            continue
+            health[desk] = "EMPTY: no rows returned"; continue
         hdr = rows[0]; ix = {h.strip().lower(): i for i, h in enumerate(hdr)}
         di = ix.get("date"); ei = ix.get("email"); pi = ix.get("phone")
         if di is None:
-            continue
+            health[desk] = "NO_DATE_COLUMN: 'Date' header missing (renamed?)"; continue
         seen = set(); n = 0
         for r in rows[1:]:
             if di < len(r) and r[di] and str(r[di]).strip() in want:
@@ -264,9 +271,13 @@ def preipo_meetings(date):
                 if key:
                     seen.add(key)
                 n += 1
-        total += n  # desks are additive (Collins + Summit)
-    _preipo_cache[date] = total
-    return total
+        by_desk[desk] = n; health[desk] = "OK"
+    _preipo_cache[date] = {"by_desk": by_desk, "health": health}
+    return _preipo_cache[date]
+
+def preipo_meetings(date):
+    """Total Pre-IPO meetings = SUM of the additive desks (Collins + Summit)."""
+    return sum(preipo_by_desk(date)["by_desk"].values())
 
 # im_bookings lead_type (cheap/regular) by email|phone, for the report day (warehouse SoT)
 def imbookings_meetings(date):
@@ -309,8 +320,10 @@ def get_email():
         out.append((name, sent, 0, opps, mm, c, r))  # (ws, sent, hr(unused), opps, meetings, cheap, regular)
     return out
 
-# sendivo sub-account -> (label, channel-bucket)
-SENDIVO_SUB = {12720: "Renaissance 1", 13922: "Renaissance 2", 14603: "RG3 webform"}
+# sendivo sub-account ids -> labels, FROM the registry (metrics.sms_sent.api.sub_accounts).
+SENDIVO_SUB = REG.sendivo_subs()                  # {id: label}
+SUB_REN1 = REG.sendivo_sub_id("Funding")          # 12720 — Ren1 Funding SMS
+SUB_REN2 = REG.sendivo_sub_id("Pre-IPO")          # 13922 — Ren2 Pre-IPO SMS
 def get_sms_wa():
     sms = sendivo_sms(DAILY)
     inb = {r[0]: (int(r[1]), int(r[2])) for r in wq(
@@ -324,8 +337,8 @@ def get_sms_wa():
     # (folds in #116). SMS has no failed column here -> failed=None -> Fail% "—", delivered≈sent (the
     # sendivo billed/sent count; SMS delivery is ~100%). Funding SMS meetings on Ren1; Pre-IPO on Ren2.
     rows = []
-    s1 = sms.get(12720, 0); rows.append(("Renaissance 1 (SMS)", s1, s1, None, inb.get("Renaissance 1", (0, 0))[1], sms_mtg))
-    s2 = sms.get(13922, 0); rows.append(("Renaissance 2 (SMS · Pre-IPO)", s2, s2, None, inb.get("Renaissance 2", (0, 0))[1], preipo_meetings(DAILY)))
+    s1 = sms.get(SUB_REN1, 0); rows.append(("Renaissance 1 (SMS)", s1, s1, None, inb.get("Renaissance 1", (0, 0))[1], sms_mtg))
+    s2 = sms.get(SUB_REN2, 0); rows.append(("Renaissance 2 (SMS · Pre-IPO)", s2, s2, None, inb.get("Renaissance 2", (0, 0))[1], preipo_meetings(DAILY)))
     wa = wq(f"""SELECT sent, delivered, failed, replies_total FROM main.v_sms_dash_wa_daily
                 WHERE channel='whatsapp' AND metric_date=DATE '{DAILY}'""")
     if wa:
@@ -408,6 +421,111 @@ def get_im_reply():
         else:
             out.append((name, 0, None, None, 0, None, None, 0, None, None))
     return (DAILY, wk, mo), out
+
+# ============================ source self-verify (the DATA-TICKET fix) ============================
+# A chat / the SLA watchdog can confirm "am I sourcing the right thing for every metric?" with ZERO
+# human hand-feeding: probe each registered source is reachable + correctly-shaped, and reconcile
+# Pre-IPO per-desk counts to the team's #pre-ipo-success counter. Drift is FLAGGED, never silently
+# rendered.  handoffs/2026-06-30-DATA-TICKET-preipo-source-mapping-incompleteness.md
+def _rel_ok(rel):
+    try:
+        wq(f"SELECT 1 FROM {rel} LIMIT 1"); return True, "OK"
+    except Exception as e:
+        return False, str(e).strip()[:160]
+
+def reconcile_preipo(report_date):
+    """Reconcile the rendered per-desk Pre-IPO counts to the #pre-ipo-success counter (the team's own
+    tally). Returns (status, drift_lines, sheet_by_desk, anchor_by_desk).
+    status: OK | DRIFT | ANCHOR_UNAVAILABLE.  Per-desk source health (unreachable / renamed Date col)
+    is drift on its own, regardless of whether the Slack anchor is reachable."""
+    info = preipo_by_desk(report_date); sheet = info["by_desk"]; health = info["health"]
+    drift = [f"{d} desk source unhealthy: {h}" for d, h in health.items() if h != "OK"]
+    slack = None
+    try:
+        slack = REG.fetch_preipo_slack_tally(report_date)
+    except Exception as e:
+        print(f"WARN preipo slack tally failed: {e}", file=sys.stderr)
+    if slack and slack.get("by_desk"):
+        sd = slack["by_desk"]
+        for desk, n_sheet in sheet.items():
+            n_slack = sd.get(desk, 0)
+            if n_sheet != n_slack:
+                drift.append(f"{desk}: sheet={n_sheet} vs #pre-ipo-success counter={n_slack}")
+        if slack.get("unknown_desks"):
+            drift.append(f"UNKNOWN desk(s) posting in #pre-ipo-success but NOT in the registry: "
+                         f"{slack['unknown_desks']} -> add to config/daily_report_sources.json")
+        return ("DRIFT" if drift else "OK"), drift, sheet, sd
+    # degrade 1: reconcile against the registry's known_good if it is for this date
+    kg = REG.preipo_known_good()
+    if kg.get("date") == report_date and kg.get("by_desk"):
+        for desk, n_sheet in sheet.items():
+            n_kg = kg["by_desk"].get(desk)
+            if n_kg is not None and n_sheet != n_kg:
+                drift.append(f"{desk}: sheet={n_sheet} vs known_good={n_kg}")
+        return ("DRIFT" if drift else "OK"), drift, sheet, kg["by_desk"]
+    # degrade 2: no live anchor and not a known_good date -> structural health only
+    return ("DRIFT" if drift else "ANCHOR_UNAVAILABLE"), drift, sheet, None
+
+def verify_sources(report_date):
+    """Print a per-metric CONFIRM/WARN/DRIFT report and return True iff no source DRIFTED. Used by
+    `render_daily.py <date> --verify` (a self-check a chat runs to trust the report without a human)."""
+    reg = REG.load_registry()
+    out = []  # (status, msg)
+    def L(st, msg): out.append((st, msg))
+    errs = REG.validate_registry(reg)
+    L("OK" if not errs else "DRIFT", "registry schema valid" if not errs else "registry INVALID: " + "; ".join(errs))
+    # §1 Instantly per-workspace
+    try:
+        inst = instantly_daily(report_date); missing = [s for s, _ in WS if s not in inst]
+        L("OK" if not missing else "WARN",
+          f"§1 Instantly: {len(inst)}/{len(WS)} workspaces returned" + (f"; MISSING {missing}" if missing else ""))
+    except Exception as e:
+        L("WARN", f"§1 Instantly probe failed: {e}")
+    # booking sheet (§1 meetings / §2 / §5) — reachable + required columns present
+    bsid, btab = REG.bookings_sheet()
+    try:
+        brows = gget(bsid, f"{btab}!A1:R"); bhdr = set(brows[0]) if brows else set()
+        need = set(reg["metrics"]["email_meetings_leadtype"]["sheet"].get("required_columns", []))
+        miss = need - bhdr
+        L("OK" if not miss else "DRIFT",
+          f"booking sheet {bsid[:10]}…/{btab}: {len(brows)} rows" + (f"; MISSING cols {sorted(miss)}" if miss else "; required cols present"))
+    except Exception as e:
+        L("DRIFT", f"booking sheet {bsid[:10]}…/{btab} UNREACHABLE: {e}")
+    # §2 sendivo billing reachable
+    try:
+        sm = sendivo_sms(report_date)
+        L("OK" if sm else "WARN", f"§2 sendivo billing: {len(sm)} sub-account(s) returned; registry subs {REG.sendivo_subs()}")
+    except Exception as e:
+        L("WARN", f"§2 sendivo probe failed: {e}")
+    # every warehouse-sourced metric: relation reachable (right name?)
+    for mid, m in reg["metrics"].items():
+        if m.get("source_type") == "warehouse":
+            ok, why = _rel_ok(m["warehouse"]["relation"])
+            L("OK" if ok else "DRIFT", f"{mid}: warehouse {m['warehouse']['relation']} " + ("reachable" if ok else f"UNREACHABLE: {why}"))
+    lt = reg["metrics"]["email_meetings_leadtype"].get("leadtype_source")
+    if lt:
+        ok, why = _rel_ok(lt["relation"])
+        L("OK" if ok else "DRIFT", f"email_meetings_leadtype lead_type: warehouse {lt['relation']} " + ("reachable" if ok else f"UNREACHABLE: {why}"))
+    # Pre-IPO reconciliation (the ticket's core metric)
+    st, drift, sheet, anchor = reconcile_preipo(report_date)
+    if st == "OK":
+        L("OK", f"Pre-IPO desks {sheet} reconcile to anchor {anchor}")
+    elif st == "ANCHOR_UNAVAILABLE":
+        L("WARN", f"Pre-IPO desks {sheet} reachable; reconciliation anchor unavailable "
+                  f"(no Slack read creds and {report_date} != known_good date) — structural check only")
+    else:
+        L("DRIFT", "Pre-IPO RECONCILIATION DRIFT — " + " | ".join(drift) + f"  (rendered {sheet}, anchor {anchor})")
+    # print
+    print(f"\n=== daily-report SOURCE VERIFY · {report_date} ===")
+    for st_, msg in out:
+        print(f"  [{ {'OK': '✓ OK   ', 'WARN': '! WARN ', 'DRIFT': '✗ DRIFT'}.get(st_, '? ?    ') }] {msg}")
+    n_drift = sum(1 for st_, _ in out if st_ == "DRIFT")
+    print("=== " + ("PASS — every source confirmed against the registry" if not n_drift
+                     else f"DRIFT — {n_drift} source(s) need attention (see config/daily_report_sources.json)") + " ===\n")
+    return n_drift == 0
+
+if VERIFY:
+    sys.exit(0 if verify_sources(DAILY) else 2)
 
 # ============================ collect (per-section failure isolation, C1/C2) ============================
 # One external failure (warehouse 500, sheet error, API timeout) must degrade ONLY its section to a
@@ -629,6 +747,32 @@ def daily(ctx):
     ctx["partner_table"](PARTNER_D, PARTNER_D_TOTAL, f"5 · BOOKINGS BY PARTNER · day {DAILY}"); add()
     ctx["imreply_table"](IMREPLY_D, f"6 · IM REPLY-TIME — first-reply latency by workspace · daily / weekly / monthly · email (SMS+WA pending)")
 
+def _alert(text):
+    """Best-effort drift alert via the established scripts/alert_slack.py path; never raises (the tab
+    is already written, so a Slack hiccup must not fail the render)."""
+    try:
+        import subprocess
+        subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "alert_slack.py"), text],
+                       timeout=30, check=False)
+    except Exception as e:
+        print(f"WARN _alert failed: {e}", file=sys.stderr)
+
 print(f"Rendering DAILY tab '{DAILY_TAB}' for {DAILY} ...")
 build_and_write(DAILY_TAB, daily)
 print(f"OK — wrote tab '{DAILY_TAB}'.")
+
+# Post-render drift guard: reconcile Pre-IPO to the team counter AFTER writing (never blocks the tab).
+# "flag drift instead of silently rendering" — DATA-TICKET 2026-06-30. Fully guarded; a Slack/recon
+# failure only costs the alert, not the render.
+try:
+    _st, _drift, _sheet, _anchor = reconcile_preipo(DAILY)
+    if _st == "DRIFT":
+        _msg = (f":warning: *daily-report Pre-IPO source DRIFT* ({DAILY}, tab '{DAILY_TAB}'): "
+                + " | ".join(_drift) + f"  (rendered {_sheet} vs anchor {_anchor}). "
+                "Fix config/daily_report_sources.json -> preipo_meetings (a new/renamed desk?).")
+        print("WARN " + _msg, file=sys.stderr)
+        _alert(_msg)
+    else:
+        print(f"Pre-IPO reconcile: {_st} (desks {_sheet})")
+except Exception as _e:
+    print(f"WARN post-render Pre-IPO reconcile failed: {_e}", file=sys.stderr)
