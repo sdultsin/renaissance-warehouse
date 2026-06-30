@@ -307,16 +307,20 @@ def get_sms_wa():
     book = consolidated_bookings(DAILY)
     sms_mtg = sum(1 for b in book if b["channel"].lower() == "sms")
     wa_mtg = sum(1 for b in book if b["channel"].lower() == "whatsapp")
-    # SMS meetings split Ren1(Funding)/Ren2(Pre-IPO) not channel-tagged in the sheet -> report combined on Ren1 row,
-    # Pre-IPO SMS meetings come from the Pre-IPO sheets (yellow block). Here: Ren1 row carries funding SMS meetings.
+    # Row shape: (label, sent, delivered, failed|None, human_replies, meetings).  WhatsApp surfaces
+    # DELIVERED + FAIL% (ISKRA "sent" runs ~30-37% failed -> attempted is misleading); KPI=deliv/mtg
+    # (folds in #116). SMS has no failed column here -> failed=None -> Fail% "—", delivered≈sent (the
+    # sendivo billed/sent count; SMS delivery is ~100%). Funding SMS meetings on Ren1; Pre-IPO on Ren2.
     rows = []
-    rows.append(("Renaissance 1 (SMS)", sms.get(12720, 0), inb.get("Renaissance 1", (0, 0))[1], sms_mtg))
-    rows.append(("Renaissance 2 (SMS · Pre-IPO)", sms.get(13922, 0), inb.get("Renaissance 2", (0, 0))[1], preipo_meetings(DAILY)))
+    s1 = sms.get(12720, 0); rows.append(("Renaissance 1 (SMS)", s1, s1, None, inb.get("Renaissance 1", (0, 0))[1], sms_mtg))
+    s2 = sms.get(13922, 0); rows.append(("Renaissance 2 (SMS · Pre-IPO)", s2, s2, None, inb.get("Renaissance 2", (0, 0))[1], preipo_meetings(DAILY)))
     wa = wq(f"""SELECT sent, delivered, failed, replies_total FROM main.v_sms_dash_wa_daily
                 WHERE channel='whatsapp' AND metric_date=DATE '{DAILY}'""")
-    wa_sent = int(wa[0][0] or 0) if wa else 0
-    wa_rep = int(wa[0][3] or 0) if wa else 0
-    rows.append(("WhatsApp (ISKRA)", wa_sent, wa_rep, wa_mtg))
+    if wa:
+        ws_, wd, wf, wr = (int(wa[0][i] or 0) for i in range(4))
+    else:
+        ws_, wd, wf, wr = 0, 0, 0, 0
+    rows.append(("WhatsApp (ISKRA)", ws_, wd, wf, wr, wa_mtg))
     return rows
 
 def get_close():
@@ -404,7 +408,7 @@ def _safe(label, fn, default):
         print(f"WARN section '{label}' FAILED ({e}); rendering it empty", file=sys.stderr)
         return default
 _EMAIL_FB = [(name, 0, 0, 0, 0, 0, 0) for _, name in WS]
-_SMS_FB = [("Renaissance 1 (SMS)", 0, 0, 0), ("Renaissance 2 (SMS · Pre-IPO)", 0, 0, 0), ("WhatsApp (ISKRA)", 0, 0, 0)]
+_SMS_FB = [("Renaissance 1 (SMS)", 0, 0, None, 0, 0), ("Renaissance 2 (SMS · Pre-IPO)", 0, 0, None, 0, 0), ("WhatsApp (ISKRA)", 0, 0, 0, 0, 0)]
 _CLOSE_FB = {"dials": 0, "leads": 0, "connects": 0, "meetings": 0}
 _TRUTH_FB = (None, [(name, 0, 0, 0, 0) for _, name in WS])
 _IMREPLY_FB = ((DAILY, DAILY, DAILY), [(name, 0, None, None, 0, None, None, 0, None, None) for _, name in WS])
@@ -462,13 +466,18 @@ def build_and_write(tab, build_fn):
             ts += sent; topp += opps; tm += m; tc_ += c; tr_ += r
         ti = add(["TOTAL", ts, topp, tm, kpi(ts, tm), tc_, pctstr(tc_, tm), tr_, pctstr(tr_, tm)]); tot.append(ti); row_ncol[ti] = W
     def sms_wa_table(rows_data, header_label):
-        W = 5
+        # WhatsApp shows DELIVERED + FAIL% (ISKRA "sent" runs ~30-37% failed -> attempted misleads);
+        # KPI = delivered/mtg. SMS: failed=None -> Fail% "—", delivered≈sent. (folds in #116)
+        W = 7
         si = add([header_label]); sec.append(si); row_ncol[si] = W
-        hr = add(["Channel / workspace", "Sent", "Human replies", "Meetings", "KPI (sent/mtg)"]); th.append(hr); th_ncol[hr] = W
-        ts = th_ = tm = 0
-        for label, sent, reps, m in rows_data:
-            ri = add([label, sent, reps, m, kpi(sent, m)]); data.append(ri); row_ncol[ri] = W; ts += sent; th_ += reps; tm += m
-        ti = add(["TOTAL", ts, th_, tm, kpi(ts, tm)]); tot.append(ti); row_ncol[ti] = W
+        hr = add(["Channel / workspace", "Sent", "Delivered", "Fail %", "Human RR", "Meetings", "KPI (deliv/mtg)"]); th.append(hr); th_ncol[hr] = W
+        def failpct(failed, sent): return (f"'{round(100.0*failed/sent)}%" if sent else "'0%") if failed is not None else "—"
+        ts = td = tf = thr = tm = 0; any_fail = False
+        for label, sent, deliv, failed, reps, m in rows_data:
+            ri = add([label, sent, deliv, failpct(failed, sent), rr(reps, deliv), m, kpi(deliv, m)]); rrrows.append(ri); data.append(ri); row_ncol[ri] = W
+            ts += sent; td += deliv; thr += reps; tm += m
+            if failed is not None: tf += failed; any_fail = True
+        ti = add(["TOTAL", ts, td, (f"'{round(100.0*tf/ts)}%" if (any_fail and ts) else "—"), rr(thr, td), tm, kpi(td, tm)]); tot.append(ti); rrrows.append(ti); row_ncol[ti] = W
     def truth_table(header_label):
         W = 6
         si = add([header_label]); sec.append(si); row_ncol[si] = W
@@ -531,6 +540,8 @@ def build_and_write(tab, build_fn):
     reqs.append({"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": 0, "endIndex": WIDE}, "properties": {"pixelSize": 21}, "fields": "pixelSize"}})
     reqs.append({"repeatCell": {"range": rng(0, NROW, 1, NCOL), "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}}, "fields": "userEnteredFormat.numberFormat"}})
     reqs.append({"repeatCell": {"range": rng(0, NROW, 0, 1), "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}}, "fields": "userEnteredFormat.numberFormat"}})
+    for i in rrrows:  # §2 Human RR (col 4) as a percent
+        reqs.append({"repeatCell": {"range": rng(i, i + 1, 4, 5), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}}}, "fields": "userEnteredFormat.numberFormat"}})
     for i in strows:
         reqs.append({"repeatCell": {"range": rng(i, i + 1, 5, 6), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}}, "fields": "userEnteredFormat.numberFormat"}})
     for i in sorted(set(data) | set(tot) | set(strows)):
@@ -562,9 +573,10 @@ def write_summary_block(sid):
     """Cream right-side 'Business / Funding' summary block (cols L-O), GENERATED from section data."""
     def short(ws): return ws.split(" (")[0]
     def ratio(a, b): return round(a / b) if b else ""
-    sms1 = SMS_D[0] if len(SMS_D) > 0 else ("", 0, 0, 0)
-    sms2 = SMS_D[1] if len(SMS_D) > 1 else ("", 0, 0, 0)
-    wa = next((x for x in SMS_D if "WhatsApp" in x[0]), ("", 0, 0, 0))
+    # SMS_D rows: (label, sent, delivered, failed, replies, meetings)
+    sms1 = SMS_D[0] if len(SMS_D) > 0 else ("", 0, 0, None, 0, 0)
+    sms2 = SMS_D[1] if len(SMS_D) > 1 else ("", 0, 0, None, 0, 0)
+    wa = next((x for x in SMS_D if "WhatsApp" in x[0]), ("", 0, 0, 0, 0, 0))
     warm = next((r for r in EMAIL_D if r[0].lower().startswith("warm")), ("Warm leads", 0, 0, 0, 0, 0, 0))
     wsrows = [r for r in EMAIL_D if not r[0].lower().startswith("warm")]
     blk = [[f"{DAILY_TAB} — Business / Funding · {DAILY}", "", "", ""],
@@ -573,8 +585,8 @@ def write_summary_block(sid):
     for ws, sent, hr, opps, m, c, r in wsrows:
         blk.append([short(ws), sent, m, ratio(sent, m)]); ts += sent; tm += m
     blk.append(["Total", ts, tm, ratio(ts, tm)]); blk.append(["", "", "", ""])
-    for lbl, s, m in [("SMS Funding", sms1[1], sms1[3]), ("SDR (Close)", CLOSE_D["dials"], CLOSE_D["meetings"]),
-                      ("Warm Leads", warm[1], warm[4]), ("WhatsApp Funding", wa[1], wa[3])]:
+    for lbl, s, m in [("SMS Funding", sms1[1], sms1[5]), ("SDR (Close)", CLOSE_D["dials"], CLOSE_D["meetings"]),
+                      ("Warm Leads", warm[1], warm[4]), ("WhatsApp Funding (delivered)", wa[2], wa[5])]:
         blk.append([lbl, s, m, ratio(s, m)])
     blk.append(["", "", "", ""])
     blk.append(["SMS IPO", sms2[1], PREIPO_MTG, ratio(sms2[1], PREIPO_MTG)])
