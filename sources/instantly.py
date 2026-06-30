@@ -101,8 +101,12 @@ class InstantlyClient:
     # was exhausted, i.e. the result set is silently truncated mid-history. Callers
     # that need full coverage (email-thread-sync full backfill) MUST treat a ceiling
     # hit as a HARD FAIL and NOT advance their watermark (FINALIZED-SPEC §4.C/R8).
-    PAGINATION_CEILING = 100_000  # runaway BACKSTOP, not a data limit (~10M records). Real
-                                  # pulls complete via cursor exhaustion; never cut short silently.
+    PAGINATION_CEILING = 5_000    # [06-30 lowered from 100_000] runaway BACKSTOP (~500k records).
+                                  # 100k never bit: the all-history tag-edge pull (custom-tag-mappings /
+                                  # accounts?tag_ids) walked ~91k pages/15h, hanging the whole nightly on
+                                  # the writer lock. 5k still clears every legit pull (campaigns/accounts/
+                                  # analytics are <500 pages) but caps the runaway -> fails LOUD, and
+                                  # per-phase isolation carries the run forward to the canonical phase.
 
     def _paginate(
         self,
