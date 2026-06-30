@@ -12,7 +12,11 @@ Per workspace key:
   4. FULL-REPLACE this workspace's rows (delete+insert after a clean pull) so a single
      failed workspace can never wipe its rows.
 
-Registered under the 'instantly' phase (04:00); refreshes every nightly run.
+Registered as the LAST phase ('account_tags_late', after 'derived'). This is a slow
+(~3-8h) rate-limited per-inbox pull, so it is isolated at the very end of PHASE_ORDER
+where it can NEVER block or kill the critical phases. [2026-06-30] Moved out of the
+'instantly' phase (was position 6/16, where its runtime strangled account_census..derived
+and the nightly never finished). Refreshes every nightly run.
 """
 
 from __future__ import annotations
@@ -28,7 +32,7 @@ logger = logging.getLogger("entities.account_tags")
 
 
 def register(registry: Registry) -> None:
-    registry.add_phase("instantly", "account_tags", run_account_tags_ingest)
+    registry.add_phase("account_tags_late", "account_tags", run_account_tags_ingest)
 
 
 def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
