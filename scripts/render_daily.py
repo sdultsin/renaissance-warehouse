@@ -40,7 +40,14 @@ BASE = f"https://sheets.googleapis.com/v4/spreadsheets/{SID}"
 
 args = [a for a in sys.argv[1:] if not a.startswith("--")]
 DRY = "--dry" in sys.argv
-REPORT_DATE = args[0] if args else "2026-06-29"
+# Default to TODAY (ET), never a hardcoded past date — a mis-templated cron must not silently render
+# a stale day into a today-named tab (M6). The sync always passes REPORT_DATE explicitly.
+try:
+    from zoneinfo import ZoneInfo
+    _today_et = datetime.datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+except Exception:
+    _today_et = datetime.date.today().isoformat()
+REPORT_DATE = args[0] if args else _today_et
 _d = datetime.date.fromisoformat(REPORT_DATE)
 DAILY = REPORT_DATE
 DAILY_TAB = args[1] if len(args) > 1 else _d.strftime("%b %-d")  # "Jun 29"
@@ -94,7 +101,18 @@ def wq(sql):
     return json.load(urllib.request.urlopen(req, timeout=180))["rows"]
 
 # ---------------------------- external fetchers (memoized) ----------------------------
-import httpx
+import httpx, time
+def _retry(fn, tries=3, label=""):
+    """Retry a transient network call (timeout/5xx) a few times before giving up (nightly robustness)."""
+    last = None
+    for i in range(tries):
+        try:
+            return fn()
+        except Exception as e:
+            last = e
+            if i < tries - 1:
+                time.sleep(2 * (i + 1))
+    raise last
 _INST_BASE = "https://api.instantly.ai/api/v2"
 _inst_cache = {}
 def instantly_daily(date):
@@ -109,16 +127,26 @@ def instantly_daily(date):
         if not k:
             continue
         try:
-            r = httpx.get(_INST_BASE + "/campaigns/analytics/daily",
-                          params={"start_date": date, "end_date": date},
-                          headers={"Authorization": f"Bearer {k}"}, timeout=60.0)
-            r.raise_for_status()
+            def _call(k=k):
+                rr = httpx.get(_INST_BASE + "/campaigns/analytics/daily",
+                               params={"start_date": date, "end_date": date},
+                               headers={"Authorization": f"Bearer {k}"}, timeout=60.0)
+                rr.raise_for_status()
+                return rr
+            r = _retry(_call, label=slug)
             rows = r.json() or []
             day = next((x for x in rows if str(x.get("date", ""))[:10] == date), None)
             if day:
                 out[slug] = (int(day.get("sent") or 0), int(day.get("opportunities") or 0))
         except Exception as e:
             print(f"WARN instantly_daily {slug} {date}: {e}", file=sys.stderr)
+    # Loud: a REPORTING workspace missing from the result reads 0 in §1 AND §4 (a wrong-but-plausible
+    # zero, not a genuine no-send) — surface it so a dead/rotated key is caught, never silent (M3).
+    missing = [s for s in REPORT_SLUGS if s not in out]
+    if missing:
+        print(f"WARN instantly_daily {date}: NO DATA for reporting workspace(s) "
+              f"{missing} — these render 0 sent/opps (dead key? rename?). NOT a genuine zero.",
+              file=sys.stderr)
     _inst_cache[date] = out
     return out
 
@@ -132,7 +160,7 @@ def sendivo_sms(date):
         try:
             from sources.sendivo import SendivoClient
             with SendivoClient(_CREDS.require("SENDIVO_API_KEY")) as s:
-                for r in s.billing_report(date, date):
+                for r in _retry(lambda: s.billing_report(date, date), label="sendivo"):
                     sf = r.get("sms_fees") or {}
                     qty = sf.get("quantity") if isinstance(sf, dict) else sf
                     out[int(r.get("sub_account_id"))] = int(qty or 0)
@@ -144,7 +172,11 @@ def sendivo_sms(date):
 # ---------------------------- google sheet reader ----------------------------
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-_g_creds = Credentials.from_authorized_user_file(TOK); _g_creds.refresh(Request())
+_g_creds = Credentials.from_authorized_user_file(TOK)
+try:
+    _g_creds.refresh(Request())  # populate .expiry so .valid is meaningful (M1)
+except Exception as _e:
+    print(f"WARN initial Google token refresh failed ({_e}); will retry lazily", file=sys.stderr)
 def _gtok():
     if not _g_creds.valid:
         _g_creds.refresh(Request())
@@ -157,15 +189,22 @@ def gget(sid, rng):
 # consolidated booking sheet (Channel + Workspace + Partner per booking; portal-fed)
 BOOKINGS_SID = "1vaExhxu319o2CSoQtjWRV49lq5GowOeJzo1_GHXIIqM"
 def _date_variants(d):
-    # the booking sheet writes "Jun 29, 2026"; tolerate "June 29, 2026" too
-    return {d.strftime("%b %-d, %Y"), d.strftime("%B %-d, %Y")}
+    # booking sheets are human/automation-touched — tolerate every format we've seen so a rendering
+    # change can't silently zero the meeting columns (M4): "Jun 29, 2026", "June 29, 2026",
+    # "2026-06-29", "6/29/2026", "06/29/2026".
+    return {d.strftime("%b %-d, %Y"), d.strftime("%B %-d, %Y"), d.isoformat(),
+            d.strftime("%-m/%-d/%Y"), d.strftime("%m/%d/%Y")}
 _book_cache = {}
 def consolidated_bookings(date):
     """deduped (email|phone) bookings for `date`: list of {channel, ws, partner, key}."""
     if date in _book_cache:
         return _book_cache[date]
     d = datetime.date.fromisoformat(date); want = _date_variants(d)
-    rows = gget(BOOKINGS_SID, "Data!A1:R")
+    try:
+        rows = gget(BOOKINGS_SID, "Data!A1:R")
+    except Exception as e:
+        print(f"WARN consolidated_bookings sheet read failed {date}: {e}", file=sys.stderr)
+        _book_cache[date] = []; return []
     if not rows:
         _book_cache[date] = []; return []
     hdr = rows[0]; ix = {h: i for i, h in enumerate(hdr)}
@@ -183,6 +222,9 @@ def consolidated_bookings(date):
         out.append({"channel": c(r, "Channel"), "ws": ws_alias(c(r, "Workspace")),
                     "partner": c(r, "Partner") or "(unknown)", "key": key,
                     "email": c(r, "Email").lower(), "phone": c(r, "Phone")})
+    if not out:
+        print(f"WARN consolidated_bookings: 0 rows for {date} (date-format drift? all meeting "
+              f"columns will read 0)", file=sys.stderr)
     _book_cache[date] = out
     return out
 
@@ -216,8 +258,10 @@ def preipo_meetings(date):
 
 # im_bookings lead_type (cheap/regular) by email|phone, for the report day (warehouse SoT)
 def imbookings_meetings(date):
-    """{key(email|phone): lead_type} + raw deduped count, from the portal mirror (offer=Funding)."""
-    rows = wq(f"""
+    """{key(email|phone): lead_type} from the portal mirror (offer=Funding). Fail-soft -> {} so a
+    warehouse hiccup costs only the cheap/regular split, not §1's Instantly sent/opps."""
+    try:
+        rows = wq(f"""
         WITH b AS (
           SELECT lower(coalesce(nullif(email,''), phone)) AS k,
                  max(lower(coalesce(lead_type,''))) AS lead_type
@@ -227,6 +271,9 @@ def imbookings_meetings(date):
             AND (deleted_at IS NULL OR deleted_at='' OR lower(deleted_at)='null')
           GROUP BY 1)
         SELECT k, lead_type FROM b WHERE k IS NOT NULL AND k<>''""")
+    except Exception as e:
+        print(f"WARN imbookings_meetings failed {date}: {e}", file=sys.stderr)
+        return {}
     return {r[0]: (r[1] or "") for r in rows}
 
 # ============================ SECTION DATA ============================
@@ -297,7 +344,8 @@ def get_truth():
         otd = cap.get((slug, "OTD"), 0.0); goog = cap.get((slug, "Google"), 0.0)
         actual = inst.get(slug, (0, 0))[0]
         out.append((name, otd, goog, otd + goog, actual))
-    census = wq("SELECT max(census_date) FROM core.account_label")[0][0]
+    cr = wq("SELECT max(census_date) FROM core.account_label")
+    census = cr[0][0] if cr and cr[0] else None
     return census, out
 
 def get_partner():
@@ -345,14 +393,29 @@ def get_im_reply():
             out.append((name, 0, None, None, 0, None, None, 0, None, None))
     return (DAILY, wk, mo), out
 
-# ============================ collect ============================
-EMAIL_D = get_email()
-SMS_D = get_sms_wa()
-CLOSE_D = get_close()
-SENDING_CENSUS, SENDING_TRUTH = get_truth()
-PARTNER_D, PARTNER_D_TOTAL = get_partner()
-IMREPLY_PERIODS, IMREPLY_D = get_im_reply()
-PREIPO_MTG = preipo_meetings(DAILY)
+# ============================ collect (per-section failure isolation, C1/C2) ============================
+# One external failure (warehouse 500, sheet error, API timeout) must degrade ONLY its section to a
+# safe sentinel, never take down the whole nightly render. Fallback tuple arities MUST match the
+# table builders + write_summary_block unpacking.
+def _safe(label, fn, default):
+    try:
+        return fn()
+    except Exception as e:
+        print(f"WARN section '{label}' FAILED ({e}); rendering it empty", file=sys.stderr)
+        return default
+_EMAIL_FB = [(name, 0, 0, 0, 0, 0, 0) for _, name in WS]
+_SMS_FB = [("Renaissance 1 (SMS)", 0, 0, 0), ("Renaissance 2 (SMS · Pre-IPO)", 0, 0, 0), ("WhatsApp (ISKRA)", 0, 0, 0)]
+_CLOSE_FB = {"dials": 0, "leads": 0, "connects": 0, "meetings": 0}
+_TRUTH_FB = (None, [(name, 0, 0, 0, 0) for _, name in WS])
+_IMREPLY_FB = ((DAILY, DAILY, DAILY), [(name, 0, None, None, 0, None, None, 0, None, None) for _, name in WS])
+
+EMAIL_D = _safe("email", get_email, _EMAIL_FB)
+SMS_D = _safe("sms_wa", get_sms_wa, _SMS_FB)
+CLOSE_D = _safe("close", get_close, _CLOSE_FB)
+SENDING_CENSUS, SENDING_TRUTH = _safe("truth", get_truth, _TRUTH_FB)
+PARTNER_D, PARTNER_D_TOTAL = _safe("partner", get_partner, ([], 0))
+IMREPLY_PERIODS, IMREPLY_D = _safe("imreply", get_im_reply, _IMREPLY_FB)
+PREIPO_MTG = _safe("preipo", lambda: preipo_meetings(DAILY), 0)
 
 if DRY:
     print(f"REPORT_DATE={DAILY}  TAB={DAILY_TAB}  census(§4)={SENDING_CENSUS}  periods(§6)={IMREPLY_PERIODS}")
@@ -371,11 +434,15 @@ def api(method, url, body=None):
     req = urllib.request.Request(url, data=data, method=method,
         headers={"Authorization": f"Bearer {_gtok()}", "Content-Type": "application/json"})
     return json.load(urllib.request.urlopen(req))
-def rr(hr, sent): return (hr / sent) if sent else "—"
-def pctstr(n, m): return f"'{round(100.0*n/m)}%" if m else "'0%"
-def kpi(sent, m): return round(sent / m) if m else "—"
-def fpct(actual, expected): return (actual / expected) if expected else "—"
-def mins(v): return "—" if v is None else round(v)
+# defensive coercion: the read API may serialize DuckDB DECIMAL/avg/median as strings (M2)
+def _f(x):
+    try: return float(x)
+    except (TypeError, ValueError): return 0.0
+def rr(hr, sent): return (_f(hr) / _f(sent)) if sent else "—"
+def pctstr(n, m): return f"'{round(100.0*_f(n)/_f(m))}%" if m else "'0%"
+def kpi(sent, m): return round(_f(sent) / _f(m)) if m else "—"
+def fpct(actual, expected): return (_f(actual) / _f(expected)) if expected else "—"
+def mins(v): return "—" if v is None else round(_f(v))
 def rgb(r, g, b): return {"red": r, "green": g, "blue": b}
 
 def build_and_write(tab, build_fn):
