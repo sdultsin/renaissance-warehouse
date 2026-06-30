@@ -322,7 +322,7 @@ class InstantlyClient:
         """Eager `lead_emails` that also reports whether the pagination ceiling was hit.
 
         Returns (items, ceiling_hit). A True ceiling_hit means the lead's history was
-        truncated mid-cursor (>1000 pages — pathological for a single lead) and the
+        truncated mid-cursor (>PAGINATION_CEILING pages — pathological for a single lead) and the
         caller MUST treat that lead/workspace as a HARD FAIL (do not advance the
         watermark; escalate). Used by the email-thread-sync full-backfill path.
         """
@@ -373,21 +373,41 @@ class InstantlyClient:
         self,
         resource_type: int | None = None,
         workspace_id: str | None = None,
+        ceiling_flag: dict | None = None,
     ) -> Iterator[dict]:
         """`GET /custom-tag-mappings` — the PUBLIC bulk (tag, resource) edge list.
 
         Unlike `/tag-mappings` (admin-only; 404s on the public v2 surface — see
         `list_tag_mappings`), `/custom-tag-mappings` IS reachable with a workspace key
         and streams EVERY tag edge in one paginated pass (verified live 2026-06-26 on
-        Funding 2). Each item: {"id","tag_id","resource_id","resource_type",...} where
-        `resource_id` is the sending-account EMAIL when resource_type == 1. This is the
-        efficient, faithful source for the full account<->tag mirror — no per-tag
-        `/accounts?tag_ids=` iteration needed.
+        Funding 2). Each item: {"id","tag_id","resource_id","resource_type",
+        "timestamp_created",...} where `resource_id` is the sending-account EMAIL when
+        resource_type == 1.
+
+        ORDERING + FILTERS (verified live 2026-06-30, entities/account_tags.py rewrite):
+          * The stream is NEWEST-FIRST by `timestamp_created` (cursor walks backward in
+            time), exactly like `/emails`. A caller pulling an INCREMENTAL delta should
+            iterate and STOP (break) once it crosses its watermark — everything after is
+            older. This is the ONLY safe way to use it: a full walk is ~9M edges across
+            workspaces (every account ever × its tags), ~91k pages, hours — it hung the
+            nightly 15h (2026-06-30). DON'T full-walk it nightly.
+          * `resource_type` is NOT honored server-side (verified: rt=1 returns the SAME
+            set as unfiltered, ~96% rt=1 / ~4% rt=2). Filter client-side on
+            `resource_type == 1`. The param is sent for forward-compat only.
+          * No server-side date filter exists (start_date/created_after/since all ignored)
+            — the newest-first client-side STOP is the only incremental bound.
+
+        `ceiling_flag` (a dict) is threaded to `_paginate`: if the page-count backstop is
+        hit before the cursor is exhausted it sets `ceiling_flag['hit'] = True` (vs raising)
+        so an incremental caller can fail-loud for that workspace WITHOUT merging a partial
+        set. Pass it whenever you rely on a bounded incremental window.
         """
         params: dict = {}
         if resource_type is not None:
             params["resource_type"] = resource_type
-        yield from self._paginate("/custom-tag-mappings", params=params or None, limit=100)
+        yield from self._paginate(
+            "/custom-tag-mappings", params=params or None, limit=100, ceiling_flag=ceiling_flag
+        )
 
     def list_accounts(
         self,
