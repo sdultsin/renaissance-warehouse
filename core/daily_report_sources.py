@@ -89,6 +89,25 @@ def validate_registry(reg: dict | None = None) -> list[str]:
             re.compile(rx)
         except re.error as e:
             errs.append(f"preipo reconciliation.line_regex does not compile: {e}")
+    # Guard the accessors the renderer relies on: a registry can be schema-shaped yet drop a key the
+    # renderer reads, which would pass a naive validate then crash/silently-zero at render. Assert the
+    # exact lookups render_daily makes resolve (sendivo Funding/Pre-IPO subs, the booking sheet).
+    sms = metrics.get("sms_sent", {})
+    subs = (sms.get("api") or {}).get("sub_accounts")
+    if not subs:
+        errs.append("sms_sent.api.sub_accounts missing/empty — §2 SMS would have no sub-accounts")
+    else:
+        chans = " ".join(str(s.get("channel", "")).lower() for s in subs)
+        for needed in ("funding", "pre-ipo"):
+            if needed not in chans:
+                errs.append(f"sms_sent.api.sub_accounts has no '{needed}' channel -> sendivo_sub_id('{needed}') "
+                            f"returns None -> §2 SMS for that channel silently renders 0")
+        for s in subs:
+            if not s.get("id"):
+                errs.append(f"sms_sent sub_account missing id: {s}")
+    bsheet = (metrics.get("email_meetings_leadtype", {}) or {}).get("sheet") or {}
+    if not (bsheet.get("spreadsheet_id") and bsheet.get("tab")):
+        errs.append("email_meetings_leadtype.sheet missing spreadsheet_id/tab — the consolidated booking sheet")
     return errs
 
 
@@ -201,13 +220,16 @@ def _msg_in_et_day(ts: str | float, report_date_iso: str) -> bool:
 
 def tally_preipo_messages(messages: list[dict], report_date_iso: str,
                           known_desks: dict[str, str], pattern: "re.Pattern") -> dict:
-    """PURE: given Slack messages [{ts, text}], the report ET day, the known {lower:Desk} map and the
-    compiled line regex, return {"by_desk": {desk:maxN}, "unknown_desks": {label:maxN}, "messages": k}.
-    Rule: counter RESETS to 1 per ET day and multiple bookers each run their own 1..N -> take the MAX N
-    per desk over the day (do NOT sum). Bucket by message POST date in ET (the 'June DD' in the text is
-    the script name, not the booking date). No I/O — unit-testable."""
-    by_desk: dict[str, int] = {}
-    unknown: dict[str, int] = {}
+    """PURE: given Slack messages [{ts, text, user}], the report ET day, the known {lower:Desk} map and
+    the compiled line regex, return {"by_desk": {desk:N}, "unknown_desks": {label:N}, "messages": k}.
+
+    Rule: the counter RESETS to 1 per ET day and EACH BOOKER runs their own independent 1..N. So take
+    the MAX N per (desk, booker) within the ET day, then SUM across bookers — i.e. two people each
+    booking up to 11 on the same desk total 22, not max(11,11)=11, while one booker's run split across
+    several messages still collapses to their single max (no double-count). Bucket by message POST date
+    in ET (the 'June DD' inside a line is the script name, not the booking date). No I/O — unit-testable."""
+    desk_user_max: dict[tuple, int] = {}     # (Desk, booker) -> max N
+    unknown_user_max: dict[tuple, int] = {}  # (label, booker) -> max N
     n = 0
     for msg in messages:
         if not _msg_in_et_day(msg.get("ts", ""), report_date_iso):
@@ -215,17 +237,25 @@ def tally_preipo_messages(messages: list[dict], report_date_iso: str,
         text = msg.get("text", "") or ""
         if not text:
             continue
+        booker = msg.get("user") or msg.get("username") or msg.get("bot_id") or "?"
         n += 1
         for m in pattern.finditer(text):
             label, num = m.group(1), int(m.group(2))
             key = label.lower()
             if key in known_desks:
-                desk = known_desks[key]
-                by_desk[desk] = max(by_desk.get(desk, 0), num)
+                k = (known_desks[key], booker)
+                desk_user_max[k] = max(desk_user_max.get(k, 0), num)
             else:
-                unknown[label] = max(unknown.get(label, 0), num)
+                k = (label, booker)
+                unknown_user_max[k] = max(unknown_user_max.get(k, 0), num)
+    by_desk: dict[str, int] = {}
+    for (desk, _booker), v in desk_user_max.items():
+        by_desk[desk] = by_desk.get(desk, 0) + v
     for desk in known_desks.values():
         by_desk.setdefault(desk, 0)
+    unknown: dict[str, int] = {}
+    for (label, _booker), v in unknown_user_max.items():
+        unknown[label] = unknown.get(label, 0) + v
     return {"by_desk": by_desk, "unknown_desks": unknown, "messages": n}
 
 
