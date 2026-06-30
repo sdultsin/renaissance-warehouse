@@ -38,7 +38,7 @@ elif [[ "$MODE" == "relock" ]]; then
 else
     REPORT_DATE="$(TZ=America/New_York date +%F)"
 fi
-TAB="$(date -d "$REPORT_DATE" +'%B %-d')"   # e.g. "June 29"
+TAB="$(date -d "$REPORT_DATE" +'%b %-d')"   # e.g. "Jun 29" (matches Jun 22-26 / Jun MTD naming)
 # All callers (cron / watchdog self-heal / manual) own the redirect to logs/daily_report_sync.log,
 # so the script writes to stdout/stderr only — no internal tee (which would double every line).
 PROMOTE_LOG="$REPO_DIR/logs/daily_report_promote.log"   # detached publisher gets its own file
