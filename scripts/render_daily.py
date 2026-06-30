@@ -11,8 +11,9 @@ Usage:  python3 render_daily.py 2026-06-29 ["Tab Name"]   (tab name defaults to 
 Sources (canonical, per /data-warehouse B.3):
  §1 Email = raw_pipeline_campaign_daily_metrics (sent/opps, COALESCE workspace attribution) +
             core.meeting (email meetings by workspace) + core.v_meeting_lead_type (cheap=cheap_mca).
- §2 SMS/WA = v_sms_workspace_funnel (sent/RR) + core.meeting SMS (meetings) + v_sms_dash_wa_daily (WA)
-            + v_sms_sends_by_offer (Funding/IPO split, right-side summary).
+ §2 SMS/WA = v_sms_workspace_funnel (sent/delivered/RR) + core.meeting SMS (meetings) + v_sms_dash_wa_daily
+            (WA: sent/DELIVERED/FAILED/replies/meetings — WhatsApp shows delivered + fail%, not raw attempted,
+            since ISKRA "sent" runs ~30-37% failed) + v_sms_sends_by_offer (Funding/IPO split, summary).
  §3 Close = core.call (dials/leads/connects, ET day) + core.meeting channel=Call (meetings).
  §4 Sending truth = core.v_sending_truth_pit (eligible_capacity=expected, actual_sends=actual),
             LAST COMPLETE field day (lagged ~2d by design — not on the 10 PM critical path).
@@ -78,15 +79,22 @@ def get_email():
     return out
 
 def get_sms_wa():
-    smsf = {r[0]: r for r in wq(f"SELECT sub_account, sent, replies FROM main.v_sms_workspace_funnel WHERE metric_date = DATE '{DAILY}'")}
+    # row shape: (label, sent, delivered, failed|None, replies, meetings). failed=None -> Fail% shows '—'
+    # (SMS has no per-funnel failed column here; SMS deliverability lives in main.v_sms_deliverability_*).
+    smsf = {r[0]: r for r in wq(f"SELECT sub_account, sent, delivered, replies FROM main.v_sms_workspace_funnel WHERE metric_date = DATE '{DAILY}'")}
     smsm = {r[0]: int(r[1]) for r in wq(
         f"SELECT sendivo_sub_account, COUNT(*) FROM core.meeting WHERE channel='SMS' AND meeting_date = DATE '{DAILY}' AND sendivo_sub_account IS NOT NULL AND is_duplicate_of IS NULL GROUP BY 1")}
     rows = []
     for sa in ["Renaissance 1", "Renaissance 2"]:
         f = smsf.get(sa)
-        rows.append((sa, int(f[1]) if f else 0, int(f[2]) if f else 0, smsm.get(sa, 0)))
-    wa = wq(f"SELECT sent, replies_total, meetings_booked FROM main.v_sms_dash_wa_daily WHERE metric_date = DATE '{DAILY}'")
-    rows.append(("WhatsApp (ISKRA)", int(wa[0][0] or 0), int(wa[0][1] or 0), int(wa[0][2] or 0)) if wa else ("WhatsApp (ISKRA)",0,0,0))
+        rows.append((sa, int(f[1]) if f else 0, int(f[2]) if f else 0, None, int(f[3]) if f else 0, smsm.get(sa, 0)))
+    # WhatsApp: surface DELIVERED + FAIL% (not raw attempted). ISKRA "sent" runs ~30-37% failed.
+    wa = wq(f"SELECT sent, delivered, failed, replies_total, meetings_booked FROM main.v_sms_dash_wa_daily WHERE metric_date = DATE '{DAILY}'")
+    if wa:
+        s,dl,fl,rp,mt = (int(wa[0][i] or 0) for i in range(5))
+        rows.append(("WhatsApp (ISKRA)", s, dl, fl, rp, mt))
+    else:
+        rows.append(("WhatsApp (ISKRA)", 0, 0, 0, 0, 0))
     return rows
 
 def get_close():
@@ -184,13 +192,18 @@ def build_and_write(tab, build_fn, gradient_truth=True):
             ts+=sent; topp+=opps; tm+=m; tc_+=c; tr_+=r
         ti=add(["TOTAL",ts,topp,tm,kpi(ts,tm),tc_,pctstr(tc_,tm),tr_,pctstr(tr_,tm)]); tot.append(ti); row_ncol[ti]=W
     def sms_wa_table(rows_data, header_label):
-        W=5
+        # Show DELIVERED + FAIL% (not raw attempted). KPI = delivered/mtg (raw 'sent' includes ~30% failures
+        # for WhatsApp -> sent/mtg was implausibly efficient). Fail% = failed/sent; '—' when failed unknown (SMS).
+        W=7
         si=add([header_label]); sec.append(si); row_ncol[si]=W
-        hr=add(["Channel / workspace","Sent","Human RR","Meetings","KPI (sent/mtg)"]); th.append(hr); th_ncol[hr]=W
-        ts=th_=tm=0
-        for label,sent,reps,m in rows_data:
-            ri=add([label,sent,rr(reps,sent),m,kpi(sent,m)]); rrrows.append(ri); data.append(ri); row_ncol[ri]=W; ts+=sent; th_+=reps; tm+=m
-        ti=add(["TOTAL",ts,rr(th_,ts),tm,kpi(ts,tm)]); tot.append(ti); rrrows.append(ti); row_ncol[ti]=W
+        hr=add(["Channel / workspace","Sent","Delivered","Fail %","Human RR","Meetings","KPI (deliv/mtg)"]); th.append(hr); th_ncol[hr]=W
+        ts=td=tf=th_=tm=0; any_fail=False
+        def failpct(failed,sent): return (f"'{round(100.0*failed/sent)}%" if sent else "'0%") if failed is not None else "—"
+        for label,sent,deliv,failed,reps,m in rows_data:
+            ri=add([label,sent,deliv,failpct(failed,sent),rr(reps,deliv),m,kpi(deliv,m)]); rrrows.append(ri); data.append(ri); row_ncol[ri]=W
+            ts+=sent; td+=deliv; th_+=reps; tm+=m
+            if failed is not None: tf+=failed; any_fail=True
+        ti=add(["TOTAL",ts,td,(f"'{round(100.0*tf/ts)}%" if (any_fail and ts) else "—"),rr(th_,td),tm,kpi(td,tm)]); tot.append(ti); rrrows.append(ti); row_ncol[ti]=W
     def truth_table(header_label):
         W=10
         si=add([header_label]); sec.append(si); row_ncol[si]=W
@@ -242,7 +255,7 @@ def build_and_write(tab, build_fn, gradient_truth=True):
     reqs.append({"updateDimensionProperties":{"range":{"sheetId":sid,"dimension":"ROWS","startIndex":0,"endIndex":WIDE},"properties":{"pixelSize":21},"fields":"pixelSize"}})
     reqs.append({"repeatCell":{"range":rng(0,NROW,1,NCOL),"cell":{"userEnteredFormat":{"numberFormat":{"type":"NUMBER","pattern":"#,##0"}}},"fields":"userEnteredFormat.numberFormat"}})
     reqs.append({"repeatCell":{"range":rng(0,NROW,0,1),"cell":{"userEnteredFormat":{"numberFormat":{"type":"TEXT"}}},"fields":"userEnteredFormat.numberFormat"}})
-    for i in rrrows: reqs.append({"repeatCell":{"range":rng(i,i+1,2,3),"cell":{"userEnteredFormat":{"numberFormat":{"type":"PERCENT","pattern":"0.00%"}}},"fields":"userEnteredFormat.numberFormat"}})
+    for i in rrrows: reqs.append({"repeatCell":{"range":rng(i,i+1,4,5),"cell":{"userEnteredFormat":{"numberFormat":{"type":"PERCENT","pattern":"0.00%"}}},"fields":"userEnteredFormat.numberFormat"}})  # Human RR now col 4 (was 2; +Delivered,+Fail%)
     for i in strows:
         for c in (3,6,9): reqs.append({"repeatCell":{"range":rng(i,i+1,c,c+1),"cell":{"userEnteredFormat":{"numberFormat":{"type":"PERCENT","pattern":"0.0%"}}},"fields":"userEnteredFormat.numberFormat"}})
     for i in sorted(set(data)|set(tot)|set(strows)):
