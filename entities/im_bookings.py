@@ -106,6 +106,50 @@ def run(ctx: RunContext) -> PhaseResult:
             "key/RLS/portal problem? Refusing to replace the live snapshot."
         )
 
+    # --- Regression guard (2026-06-30) -------------------------------------------------
+    # The MIN_EXPECTED_ROWS floor above only catches a near-empty pull. On 2026-06-30 the
+    # portal was transiently reseeded from a stale ~2026-06-02 export mid-migration: rowcount
+    # stayed ~40.7k (ABOVE the floor) but the newest booking date rolled back ~4 weeks, so the
+    # floor missed it and the nightly mirror would have clobbered the good snapshot. Refuse to
+    # replace the live snapshot when the incoming pull REGRESSES versus the current one — either
+    # the newest booking date goes backwards, or rowcount drops materially. Fail LOUD, write
+    # nothing, keep last-known-good (same contract as the floor guard above).
+    def _max_date(rs):
+        best = None
+        for r in rs:
+            v = r.get("date")
+            if not v:
+                continue
+            s = str(v)[:10]
+            if s > "2027-01-01":          # ignore far-future typos so they can't mask a regress
+                continue
+            if best is None or s > best:
+                best = s
+        return best
+
+    prev_rows, prev_max = db.execute(
+        "SELECT count(*), max(try_cast(date AS DATE)) "
+        "FILTER (WHERE try_cast(date AS DATE) < DATE '2027-01-01') "
+        "FROM raw_im_bookings WHERE _source = ?",
+        [SOURCE_TAG],
+    ).fetchone()
+    prev_rows = prev_rows or 0
+    prev_max = prev_max.isoformat() if prev_max else None
+    new_max = _max_date(rows)
+    if prev_rows:  # only guard once a live baseline exists
+        if prev_max and (new_max is None or new_max < prev_max):
+            raise RuntimeError(
+                f"im_bookings pull REGRESSED newest booking date {prev_max} -> {new_max} "
+                f"(rows {prev_rows} -> {len(rows)}) while above the row floor — likely a stale "
+                "or partial portal reseed (cf. 2026-06-30 mid-migration). Refusing to replace "
+                "the live snapshot."
+            )
+        if len(rows) < prev_rows * 0.97:
+            raise RuntimeError(
+                f"im_bookings pull rowcount collapsed {prev_rows} -> {len(rows)} (>3% drop) "
+                "while above the absolute floor. Refusing to replace the live snapshot."
+            )
+
     snapshot_date = datetime.now(timezone.utc).date().isoformat()
     loaded_at = datetime.now(timezone.utc)
     payload = [
