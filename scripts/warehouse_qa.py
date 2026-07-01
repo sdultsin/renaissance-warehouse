@@ -97,6 +97,10 @@ EMPTY_CHECK_TABLES = [
     # is manual/snapshot so these stay put between exports.
     "core.infra_batch_key",
     "core.sending_account_batch",
+    # daily-report centralization mirrors (DDL 1061, 2026-07-01): 0 rows after
+    # the June backfill = truncation/loss, fail loud. (Skipped until built.)
+    "raw_instantly_workspace_analytics_daily",
+    "raw_sendivo_billing_daily",
 ]
 
 # Active-account batch-coverage WARN threshold (infra-batch layer). The infra
