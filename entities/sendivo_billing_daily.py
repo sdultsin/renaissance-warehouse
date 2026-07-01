@@ -19,9 +19,12 @@ Nightly cost: one API call per day in the re-pull window
 delivery-metrics convention; billing for a closed day is stable, the overlap
 just self-heals late corrections). Day-scoped upserts, never a history pull.
 
-Fault tolerance: per-day isolation — one day failing cannot drop the others;
-a failed day is loudly logged and re-raised at the end AFTER the healthy days
-committed (phase 'failed', run 'partial' — never a silent gap).
+Fault tolerance: per-day isolation for FETCH failures — one day's API failure
+cannot drop the others; failed days are loudly logged and re-raised at the end
+AFTER the healthy days committed (phase 'failed', run 'partial' — never a
+silent gap). A DB WRITE failure, by contrast, aborts the remaining days
+immediately (after a clean rollback of the in-flight day): a write failure is
+systemic, and retrying it day-by-day would just repeat it.
 
 Backfill (one-off, NOT on the nightly path; takes the writer flock itself):
     python -m entities.sendivo_billing_daily --start 2026-06-01 --end 2026-07-01
@@ -43,7 +46,18 @@ from sources.sendivo import SendivoClient
 
 logger = logging.getLogger("entities.sendivo_billing_daily")
 
-WINDOW_DAYS = int(os.environ.get("SENDIVO_BILLING_DAILY_DAYS", "7"))
+def _env_int(name: str, default: int) -> int:
+    """Malformed env var degrades to default instead of raising at import
+    (an import-time raise silently skips register())."""
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        logging.getLogger("entities.sendivo_billing_daily").warning(
+            "invalid %s; using default %d", name, default)
+        return default
+
+
+WINDOW_DAYS = _env_int("SENDIVO_BILLING_DAILY_DAYS", 7)
 
 _COLS = [
     "metric_date", "sub_account_id", "location_id", "total_spend",

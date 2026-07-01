@@ -45,7 +45,9 @@ Extra slugs can be added via WAREHOUSE_INSTANTLY_ANALYTICS_EXTRA_SLUGS
 
 Nightly cost is bounded: per workspace 1 ws-daily call + campaign-list pages
 (~100/page) + 1 daily call per campaign (272 campaigns across the roster as of
-2026-07-01) + 1 call per NEW referenced tag id — all day-scoped
+2026-07-01) + 1 call per referenced tag id (re-fetched EVERY run so label renames
+track; bounded to the tens of ids a workspace's campaigns actually reference,
+with the raw_instantly_tag_def cache as the failure fallback) — all day-scoped
 (WAREHOUSE_INSTANTLY_ANALYTICS_DAYS back, default 3). Never a full-history pull.
 
 Backfill (one-off, NOT on the nightly path; takes the writer flock itself):
@@ -58,6 +60,7 @@ import argparse
 import json
 import logging
 import os
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
@@ -69,13 +72,28 @@ from sources.instantly import InstantlyClient, InstantlyError
 
 logger = logging.getLogger("entities.instantly_analytics_daily")
 
+# Instantly tag ids are UUIDs; permissive id-shape guard (hex + dashes).
+_TAG_ID_RE = re.compile(r"[0-9a-fA-F-]{8,64}")
+
 # How many days back the nightly re-pulls (overlap covers timezone edges +
 # late-restated replies/opps on recent days). Day-scoped by design.
-WINDOW_DAYS = int(os.environ.get("WAREHOUSE_INSTANTLY_ANALYTICS_DAYS", "3"))
+def _env_int(name: str, default: int) -> int:
+    """A malformed env var must degrade to the default, not raise at import —
+    an import-time raise makes discover_and_register silently skip registration
+    (only the 2-day biz SLA would catch the dead feed days later)."""
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        logging.getLogger("entities.instantly_analytics_daily").warning(
+            "invalid %s; using default %d", name, default)
+        return default
+
+
+WINDOW_DAYS = _env_int("WAREHOUSE_INSTANTLY_ANALYTICS_DAYS", 3)
 # Fan-out concurrency WITHIN one workspace (fetch only; all DB writes are on the
 # caller thread). 6 matches the proven render_daily (8) / build_campaign_daily (8)
 # range while staying gentle — Instantly is fragile right now.
-FANOUT_WORKERS = int(os.environ.get("WAREHOUSE_INSTANTLY_ANALYTICS_WORKERS", "6"))
+FANOUT_WORKERS = _env_int("WAREHOUSE_INSTANTLY_ANALYTICS_WORKERS", 6)
 
 _METRIC_FIELDS = [
     "sent", "contacted", "new_leads_contacted", "opened", "unique_opened",
@@ -178,7 +196,9 @@ def _fetch_workspace(client: InstantlyClient, slug: str, start: str, end: str) -
             "id": c.get("id"),
             "name": c.get("name"),
             "status": c.get("status"),
-            "email_tag_list": c.get("email_tag_list") or [],
+            # keep only string tag ids: a stray None/list element would make
+            # sorted()/dict lookups raise and fail the whole workspace (NIT-1)
+            "email_tag_list": [t for t in (c.get("email_tag_list") or []) if isinstance(t, str)],
         }
         for c in client.list_campaigns()
         if c.get("id")
@@ -224,9 +244,26 @@ def _resolve_tags(conn, client: InstantlyClient, tag_ids: set[str], now, run_id)
     ) if tag_ids else {}
     unresolved = 0
     for tid in sorted(tag_ids):
+        if not _TAG_ID_RE.fullmatch(tid):
+            # API-sourced id goes into the URL path — refuse anything that isn't
+            # id-shaped rather than interpolating it (NIT-2).
+            logger.warning("tag id %r is not id-shaped; skipping fetch", tid[:80])
+            if cached.get(tid):
+                labels[tid] = cached[tid]
+            else:
+                unresolved += 1
+            continue
         try:
             t = client._get(f"/custom-tags/{tid}")  # noqa: SLF001
             label = t.get("label") or t.get("name")
+            if label is None:
+                # a "successful" fetch with no label must not clobber a good
+                # cached label with NULL (MINOR-2)
+                label = cached.get(tid)
+            if label is None:
+                unresolved += 1
+                logger.warning("tag %s fetch returned no label and no cache exists", tid)
+                continue
             labels[tid] = label
             conn.execute(
                 _TAG_UPSERT,
@@ -234,7 +271,7 @@ def _resolve_tags(conn, client: InstantlyClient, tag_ids: set[str], now, run_id)
                  t.get("timestamp_created"), t.get("timestamp_updated"), now, run_id],
             )
         except Exception as exc:  # noqa: BLE001 — fall back to cache, never fail the ws
-            if tid in cached and cached[tid]:
+            if cached.get(tid):
                 labels[tid] = cached[tid]
                 logger.warning("tag %s fetch failed (%s); using cached label %r", tid, exc, cached[tid])
             else:
@@ -298,14 +335,17 @@ def _write_workspace(conn, slug: str, fetched: dict, labels: dict[str, str],
 
 def _ingest(conn, credentials, run_id: str, start: str, end: str,
             slugs: list[str] | None = None) -> PhaseResult:
+    if date.fromisoformat(end) < date.fromisoformat(start):
+        raise ValueError(f"end {end} before start {start} — inverted window would "
+                         "silently ingest nothing (MINOR-3)")
     keys = credentials.instantly_workspace_keys()
     roster = [s for s, _ in workspace_roster()]
     required = slugs if slugs is not None else roster
-    extra = [
+    extra = list(dict.fromkeys(
         s.strip() for s in
         os.environ.get("WAREHOUSE_INSTANTLY_ANALYTICS_EXTRA_SLUGS", "").split(",")
         if s.strip() and s.strip() not in required
-    ] if slugs is None else []
+    )) if slugs is None else []
 
     now = datetime.now(timezone.utc)
     total_ws = total_camp = 0

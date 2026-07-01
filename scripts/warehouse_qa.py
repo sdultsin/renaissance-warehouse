@@ -100,6 +100,7 @@ EMPTY_CHECK_TABLES = [
     # daily-report centralization mirrors (DDL 1061, 2026-07-01): 0 rows after
     # the June backfill = truncation/loss, fail loud. (Skipped until built.)
     "raw_instantly_workspace_analytics_daily",
+    "raw_instantly_campaign_analytics_daily",
     "raw_sendivo_billing_daily",
 ]
 
@@ -186,6 +187,48 @@ def run_checks(con) -> tuple[list[str], list[str]]:
         n = con.execute(f"SELECT count(*) FROM {tbl}").fetchone()[0]
         if n == 0:
             fails.append(f"EMPTY: decision table `{tbl}` returned 0 rows")
+
+    # 3a. Instantly analytics-daily ingest holes (PR #150 review MAJOR-1).
+    # Per-campaign fetch failures are isolated by design (a failed campaign keeps
+    # last-good rows), and transient failures self-heal via the 3-day re-pull
+    # window. But a workspace that shows failures across the 2 MOST RECENT runs
+    # is past self-healing: it is accumulating a permanent hole in
+    # raw_instantly_campaign_analytics_daily while every table-level freshness
+    # signal stays green (other campaigns keep max(date) current). That breaks
+    # the 100%-or-flagged rule silently — so consume the flag here and FAIL.
+    try:
+        if _exists(con, "raw_instantly_analytics_sync_status"):
+            repeat = con.execute(
+                """
+                WITH last2 AS (
+                    SELECT _run_id, max(_loaded_at) AS last_at
+                    FROM raw_instantly_analytics_sync_status
+                    GROUP BY _run_id ORDER BY last_at DESC LIMIT 2
+                ),
+                bad AS (
+                    SELECT s.workspace_slug,
+                           (s.status = 'failed' OR COALESCE(s.campaigns_failed, 0) > 0) AS is_bad,
+                           COALESCE(s.campaigns_failed, 0) AS n_failed, s.status
+                    FROM raw_instantly_analytics_sync_status s
+                    JOIN last2 l ON l._run_id = s._run_id
+                )
+                SELECT workspace_slug,
+                       max(n_failed) AS max_failed,
+                       string_agg(DISTINCT status, ',') AS statuses
+                FROM bad
+                GROUP BY workspace_slug
+                HAVING count(*) >= 2 AND bool_and(is_bad)
+                """
+            ).fetchall()
+            for slug, max_failed, statuses in repeat:
+                fails.append(
+                    f"INGEST-HOLE: instantly analytics_daily `{slug}` degraded in BOTH of the "
+                    f"2 most recent runs (status={statuses}, campaigns_failed up to {max_failed}) — "
+                    f"per-campaign/day rows are accumulating a permanent gap in "
+                    f"raw_instantly_campaign_analytics_daily (3-day self-heal window about to lapse). "
+                    f"Check raw_instantly_analytics_sync_status for the errors.")
+    except Exception as exc:  # noqa: BLE001
+        warns.append(f"INGEST-HOLE check errored ({exc})")
 
     # 3b. Infra-batch coverage. WARN if too large a share of currently-active
     # inboxes have no batch mapping (the manual infra snapshot has gone stale).
