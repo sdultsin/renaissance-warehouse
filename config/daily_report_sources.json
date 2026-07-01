@@ -97,6 +97,34 @@
       "reconciliation": null
     },
 
+    "sms_kpi_to_opp": {
+      "section": "§2b SMS KPI-to-opp (texts per opportunity, by workspace)",
+      "what": "SMS sent / opps / sent-per-opp per workspace (Ren1 Funding / Ren2 Pre-IPO / Ren3 webform). Sent/opp is THE number gating the web-form-vs-meeting economics decision (Ido: '~5,000 and web apps don't pencil'). opp = positive-intent inbound SMS reply = the CURRENT-native notion derived.sms_reply_is_positive_qwen.is_positive (do NOT build a bespoke reclassifier [Sam 2026-06-30]).",
+      "source_type": "warehouse",
+      "warehouse": {
+        "relation": "main.v_sms_workspace_funnel",
+        "opp_definition": "opps = count of Qwen positive-intent replies (derived.sms_reply_is_positive_qwen where is_positive) attributed to the sub-account by reply number; sent from v_sms_campaign_performance; sent_per_opp = sent/opps.",
+        "key_columns": ["metric_date", "sub_account", "sent", "opps"],
+        "window": "TRAILING fully-classified window: the most-recent up-to-7 SMS-reply days (<= report date) where >= 90% of that day's human (non-opt-out) inbound carries a Qwen verdict. Same-day/recent opps are NOT shown live.",
+        "why_trailing": "The Qwen classifier runs on a ~2-3d lag (cron /root/sms-sentiment-bi/incremental.sh @09:00 UTC -> seed -> loaded next nightly), so the render day's opps are unclassified at 10pm-ET report time. A partial classification massively UNDER-counts opps (06-29 read 4% classified) and would poison the KPI-to-opp gate — hence a fully-classified trailing window + 'pending' for same-day (feedback_partial_data_100pct_or_wipe_20260614). This is why §2 historically carried NO opp column.",
+        "ren3_caveat": "Ren3 (webform) sends route via the AIM API and are NOT in the campaign feed -> its funnel sent is 0 -> Sent/opp renders '—' (opps still shown)."
+      },
+      "reconciliation": null
+    },
+
+    "sms_campaign_leaderboard": {
+      "section": "§2c SMS campaign leaderboard (sent -> opp)",
+      "what": "Per-campaign sent -> opp ranking over the same trailing fully-classified window, best converters first (lowest sent/opp), campaigns with >= 10 in-window opps.",
+      "source_type": "warehouse",
+      "warehouse": {
+        "relation": "main.v_sms_campaign_performance (sent) + derived.sms_reply_is_positive_qwen (opps) attributed via main.v_sendivo_number_campaign (our_number -> campaign)",
+        "grain": "CAMPAIGN — reply number -> campaign is 1:1 (0 numbers map to >1 campaign) and maps 100% of opps.",
+        "grain_cap": "Per-BLAST/script attribution is NOT clean: the outbound-message log (main.v_sendivo_outbound_message) ties only ~22% of positive opps to a blast (log is sparse — only ~30% of reply phones covered, recent days only). The real per-script fix needs Sendivo blast_id on the won-export — BLOCKED on Larry/Sendivo (said yes, untested). Do NOT ship a per-blast leaderboard until that lands. Also do NOT ship SMS sent/MEETING per-campaign — SMS meetings carry NULL campaign_id (only ~7 mapped) -> fake infinite/zero KPIs.",
+        "key_columns": ["campaign_id", "campaign_name", "sub_account_name", "sent", "opps"]
+      },
+      "reconciliation": null
+    },
+
     "whatsapp": {
       "section": "§2 WhatsApp (ISKRA)",
       "what": "WhatsApp sent / delivered / failed / replies (ISKRA 'sent' runs ~30-37% failed; KPI = delivered/mtg).",
