@@ -423,6 +423,97 @@ def get_sms_wa():
     rows.append(("WhatsApp (ISKRA)", ws_, wd, wf, wr, wa_mtg))
     return rows
 
+# ---------------------------- §2b/§2c SMS KPI-to-opp + campaign leaderboard ----------------------------
+# The SMS "opp" (opportunity) = a POSITIVE-INTENT inbound reply, per the CURRENT-native notion:
+# derived.sms_reply_is_positive_qwen.is_positive (the Qwen classifier already shipped as the warehouse's
+# SMS positive-reply signal — we surface it, we do NOT build a bespoke reclassifier [Sam 2026-06-30]).
+# WHY these are a TRAILING WINDOW, not the render-day: that classifier runs on a ~2-3d LAG (cron
+# /root/sms-sentiment-bi/incremental.sh @09:00 UTC -> appended to the seed -> loaded on the next
+# nightly), so the render day's opps are NOT yet classified at 10pm-ET report time. A partial
+# classification massively UNDER-counts opps (06-29 read 4% classified -> ~10x too few opps), which
+# would poison the KPI-to-opp gate — so we show the number ONLY over days that are ~fully classified
+# and mark same-day as pending (the 100%-or-wipe rule, feedback_partial_data_100pct_or_wipe_20260614).
+# This is exactly why §2 historically carried NO opp column ("excluded as inaccurate").
+_sms_win_cache = {}
+def sms_complete_window(max_days=7, cov_threshold=0.9, lookback_days=21):
+    """The most-recent up-to-`max_days` SMS-reply days (<= DAILY) that are ~fully classified
+    (>= cov_threshold of that day's human/non-opt-out inbound replies carry a Qwen verdict). Returns
+    a sorted list of ISO date strings (may be []). Memoized; fail-soft -> []."""
+    if "w" in _sms_win_cache:
+        return _sms_win_cache["w"]
+    dates = []
+    try:
+        rows = wq(f"""
+          WITH cov AS (
+            SELECT CAST(received_at AS DATE) d, count(*) FILTER (WHERE NOT is_opt_out) human
+            FROM main.raw_sendivo_inbound
+            WHERE received_at >= (DATE '{DAILY}' - INTERVAL {int(lookback_days)} DAY)
+              AND CAST(received_at AS DATE) <= DATE '{DAILY}'
+            GROUP BY 1),
+          cls AS (
+            SELECT CAST(received_at AS DATE) d, count(*) classified
+            FROM derived.sms_reply_is_positive_qwen GROUP BY 1)
+          SELECT cov.d
+          FROM cov LEFT JOIN cls USING (d)
+          WHERE cov.human > 0 AND COALESCE(cls.classified, 0) >= {float(cov_threshold)} * cov.human
+          ORDER BY cov.d DESC LIMIT {int(max_days)}""")
+        dates = sorted(str(r[0])[:10] for r in rows)
+    except Exception as e:
+        print(f"WARN sms_complete_window failed: {e}", file=sys.stderr)
+    _sms_win_cache["w"] = dates
+    return dates
+
+def _sms_win_inlist():
+    dates = sms_complete_window()
+    return dates, (", ".join("DATE '%s'" % d for d in dates) if dates else "")
+
+def get_sms_kpi_to_opp():
+    """Per-workspace SMS sent / opps / sent-per-opp over the trailing fully-classified window, from the
+    current-native funnel main.v_sms_workspace_funnel (opps = Qwen positive replies attributed to the
+    sub-account by reply number). sent_per_opp = the KPI-to-opp gate. Ren3 (webform) sends route via the
+    AIM API and are NOT in the campaign feed -> its funnel sent is 0 -> Sent/opp shows '—' (opps still shown)."""
+    dates, inlist = _sms_win_inlist()
+    if not inlist:
+        return {"dates": [], "rows": []}
+    rows = wq(f"""SELECT sub_account, sum(sent), sum(opps)
+                  FROM main.v_sms_workspace_funnel
+                  WHERE metric_date IN ({inlist}) AND sub_account LIKE 'Renaissance%'
+                  GROUP BY 1 ORDER BY 1""")
+    return {"dates": dates, "rows": [(r[0], int(r[1] or 0), int(r[2] or 0)) for r in rows]}
+
+def get_sms_leaderboard(limit=30, min_opps=10, min_sent=20000):
+    """Per-CAMPAIGN sent -> opp leaderboard over the trailing fully-classified window. Sends from
+    main.v_sms_campaign_performance; opps = Qwen positive replies attributed to the campaign by reply
+    number -> campaign (main.v_sendivo_number_campaign is 1:1 our_number->campaign, 100% of opps map).
+    CAMPAIGN grain, NOT per-blast: the per-blast outbound-message log ties only ~22% of opps to a blast
+    (blocked on Sendivo blast_id on the won-export — Larry). Ranked best-first (lowest Sent/opp) among
+    campaigns ACTIVELY sending in-window (>= min_sent sent AND >= min_opps opps): the min_sent floor drops
+    campaigns whose in-window opps are replies to OUT-of-window sends (tiny sent -> artefactual ~2 sent/opp)."""
+    dates, inlist = _sms_win_inlist()
+    if not inlist:
+        return {"dates": [], "rows": []}
+    rows = wq(f"""
+      WITH nc AS (
+        SELECT our_number, any_value(campaign_id) campaign_id
+        FROM main.v_sendivo_number_campaign WHERE campaign_id IS NOT NULL GROUP BY 1),
+      opp AS (
+        SELECT nc.campaign_id, count(*) opps
+        FROM derived.sms_reply_is_positive_qwen q
+        JOIN main.raw_sendivo_inbound i ON i.inbound_message_id = q.reply_id
+        JOIN nc ON nc.our_number = ('+' || ltrim(i.our_number, '+'))
+        WHERE q.is_positive AND CAST(i.received_at AS DATE) IN ({inlist})
+        GROUP BY 1),
+      snd AS (
+        SELECT campaign_id, any_value(campaign_name) campaign_name, any_value(sub_account_name) sub_account, sum(sent) sent
+        FROM main.v_sms_campaign_performance WHERE metric_date IN ({inlist}) GROUP BY 1)
+      SELECT COALESCE(snd.sub_account, '(no-send)'), COALESCE(snd.campaign_name, CAST(opp.campaign_id AS VARCHAR)),
+             COALESCE(snd.sent, 0), COALESCE(opp.opps, 0)
+      FROM snd FULL JOIN opp USING (campaign_id)
+      WHERE COALESCE(opp.opps, 0) >= {int(min_opps)} AND COALESCE(snd.sent, 0) >= {int(min_sent)}
+      ORDER BY COALESCE(snd.sent, 0) * 1.0 / NULLIF(opp.opps, 0) ASC NULLS LAST
+      LIMIT {int(limit)}""")
+    return {"dates": dates, "rows": [(r[0], r[1], int(r[2] or 0), int(r[3] or 0)) for r in rows]}
+
 def get_close():
     c = wq(f"""SELECT COUNT(*) dials, COUNT(DISTINCT close_lead_id) leads,
                  COUNT(*) FILTER (WHERE duration_seconds >= 60) connects
@@ -769,6 +860,8 @@ _IMREPLY_FB = ((DAILY, DAILY, DAILY), [(name, 0, None, None, 0, None, None, 0, N
 
 EMAIL_D = _safe("email", get_email, _EMAIL_FB)
 SMS_D = _safe("sms_wa", get_sms_wa, _SMS_FB)
+SMS_KPI_D = _safe("sms_kpi_to_opp", get_sms_kpi_to_opp, {"dates": [], "rows": []})
+SMS_LB_D = _safe("sms_leaderboard", get_sms_leaderboard, {"dates": [], "rows": []})
 CLOSE_D = _safe("close", get_close, _CLOSE_FB)
 SENDING_CENSUS, SENDING_TRUTH = _safe("truth", get_truth, _TRUTH_FB)
 PARTNER_D, PARTNER_D_TOTAL = _safe("partner", get_partner, ([], 0))
@@ -788,6 +881,8 @@ if DRY:
         print("§1b INFRA (sent,opp,human,auto | mtg):"); [print("  ", inf, _ia[inf], "|", _im[inf]) for inf in _ia]
     print("§1 EMAIL:");    [print("  ", x) for x in EMAIL_D]
     print("§2 SMS/WA:");   [print("  ", x) for x in SMS_D]
+    print(f"§2b SMS KPI-to-opp (window {SMS_KPI_D.get('dates')}):"); [print("   ", r, "sent/opp=", (round(r[1]/r[2]) if r[1] and r[2] else '—')) for r in SMS_KPI_D.get("rows", [])]
+    print(f"§2c SMS leaderboard (top {len(SMS_LB_D.get('rows', []))}):"); [print("   ", r, "sent/opp=", (round(r[2]/r[3]) if r[2] and r[3] else '—')) for r in SMS_LB_D.get("rows", [])]
     print("§3 CLOSE:", CLOSE_D)
     print("§4 TRUTH (ws, otd_exp, goog_exp, tot_exp, actual):"); [print("  ", x) for x in SENDING_TRUTH]
     print("§5 PARTNER:", PARTNER_D, "total", PARTNER_D_TOTAL)
@@ -841,6 +936,51 @@ def build_and_write(tab, build_fn):
             ts += sent; td += deliv; thr += reps; tm += m
             if failed is not None: tf += failed; any_fail = True
         ti = add(["TOTAL", ts, td, (f"'{round(100.0*tf/ts)}%" if (any_fail and ts) else "—"), rr(thr, td), tm, kpi(td, tm)]); tot.append(ti); rrrows.append(ti); row_ncol[ti] = W
+    def sms_kpi_table(kpi_d, header_label):
+        # §2b — SMS KPI-to-opp (texts per opportunity) per workspace over the trailing fully-classified
+        # window. opp = Qwen positive-intent reply (current-native). Same-day opps lag ~2-3d -> shown as a
+        # trailing window, NOT the render day (see get_sms_kpi_to_opp / feedback_partial_data_100pct_or_wipe).
+        W = 4
+        LBL = {"Renaissance 1": "Renaissance 1 (Funding SMS)", "Renaissance 2": "Renaissance 2 (Pre-IPO SMS)",
+               "Renaissance 3": "Renaissance 3 (webform SMS)"}
+        si = add([header_label]); sec.append(si); row_ncol[si] = W
+        hr = add(["Workspace", "Sent", "Opps", "Sent/opp"]); th.append(hr); th_ncol[hr] = W
+        d = kpi_d.get("dates") or []
+        if not kpi_d.get("rows"):
+            ni = add(["(pending — no fully-classified SMS-reply day in the trailing window; the Qwen positive-intent classifier lags ~2-3d so same-day opps aren't ready)"]); data.append(ni); row_ncol[ni] = W
+            return
+        ts = topp = 0
+        for ws, sent, opps in kpi_d["rows"]:
+            spo = round(sent / opps) if (opps and sent) else "—"
+            ri = add([LBL.get(ws, ws), sent, opps, spo]); data.append(ri); row_ncol[ri] = W
+            ts += sent; topp += opps
+        tspo = round(ts / topp) if (ts and topp) else "—"
+        ti = add(["TOTAL (SMS)", ts, topp, tspo]); tot.append(ti); row_ncol[ti] = W
+        note = (f"opp = positive-intent inbound reply (Qwen classifier — the current-native SMS opp). "
+                f"Sent/opp = the KPI-to-opp gate (lower = better). Window = {len(d)} fully-classified day(s) "
+                f"{d[0]}..{d[-1]} (≥90% of that day's human replies classified); same-day opps lag ~2-3d so are "
+                f"not shown live. Ren3 webform sends route via the AIM API (not in the campaign feed) -> Sent/opp n/a.")
+        ni = add([note]); data.append(ni); row_ncol[ni] = W
+    def sms_leaderboard_table(lb_d, header_label):
+        # §2c — per-CAMPAIGN sent -> opp leaderboard over the same trailing window. CAMPAIGN grain (not
+        # per-blast): reply number -> campaign is 1:1 and maps 100% of opps; per-blast ties only ~22%
+        # (blocked on Sendivo blast_id on the export — Larry). Best converters first (lowest Sent/opp).
+        W = 5
+        si = add([header_label]); sec.append(si); row_ncol[si] = W
+        hr = add(["Campaign / script", "WS", "Sent", "Opps", "Sent/opp"]); th.append(hr); th_ncol[hr] = W
+        d = lb_d.get("dates") or []
+        if not lb_d.get("rows"):
+            ni = add(["(pending — SMS opp classification not yet available for the trailing window)"]); data.append(ni); row_ncol[ni] = W
+            return
+        for ws, camp, sent, opps in lb_d["rows"]:
+            spo = round(sent / opps) if (opps and sent) else "—"
+            ri = add([(camp or "")[:40], ws, sent, opps, spo]); data.append(ri); row_ncol[ri] = W
+        note = (f"Best converters first (lowest Sent/opp). Actively-sending campaigns only (≥20k sent AND ≥10 opps in-window; "
+                f"the floor drops campaigns whose in-window opps are replies to out-of-window sends). Window {d[0]}..{d[-1]}. "
+                f"opp = Qwen positive reply; attribution: reply number → campaign (100% of opps mapped). Per-BLAST/script "
+                f"attribution needs Sendivo blast_id on the export (pending Larry) — the outbound-message log currently ties "
+                f"only ~22% of opps to a blast, so this ranks at CAMPAIGN grain.")
+        ni = add([note]); data.append(ni); row_ncol[ni] = W
     def truth_table(header_label):
         W = 6
         si = add([header_label]); sec.append(si); row_ncol[si] = W
@@ -919,7 +1059,7 @@ def build_and_write(tab, build_fn):
             data.append(ni); row_ncol[ni] = W
     build_fn(dict(add=add, email_table=email_table, sms_wa_table=sms_wa_table, truth_table=truth_table,
                   close_table=close_table, partner_table=partner_table, imreply_table=imreply_table,
-                  infra_table=infra_table))
+                  infra_table=infra_table, sms_kpi_table=sms_kpi_table, sms_leaderboard_table=sms_leaderboard_table))
 
     meta = api("GET", BASE + "?fields=sheets(properties(sheetId,title),bandedRanges(bandedRangeId),conditionalFormats)")
     sh = next((s for s in meta["sheets"] if s["properties"]["title"] == tab), None)
@@ -1025,6 +1165,8 @@ def daily(ctx):
     ctx["email_table"](EMAIL_D, f"1 · EMAIL + WARM LEADS — by workspace · day {DAILY}"); add()
     ctx["infra_table"](INFRA_D, f"1b · EMAIL KPIs BY INFRASTRUCTURE — Google (reseller) / OTD / Milkbox · all workspaces · day {DAILY}"); add()
     ctx["sms_wa_table"](SMS_D, f"2 · SMS + WHATSAPP — by channel · day {DAILY}"); add()
+    ctx["sms_kpi_table"](SMS_KPI_D, "2b · SMS KPI-to-opp — texts per opportunity by workspace · trailing fully-classified window (the web-form-economics gate)"); add()
+    ctx["sms_leaderboard_table"](SMS_LB_D, "2c · SMS campaign leaderboard — sent → opp · trailing fully-classified window"); add()
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
     ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (active capacity) vs actual sends · no-lag · census {SENDING_CENSUS}"); add()
     ctx["partner_table"](PARTNER_D, PARTNER_D_TOTAL, f"5 · BOOKINGS BY PARTNER · day {DAILY}"); add()
