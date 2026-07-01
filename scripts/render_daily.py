@@ -544,9 +544,33 @@ def get_truth():
     return census, out
 
 def get_partner():
-    book = consolidated_bookings(DAILY)
-    cnt = collections.Counter(b["partner"] for b in book)
-    pr = sorted(cnt.items(), key=lambda x: -x[1])
+    """§5 BOOKINGS BY PARTNER — the PARTNER lens on the day's bookings. It must mirror the portal's
+    "BY PARTNER" view (what Grace reads), which is OFFER-AGNOSTIC: it counts Funding AND Pre-IPO
+    (the Collins/Summit desks) alike. consolidated_bookings() is offer='Funding'-locked (correct for
+    the §1/§2/§3 Funding MEETING columns), so §5 must NOT reuse it — doing so silently dropped the
+    Pre-IPO partners and rendered 132 vs the portal's 160 on 2026-06-30 (Collins 18 + Summit 10).
+    The Pre-IPO desks are ALSO shown as a channel lens (§2 Ren2 / "SMS IPO" via preipo_meetings); that
+    is a different cut of the same meetings, not additive to a single total, so no double-count — same
+    as the June-26 gold §5, which carried Collins/Summit. Dedup one meeting per person WITHIN each
+    partner (email|phone), matching the report's one-person-one-meeting convention (and the portal, when
+    a day has no cross-partner dupes); do NOT cross-dedup across partners (Pre-IPO desks are additive).
+    Null-key rows (no email AND no phone) drop out, same as consolidated_bookings."""
+    try:
+        rows = wq(f"""
+          SELECT coalesce(nullif(trim(partner), ''), '(unknown)')         AS partner,
+                 count(DISTINCT lower(coalesce(nullif(email, ''), phone))) AS n
+          FROM main.raw_im_bookings
+          WHERE _snapshot_date=(SELECT max(_snapshot_date) FROM main.raw_im_bookings)
+            AND substr(coalesce(date, ''), 1, 10)=DATE '{DAILY}'::VARCHAR
+            AND (deleted_at IS NULL OR deleted_at='' OR lower(deleted_at)='null')
+          GROUP BY 1""")
+    except Exception as e:
+        print(f"WARN get_partner im_bookings read failed {DAILY}: {e}", file=sys.stderr)
+        return [], 0
+    # int(n) in the filter too: the query API can serialize a BIGINT count as a JSON string, and
+    # a truthy "0" would otherwise leak a spurious '(unknown) 0' row. Secondary sort key = partner
+    # name so tied counts render deterministically (wq row order is arbitrary).
+    pr = sorted(((p, int(n)) for p, n in rows if int(n)), key=lambda x: (-x[1], x[0]))
     return pr, sum(n for _, n in pr)
 
 def get_im_reply():
