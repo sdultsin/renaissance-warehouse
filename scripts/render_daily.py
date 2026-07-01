@@ -94,6 +94,22 @@ def ws_alias(raw):
             or "sendivo" in t):                                    return "Renaissance 1 (Instantly)"
     return None
 
+# Campaign operator-tag -> workspace override [Sam 2026-06-30]. The booking desk sometimes mis-picks
+# the free-text `workspace` (a (SAMUEL) booking was landing under "Renaissance 1"), but the campaign
+# name carries the operator tag, which for a 1:1 operator is AUTHORITATIVE and overrides the label.
+# SAMUEL runs ONLY Funding 1 -> any (SAMUEL) campaign is Funding 1, whatever the workspace field says.
+# NB: "SAM" is deliberately NOT here — SAM runs BOTH F2 and F4 (campaigns "F2 - … (SAM)" / "F4 - … (SAM)"),
+# so it's ambiguous and MUST be resolved by the workspace label; and matching "SAMUEL" (not "SAM") can't
+# false-hit a "(SAM)" campaign. Add another operator only once confirmed unique to one workspace.
+_CAMPAIGN_OPERATOR = {"SAMUEL": "Funding 1 (Samuel)"}
+def ws_from_booking(workspace, campaign):
+    """Resolve a booking's workspace: a 1:1 operator tag in the campaign wins, else the free-text label."""
+    c = (campaign or "").upper()
+    for op, ws in _CAMPAIGN_OPERATOR.items():
+        if op in c:
+            return ws
+    return ws_alias(workspace)
+
 # ---------------------------- warehouse read API ----------------------------
 WH_BASE = "https://renaissance-droplet.tailae5c80.ts.net"
 def _wh_token():
@@ -224,6 +240,7 @@ def consolidated_bookings(date):
                    max(channel)   AS channel,
                    max(workspace) AS workspace,
                    max(partner)   AS partner,
+                   max(campaign)  AS campaign,
                    max(email)     AS email,
                    max(phone)     AS phone
             FROM main.raw_im_bookings
@@ -234,13 +251,13 @@ def consolidated_bookings(date):
               AND offer='Funding' AND substr(coalesce(date,''),1,10)=DATE '{date}'::VARCHAR
               AND (deleted_at IS NULL OR deleted_at='' OR lower(deleted_at)='null')
             GROUP BY 1)
-          SELECT k, channel, workspace, partner, email, phone FROM b WHERE k IS NOT NULL AND k<>''""")
+          SELECT k, channel, workspace, partner, campaign, email, phone FROM b WHERE k IS NOT NULL AND k<>''""")
     except Exception as e:
         print(f"WARN consolidated_bookings im_bookings read failed {date}: {e}", file=sys.stderr)
         _book_cache[date] = []; return []
     out = []
-    for k, channel, workspace, partner, email, phone in rows:
-        out.append({"channel": channel or "", "ws": ws_alias(workspace),
+    for k, channel, workspace, partner, campaign, email, phone in rows:
+        out.append({"channel": channel or "", "ws": ws_from_booking(workspace, campaign),
                     "partner": (partner or "").strip() or "(unknown)", "key": k,
                     "email": (email or "").lower(), "phone": phone or ""})
     if not out:
