@@ -525,8 +525,9 @@ def get_close():
 
 def get_truth():
     """§4 no-lag: Expected = active accounts' configured daily_limit by ws x infra (per-workspace
-    LAST-GOOD census, Outlook excluded); Actual = Instantly daily per workspace (== §1 sent). Per-infra
-    actual is not cheaply measurable same-day (30k+ accounts/ws) so Actual is shown at workspace Total.
+    LAST-GOOD census, Outlook excluded); Actual = Instantly daily per workspace (== §1 sent), now ALSO
+    split OTD-vs-Google via account-level sends x the same last-good census (Outlook excluded from the
+    split, so Actual OTD + Actual Google == Actual total minus Outlook; unmapped surfaced loud).
 
     Expected uses each workspace's most-recent census that actually CONTAINS it, not the global
     max(census_date). The hourly /accounts poller drops a whole workspace when Instantly 500s on its
@@ -558,11 +559,52 @@ def get_truth():
               AND lifecycle='Active' AND infra IN ('OTD','Google')
             GROUP BY 1""")}
     inst = instantly_daily(DAILY)
+    # Per-infra ACTUAL split (OTD vs Google) — account-level sends (core.sending_account_daily) mapped
+    # to infra via EACH workspace's last-good census (the SAME per-workspace carry-forward used above
+    # for Expected), so a partial global census never mis-buckets a workspace: e.g. F1/renaissance-4
+    # vanished from the 2026-07-01 census, so its report-day sends map via its 06-29 label -> 0 unmapped.
+    # sending_account_daily reconciles to instantly_daily per workspace (both Instantly-sourced), so
+    # OTD + Google + Outlook == Actual(total); Outlook is real send volume but EXCLUDED from truth
+    # (mirrors the Expected side), so the Actual OTD/Google columns sum to Actual(total) minus Outlook.
+    # A sender on an account with no label row falls to 'unmapped' and is surfaced LOUD (never a silent
+    # zero) — currently 0 for every reporting workspace on the last-good census.
+    asplit = {}   # slug -> (otd_actual, google_actual, unmapped_actual)
+    for r in wq(f"""
+        WITH ws_cens AS (   -- IDENTICAL census pick to Expected's `used`/`cap` (max census that
+                            -- actually HOLDS Active OTD/Google rows), so the split and Expected always
+                            -- read a workspace at the SAME census — never diverge on a partial-capture
+                            -- day whose newest census holds only Outlook/retired rows.
+              SELECT workspace_slug, max(census_date) AS cd FROM core.account_label
+              WHERE workspace_slug IN ({SLUGS_SQL})
+                AND lifecycle='Active' AND infra IN ('OTD','Google') GROUP BY 1),
+             lbl AS (   -- ALL infra rows (incl. Outlook) at that census, to bucket every sender
+              SELECT al.workspace_slug, al.email, al.infra
+              FROM core.account_label al JOIN ws_cens w
+                ON w.workspace_slug=al.workspace_slug AND w.cd=al.census_date),
+             sad AS (
+              SELECT workspace_slug, account_id, sum(actual_sends) AS a
+              FROM core.sending_account_daily
+              WHERE date=DATE '{DAILY}' AND workspace_slug IN ({SLUGS_SQL})
+              GROUP BY 1,2)
+        SELECT s.workspace_slug,
+               sum(CASE WHEN l.infra='OTD'    THEN s.a ELSE 0 END),
+               sum(CASE WHEN l.infra='Google' THEN s.a ELSE 0 END),
+               sum(CASE WHEN l.infra IS NULL  THEN s.a ELSE 0 END)
+        FROM sad s LEFT JOIN lbl l
+          ON l.workspace_slug=s.workspace_slug AND l.email=s.account_id
+        GROUP BY 1"""):
+        asplit[r[0]] = (float(r[1] or 0), float(r[2] or 0), float(r[3] or 0))
+    unmapped_ws = sorted({slug for slug, v in asplit.items() if v[2] > 0})
+    if unmapped_ws:
+        print(f"WARN §4 per-infra actual: sends on accounts absent from their last-good census "
+              f"(unmapped>0) for {unmapped_ws} — Actual OTD/Google understate those rows until the "
+              f"census heals (Actual total is unaffected).", file=sys.stderr)
     out = []
     for slug, name in WS:
         otd = cap.get((slug, "OTD"), 0.0); goog = cap.get((slug, "Google"), 0.0)
         actual = inst.get(slug, (0, 0))[0]
-        out.append((name, otd, goog, otd + goog, actual))
+        otd_a, goog_a, _un = asplit.get(slug, (0.0, 0.0, 0.0))
+        out.append((name, otd, goog, otd + goog, actual, otd_a, goog_a))
     census = max(used.values()) if used else None
     stale = sorted({str(d) for d in used.values() if d != census})
     if stale:
@@ -924,7 +966,7 @@ def _safe(label, fn, default):
 _EMAIL_FB = [(name, 0, 0, 0, 0, 0, 0) for _, name in WS]
 _SMS_FB = [("Renaissance 1 (SMS)", 0, 0, None, 0, 0), ("Renaissance 2 (SMS · Pre-IPO)", 0, 0, None, 0, 0), ("Renaissance 3 (SMS · webform)", 0, 0, None, 0, 0), ("WhatsApp (ISKRA)", 0, 0, 0, 0, 0)]
 _CLOSE_FB = {"dials": 0, "leads": 0, "connects": 0, "meetings": 0}
-_TRUTH_FB = (None, [(name, 0, 0, 0, 0) for _, name in WS])
+_TRUTH_FB = (None, [(name, 0, 0, 0, 0, 0, 0) for _, name in WS])
 _IMREPLY_FB = ((DAILY, DAILY, DAILY), [(name, 0, None, None, 0, None, None, 0, None, None) for _, name in WS])
 
 EMAIL_D = _safe("email", get_email, _EMAIL_FB)
@@ -953,7 +995,7 @@ if DRY:
     print(f"§2b SMS KPI-to-opp (window {SMS_KPI_D.get('dates')}):"); [print("   ", r, "sent/opp=", (round(r[1]/r[2]) if r[1] and r[2] else '—')) for r in SMS_KPI_D.get("rows", [])]
     print(f"§2c SMS leaderboard (top {len(SMS_LB_D.get('rows', []))}):"); [print("   ", r, "sent/opp=", (round(r[2]/r[3]) if r[2] and r[3] else '—')) for r in SMS_LB_D.get("rows", [])]
     print("§3 CLOSE:", CLOSE_D)
-    print("§4 TRUTH (ws, otd_exp, goog_exp, tot_exp, actual):"); [print("  ", x) for x in SENDING_TRUTH]
+    print("§4 TRUTH (ws, otd_exp, goog_exp, tot_exp, actual, otd_actual, goog_actual):"); [print("  ", x) for x in SENDING_TRUTH]
     print("§5 PARTNER:", PARTNER_D, "total", PARTNER_D_TOTAL)
     print("§6 IM-REPLY (ws, d_n,d_med,d_avg, w_n,w_med,w_avg, m_n,m_med,m_avg):"); [print("  ", x) for x in IMREPLY_D]
     print("Pre-IPO meetings:", PREIPO_MTG)
@@ -1051,16 +1093,19 @@ def build_and_write(tab, build_fn):
                 f"only ~22% of opps to a blast, so this ranks at CAMPAIGN grain.")
         ni = add([note]); data.append(ni); row_ncol[ni] = W
     def truth_table(header_label):
-        W = 6
+        W = 8
         si = add([header_label]); sec.append(si); row_ncol[si] = W
-        hr = add(["Workspace", "Expected OTD", "Expected Google", "Expected Total", "Actual (sent)", "Fulfillment %"])
+        hr = add(["Workspace", "Expected OTD", "Expected Google", "Expected Total",
+                  "Actual OTD", "Actual Google", "Actual (total)", "Fulfillment %"])
         th.append(hr); th_ncol[hr] = W
-        oe = ge = te = ta = 0
-        for ws, otd, goog, totexp, actual in SENDING_TRUTH:
-            ri = add([ws, round(otd), round(goog), round(totexp), actual, fpct(actual, totexp)])
+        oe = ge = te = ta = oa = ga = 0
+        for ws, otd, goog, totexp, actual, otd_a, goog_a in SENDING_TRUTH:
+            ri = add([ws, round(otd), round(goog), round(totexp),
+                      round(otd_a), round(goog_a), actual, fpct(actual, totexp)])
             data.append(ri); strows.append(ri); row_ncol[ri] = W
-            oe += otd; ge += goog; te += totexp; ta += actual
-        sti = add(["TOTAL", round(oe), round(ge), round(te), ta, fpct(ta, te)]); tot.append(sti); strows.append(sti); row_ncol[sti] = W
+            oe += otd; ge += goog; te += totexp; ta += actual; oa += otd_a; ga += goog_a
+        sti = add(["TOTAL", round(oe), round(ge), round(te),
+                   round(oa), round(ga), ta, fpct(ta, te)]); tot.append(sti); strows.append(sti); row_ncol[sti] = W
     def close_table(close, label):
         W = 2
         si = add([label]); sec.append(si); row_ncol[si] = W
@@ -1153,8 +1198,8 @@ def build_and_write(tab, build_fn):
     reqs.append({"repeatCell": {"range": rng(0, NROW, 0, 1), "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}}, "fields": "userEnteredFormat.numberFormat"}})
     for i in rrrows:  # §2 Human RR (col 4) as a percent
         reqs.append({"repeatCell": {"range": rng(i, i + 1, 4, 5), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}}}, "fields": "userEnteredFormat.numberFormat"}})
-    for i in strows:
-        reqs.append({"repeatCell": {"range": rng(i, i + 1, 5, 6), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}}, "fields": "userEnteredFormat.numberFormat"}})
+    for i in strows:  # §4 Fulfillment % — col 7 (shifted +2 by the Actual OTD/Google columns)
+        reqs.append({"repeatCell": {"range": rng(i, i + 1, 7, 8), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}}, "fields": "userEnteredFormat.numberFormat"}})
     for i in infrows:  # §1b RR / Human RR / Positive RR (cols 2,3,4) as percents
         for c in (2, 3, 4):
             reqs.append({"repeatCell": {"range": rng(i, i + 1, c, c + 1), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}}}, "fields": "userEnteredFormat.numberFormat"}})
@@ -1173,10 +1218,10 @@ def build_and_write(tab, build_fn):
     LAST_COL = max([th_ncol.get(i, NCOL) for i in th] + [NCOL])
     for c in range(1, LAST_COL):
         reqs.append({"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": c, "endIndex": c + 1}, "properties": {"pixelSize": 120}, "fields": "pixelSize"}})
-    # red gradient on §4 fulfillment % (col 5)
+    # red gradient on §4 fulfillment % (col 7 — shifted +2 by the Actual OTD/Google columns)
     if len(strows) >= 2:
         d0 = strows[0]; d1 = strows[-2] + 1
-        reqs.append({"addConditionalFormatRule": {"index": 0, "rule": {"ranges": [{"sheetId": sid, "startRowIndex": d0, "endRowIndex": d1, "startColumnIndex": 5, "endColumnIndex": 6}], "gradientRule": {"minpoint": {"color": rgb(0.91, 0.40, 0.40), "type": "NUMBER", "value": "0"}, "maxpoint": {"color": rgb(1, 1, 1), "type": "NUMBER", "value": "1"}}}}})
+        reqs.append({"addConditionalFormatRule": {"index": 0, "rule": {"ranges": [{"sheetId": sid, "startRowIndex": d0, "endRowIndex": d1, "startColumnIndex": 7, "endColumnIndex": 8}], "gradientRule": {"minpoint": {"color": rgb(0.91, 0.40, 0.40), "type": "NUMBER", "value": "0"}, "maxpoint": {"color": rgb(1, 1, 1), "type": "NUMBER", "value": "1"}}}}})
     api("POST", BASE + ":batchUpdate", {"requests": reqs})
     merge_reqs = [{"mergeCells": {"range": {"sheetId": sid, "startRowIndex": r0, "endRowIndex": r0 + 1, "startColumnIndex": c0, "endColumnIndex": c1}, "mergeType": "MERGE_ALL"}} for r0, c0, c1 in merges]
     if merge_reqs: api("POST", BASE + ":batchUpdate", {"requests": merge_reqs})
@@ -1237,7 +1282,7 @@ def daily(ctx):
     ctx["sms_kpi_table"](SMS_KPI_D, "2b · SMS KPI-to-opp — texts per opportunity by workspace · trailing fully-classified window (the web-form-economics gate)"); add()
     ctx["sms_leaderboard_table"](SMS_LB_D, "2c · SMS campaign leaderboard — sent → opp · trailing fully-classified window"); add()
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
-    ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (active capacity) vs actual sends · no-lag · census {SENDING_CENSUS}"); add()
+    ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (active capacity) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · no-lag · census {SENDING_CENSUS}"); add()
     ctx["partner_table"](PARTNER_D, PARTNER_D_TOTAL, f"5 · BOOKINGS BY PARTNER · day {DAILY}"); add()
     ctx["imreply_table"](IMREPLY_D, f"6 · IM REPLY-TIME — first-reply latency by workspace · 12-8pm ET Mon-Fri arrivals only · daily / weekly / monthly · email (SMS+WA pending) · Grace & Sam")
 
