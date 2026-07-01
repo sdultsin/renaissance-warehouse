@@ -54,9 +54,10 @@ def stage_parquet(canon: str, wsid: str, rows: dict, now):
     m = duckdb.connect()
     m.execute("CREATE TABLE s (email VARCHAR, workspace_slug VARCHAR, workspace_uuid VARCHAR, "
               "tags VARCHAR, tags_arr VARCHAR[], n_tags INTEGER, _loaded_at TIMESTAMPTZ, _run_id VARCHAR)")
-    m.executemany("INSERT INTO s VALUES (?,?,?,?,?,?,?,?)",
-                  [(e, canon, wsid, " | ".join(labs), labs, len(labs), now, RUN_ID)
-                   for e, labs in rows.items()])
+    if rows:  # executemany([]) raises InvalidInputException — a zero-tag workspace stages an empty parquet
+        m.executemany("INSERT INTO s VALUES (?,?,?,?,?,?,?,?)",
+                      [(e, canon, wsid, " | ".join(labs), labs, len(labs), now, RUN_ID)
+                       for e, labs in rows.items()])
     m.execute(f"COPY s TO '{path}' (FORMAT PARQUET)")
     m.close()
     return path
