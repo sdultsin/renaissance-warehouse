@@ -524,23 +524,51 @@ def get_close():
     return {"dials": d, "leads": l, "connects": cn, "meetings": m}
 
 def get_truth():
-    """§4 no-lag: Expected = active accounts' configured daily_limit by ws x infra (latest census,
-    Outlook excluded); Actual = Instantly daily per workspace (== §1 sent). Per-infra actual is not
-    cheaply measurable same-day (30k+ accounts/ws) so Actual is shown at workspace Total only."""
+    """§4 no-lag: Expected = active accounts' configured daily_limit by ws x infra (per-workspace
+    LAST-GOOD census, Outlook excluded); Actual = Instantly daily per workspace (== §1 sent). Per-infra
+    actual is not cheaply measurable same-day (30k+ accounts/ws) so Actual is shown at workspace Total.
+
+    Expected uses each workspace's most-recent census that actually CONTAINS it, not the global
+    max(census_date). The hourly /accounts poller drops a whole workspace when Instantly 500s on its
+    /accounts page (e.g. Funding 1 / renaissance-4, 2026-07-01: fleet 460k->319k, F1 vanished), which
+    would zero that workspace's Expected while Actual keeps flowing -> §4 rendered F1 Expected 0 vs
+    Actual 529,670. This read-side carry-forward mirrors the build-side fix in entities/account_census.py
+    (#133) so §4 Expected never collapses to 0 for a still-active workspace on a partial census. When the
+    census is complete this is identical to the old global-max behavior (per-ws max == global max for
+    every workspace), so it is a strict safety net, not a behavior change on healthy days."""
+    # `elig` = eligible (Active OTD/Google) capacity per (ws, census, infra); the filter lives INSIDE
+    # the CTE so a workspace's "last-good" census is the latest one that actually HAS Active OTD/Google
+    # rows — not merely the latest census it appears in (which could hold only Outlook/retired rows and
+    # re-zero Expected after the outer filter).
     cap = {(r[0], r[1]): float(r[2] or 0) for r in wq(
-        f"""SELECT workspace_slug, infra, sum(daily_limit)
+        f"""WITH elig AS (
+              SELECT workspace_slug, census_date, infra, sum(daily_limit) AS cap
+              FROM core.account_label
+              WHERE workspace_slug IN ({SLUGS_SQL})
+                AND lifecycle='Active' AND infra IN ('OTD','Google')
+              GROUP BY 1,2,3),
+            ws_latest AS (SELECT workspace_slug, max(census_date) AS census_date FROM elig GROUP BY 1)
+            SELECT e.workspace_slug, e.infra, e.cap
+            FROM elig e JOIN ws_latest USING (workspace_slug, census_date)""")}
+    # Per-workspace census actually used (same eligibility as `cap`) — for the header + carry-forward flag.
+    used = {r[0]: r[1] for r in wq(
+        f"""SELECT workspace_slug, max(census_date)
             FROM core.account_label
-            WHERE census_date=(SELECT max(census_date) FROM core.account_label)
+            WHERE workspace_slug IN ({SLUGS_SQL})
               AND lifecycle='Active' AND infra IN ('OTD','Google')
-              AND workspace_slug IN ({SLUGS_SQL}) GROUP BY 1,2""")}
+            GROUP BY 1""")}
     inst = instantly_daily(DAILY)
     out = []
     for slug, name in WS:
         otd = cap.get((slug, "OTD"), 0.0); goog = cap.get((slug, "Google"), 0.0)
         actual = inst.get(slug, (0, 0))[0]
         out.append((name, otd, goog, otd + goog, actual))
-    cr = wq("SELECT max(census_date) FROM core.account_label")
-    census = cr[0][0] if cr and cr[0] else None
+    census = max(used.values()) if used else None
+    stale = sorted({str(d) for d in used.values() if d != census})
+    if stale:
+        print(f"WARN §4 census carry-forward: some workspaces on older census {stale} "
+              f"(latest={census}) — Instantly /accounts poll dropped them; using last-good.",
+              file=sys.stderr)
     return census, out
 
 def get_partner():
