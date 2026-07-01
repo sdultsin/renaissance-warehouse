@@ -1,0 +1,28 @@
+-- 99_call_opp_phone_source.sql  [2026-07-01 phone-truth instrumentation, item 5]
+-- @gate: add
+-- Depends on 47 (raw_comms_call_opportunity exists via 16/47 comms mirror DDL)
+-- Adds `phone_source` to raw_comms_call_opportunity — the comms worker now stamps
+-- WHERE each opp's phone came from at enrichment time
+-- (signature | mirror | reuse | prospeo | leadmagic | findymail | aleads), so
+-- vendor QA / connect-rate-by-source analysis (the PHONE-FLOWS-INVESTIGATION Q3
+-- outcome test) becomes exact instead of number-match inference.
+--
+-- Source column: comms.call_opportunity.phone_source (comms migration
+-- 036_phone_source.sql, applied 2026-07-01). The comms_mirror entity builds its
+-- SELECT from PRAGMA table_info of this raw table, so adding the column here is
+-- ALL the sync needs — it is picked up on the next nightly run.
+--
+-- VALUE SET (comms-source-of-truth; stamped by the worker, NOT derived here):
+--   signature | mirror | reuse | prospeo | leadmagic | findymail | aleads
+-- NOTE: this is DISTINCT from the lead-mirror enriched_phone_source tag
+-- convention ('comms_<provider>' / 'reply_signature_v2') — do not conflate the
+-- two vocabularies; Q3-style analysis joins on THIS column for opp-grain truth.
+--
+-- ORDERING: apply comms migration 036 (pg side) BEFORE this ALTER — the comms
+-- mirror sync SELECTs every raw column from pg.comms.call_opportunity, so the
+-- raw column existing without the pg column would break the nightly SELECT.
+--
+-- Additive + idempotent. Number-agnostic (IF NOT EXISTS); the schema-moderator
+-- may renumber to the next free DDL index.
+
+ALTER TABLE raw_comms_call_opportunity ADD COLUMN IF NOT EXISTS phone_source VARCHAR;
