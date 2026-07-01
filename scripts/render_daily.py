@@ -481,13 +481,14 @@ def get_sms_kpi_to_opp():
                   GROUP BY 1 ORDER BY 1""")
     return {"dates": dates, "rows": [(r[0], int(r[1] or 0), int(r[2] or 0)) for r in rows]}
 
-def get_sms_leaderboard(limit=30, min_opps=10):
+def get_sms_leaderboard(limit=30, min_opps=10, min_sent=20000):
     """Per-CAMPAIGN sent -> opp leaderboard over the trailing fully-classified window. Sends from
     main.v_sms_campaign_performance; opps = Qwen positive replies attributed to the campaign by reply
     number -> campaign (main.v_sendivo_number_campaign is 1:1 our_number->campaign, 100% of opps map).
     CAMPAIGN grain, NOT per-blast: the per-blast outbound-message log ties only ~22% of opps to a blast
-    (blocked on Sendivo blast_id on the won-export — Larry). Ranked best-first (lowest Sent/opp), campaigns
-    with >= min_opps in-window opps."""
+    (blocked on Sendivo blast_id on the won-export — Larry). Ranked best-first (lowest Sent/opp) among
+    campaigns ACTIVELY sending in-window (>= min_sent sent AND >= min_opps opps): the min_sent floor drops
+    campaigns whose in-window opps are replies to OUT-of-window sends (tiny sent -> artefactual ~2 sent/opp)."""
     dates, inlist = _sms_win_inlist()
     if not inlist:
         return {"dates": [], "rows": []}
@@ -508,7 +509,7 @@ def get_sms_leaderboard(limit=30, min_opps=10):
       SELECT COALESCE(snd.sub_account, '(no-send)'), COALESCE(snd.campaign_name, CAST(opp.campaign_id AS VARCHAR)),
              COALESCE(snd.sent, 0), COALESCE(opp.opps, 0)
       FROM snd FULL JOIN opp USING (campaign_id)
-      WHERE COALESCE(opp.opps, 0) >= {int(min_opps)} AND COALESCE(snd.sent, 0) > 0
+      WHERE COALESCE(opp.opps, 0) >= {int(min_opps)} AND COALESCE(snd.sent, 0) >= {int(min_sent)}
       ORDER BY COALESCE(snd.sent, 0) * 1.0 / NULLIF(opp.opps, 0) ASC NULLS LAST
       LIMIT {int(limit)}""")
     return {"dates": dates, "rows": [(r[0], r[1], int(r[2] or 0), int(r[3] or 0)) for r in rows]}
@@ -974,7 +975,8 @@ def build_and_write(tab, build_fn):
         for ws, camp, sent, opps in lb_d["rows"]:
             spo = round(sent / opps) if (opps and sent) else "—"
             ri = add([(camp or "")[:40], ws, sent, opps, spo]); data.append(ri); row_ncol[ri] = W
-        note = (f"Best converters first (lowest Sent/opp). Campaigns with ≥10 in-window opps; window {d[0]}..{d[-1]}. "
+        note = (f"Best converters first (lowest Sent/opp). Actively-sending campaigns only (≥20k sent AND ≥10 opps in-window; "
+                f"the floor drops campaigns whose in-window opps are replies to out-of-window sends). Window {d[0]}..{d[-1]}. "
                 f"opp = Qwen positive reply; attribution: reply number → campaign (100% of opps mapped). Per-BLAST/script "
                 f"attribution needs Sendivo blast_id on the export (pending Larry) — the outbound-message log currently ties "
                 f"only ~22% of opps to a blast, so this ranks at CAMPAIGN grain.")
