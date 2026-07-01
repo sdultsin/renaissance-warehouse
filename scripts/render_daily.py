@@ -546,51 +546,50 @@ def get_truth():
     on 2026-07-01: Expected 101,465 while 43,455 of it sat on 2,897 connection_error accounts (the
     cancelled-reseller wave); true connected capacity 57,950 matched the 56,472 actually sent. The
     excluded capacity is printed loud (NOTE below) so a disconnect wave is visible, not silently
-    dropped. status is COALESCEd to 1 on a missing/NULL census row so a census gap can only ever
-    OVERSTATE Expected (fail toward the old behavior), never silently shrink it."""
+    dropped. The status filter applies to the capacity SUM only — the census PICK stays presence-based
+    (any Active OTD/Google label rows), so the #133 carry-forward still engages only on a genuine
+    poller drop, while a workspace whose entire fleet disconnects correctly shows Expected 0 at its
+    true newest census (a state event, not a capture gap) with the full wave in the NOTE. The census
+    join is LEFT + COALESCE(status,1)=1, so a missing/NULL census status counts as connected — a data
+    gap can only ever OVERSTATE Expected (fail toward the old behavior), never silently shrink it."""
     # `elig` = eligible (Active OTD/Google) capacity per (ws, census, infra); the filter lives INSIDE
     # the CTE so a workspace's "last-good" census is the latest one that actually HAS Active OTD/Google
     # rows — not merely the latest census it appears in (which could hold only Outlook/retired rows and
     # re-zero Expected after the outer filter).
     cap = {(r[0], r[1]): float(r[2] or 0) for r in wq(
         f"""WITH elig AS (
-              SELECT al.workspace_slug, al.census_date, al.infra, sum(al.daily_limit) AS cap
-              FROM core.account_label al JOIN core.account_census c
+              SELECT al.workspace_slug, al.census_date, al.infra,
+                     sum(CASE WHEN COALESCE(c.status, 1) = 1 THEN al.daily_limit END) AS cap
+              FROM core.account_label al LEFT JOIN core.account_census c
                 ON c.census_date=al.census_date AND c.workspace_slug=al.workspace_slug
                AND c.email=al.email
               WHERE al.workspace_slug IN ({SLUGS_SQL})
                 AND al.lifecycle='Active' AND al.infra IN ('OTD','Google')
-                AND COALESCE(c.status, 1) = 1
               GROUP BY 1,2,3),
             ws_latest AS (SELECT workspace_slug, max(census_date) AS census_date FROM elig GROUP BY 1)
             SELECT e.workspace_slug, e.infra, e.cap
             FROM elig e JOIN ws_latest USING (workspace_slug, census_date)""")}
-    # Per-workspace census actually used (same eligibility as `cap`) — for the header + carry-forward flag.
+    # Per-workspace census actually used (same PRESENCE-based pick as `cap`'s ws_latest) — for the
+    # header + carry-forward flag.
     used = {r[0]: r[1] for r in wq(
-        f"""SELECT al.workspace_slug, max(al.census_date)
-            FROM core.account_label al JOIN core.account_census c
-              ON c.census_date=al.census_date AND c.workspace_slug=al.workspace_slug
-             AND c.email=al.email
-            WHERE al.workspace_slug IN ({SLUGS_SQL})
-              AND al.lifecycle='Active' AND al.infra IN ('OTD','Google')
-              AND COALESCE(c.status, 1) = 1
+        f"""SELECT workspace_slug, max(census_date)
+            FROM core.account_label
+            WHERE workspace_slug IN ({SLUGS_SQL})
+              AND lifecycle='Active' AND infra IN ('OTD','Google')
             GROUP BY 1""")}
-    # Capacity EXCLUDED by the status=1 predicate at each workspace's used census — printed loud so a
+    # Capacity EXCLUDED by the status=1 sum filter at each workspace's used census — printed loud so a
     # disconnect wave shows up in the log as phantom capacity, not as a silent Expected shrink.
     disc = {r[0]: float(r[1] or 0) for r in wq(
         f"""WITH ws_latest AS (
-              SELECT al.workspace_slug, max(al.census_date) AS census_date
-              FROM core.account_label al JOIN core.account_census c
-                ON c.census_date=al.census_date AND c.workspace_slug=al.workspace_slug
-               AND c.email=al.email
-              WHERE al.workspace_slug IN ({SLUGS_SQL})
-                AND al.lifecycle='Active' AND al.infra IN ('OTD','Google')
-                AND COALESCE(c.status, 1) = 1
+              SELECT workspace_slug, max(census_date) AS census_date
+              FROM core.account_label
+              WHERE workspace_slug IN ({SLUGS_SQL})
+                AND lifecycle='Active' AND infra IN ('OTD','Google')
               GROUP BY 1)
             SELECT al.workspace_slug, sum(al.daily_limit)
             FROM core.account_label al
             JOIN ws_latest w ON w.workspace_slug=al.workspace_slug AND w.census_date=al.census_date
-            JOIN core.account_census c
+            LEFT JOIN core.account_census c
               ON c.census_date=al.census_date AND c.workspace_slug=al.workspace_slug
              AND c.email=al.email
             WHERE al.lifecycle='Active' AND al.infra IN ('OTD','Google')
@@ -614,17 +613,13 @@ def get_truth():
     asplit = {}   # slug -> (otd_actual, google_actual, unmapped_actual)
     for r in wq(f"""
         WITH ws_cens AS (   -- IDENTICAL census pick to Expected's `used`/`cap` (max census that
-                            -- actually HOLDS CONNECTED Active OTD/Google rows), so the split and
-                            -- Expected always read a workspace at the SAME census — never diverge on a
-                            -- partial-capture day whose newest census holds only Outlook/retired rows.
-              SELECT al.workspace_slug, max(al.census_date) AS cd
-              FROM core.account_label al JOIN core.account_census cc
-                ON cc.census_date=al.census_date AND cc.workspace_slug=al.workspace_slug
-               AND cc.email=al.email
-              WHERE al.workspace_slug IN ({SLUGS_SQL})
-                AND al.lifecycle='Active' AND al.infra IN ('OTD','Google')
-                AND COALESCE(cc.status, 1) = 1
-              GROUP BY 1),
+                            -- actually HOLDS Active OTD/Google rows — PRESENCE-based, status-blind),
+                            -- so the split and Expected always read a workspace at the SAME census —
+                            -- never diverge on a partial-capture day whose newest census holds only
+                            -- Outlook/retired rows.
+              SELECT workspace_slug, max(census_date) AS cd FROM core.account_label
+              WHERE workspace_slug IN ({SLUGS_SQL})
+                AND lifecycle='Active' AND infra IN ('OTD','Google') GROUP BY 1),
              lbl AS (   -- ALL infra rows (incl. Outlook) at that census, to bucket every sender
               SELECT al.workspace_slug, al.email, al.infra
               FROM core.account_label al JOIN ws_cens w
