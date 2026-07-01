@@ -81,11 +81,14 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     fi
 
     # Signature->phone self-enrichment (sig-phone Phase 2): extract US phones from
-    # tonight's new inbound reply signatures -> public.leads enriched_phone sidecar.
+    # tonight's new inbound reply signatures -> LEAD MIRROR enriched_phone sidecar
+    # (mirror.leads_current; repointed from retired Supabase public.leads 2026-07-01,
+    # [[project_phone_truth_lead_mirror_20260701]] — the mirror is THE phone master).
     # Watermarked + restartable; fail-loud to Slack inside the script itself. Runs
-    # AFTER compaction (warehouse lock free; read-only, coexists with publishes).
+    # AFTER compaction (warehouse lock free; the mirror write serializes on the
+    # mirror's own .writer.lock inside apply_phone_mirror_updates.sh).
     # Spec: Renaissance handoffs/2026-06-12-signature-phone-warehouse-native.md
-    echo "signature-phone sync (reply signatures -> leads.enriched_phone)" | tee -a "$LOG_FILE"
+    echo "signature-phone sync (reply signatures -> lead-mirror enriched_phone)" | tee -a "$LOG_FILE"
     "$PYTHON" scripts/signature_phone_sync.py 2>&1 | tee -a "$LOG_FILE" \
         || echo "WARN signature_phone_sync_failed (continuing)" | tee -a "$LOG_FILE"
 
