@@ -536,21 +536,27 @@ def get_truth():
     (#133) so §4 Expected never collapses to 0 for a still-active workspace on a partial census. When the
     census is complete this is identical to the old global-max behavior (per-ws max == global max for
     every workspace), so it is a strict safety net, not a behavior change on healthy days."""
+    # `elig` = eligible (Active OTD/Google) capacity per (ws, census, infra); the filter lives INSIDE
+    # the CTE so a workspace's "last-good" census is the latest one that actually HAS Active OTD/Google
+    # rows — not merely the latest census it appears in (which could hold only Outlook/retired rows and
+    # re-zero Expected after the outer filter).
     cap = {(r[0], r[1]): float(r[2] or 0) for r in wq(
-        f"""WITH ws_latest AS (
-              SELECT workspace_slug, max(census_date) AS census_date
+        f"""WITH elig AS (
+              SELECT workspace_slug, census_date, infra, sum(daily_limit) AS cap
               FROM core.account_label
               WHERE workspace_slug IN ({SLUGS_SQL})
-              GROUP BY 1)
-            SELECT al.workspace_slug, al.infra, sum(al.daily_limit)
-            FROM core.account_label al
-            JOIN ws_latest USING (workspace_slug, census_date)
-            WHERE al.lifecycle='Active' AND al.infra IN ('OTD','Google')
-            GROUP BY 1,2""")}
-    # Per-workspace census actually used (for the header + a stale-carry-forward flag).
+                AND lifecycle='Active' AND infra IN ('OTD','Google')
+              GROUP BY 1,2,3),
+            ws_latest AS (SELECT workspace_slug, max(census_date) AS census_date FROM elig GROUP BY 1)
+            SELECT e.workspace_slug, e.infra, e.cap
+            FROM elig e JOIN ws_latest USING (workspace_slug, census_date)""")}
+    # Per-workspace census actually used (same eligibility as `cap`) — for the header + carry-forward flag.
     used = {r[0]: r[1] for r in wq(
         f"""SELECT workspace_slug, max(census_date)
-            FROM core.account_label WHERE workspace_slug IN ({SLUGS_SQL}) GROUP BY 1""")}
+            FROM core.account_label
+            WHERE workspace_slug IN ({SLUGS_SQL})
+              AND lifecycle='Active' AND infra IN ('OTD','Google')
+            GROUP BY 1""")}
     inst = instantly_daily(DAILY)
     out = []
     for slug, name in WS:
