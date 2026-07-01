@@ -21,7 +21,16 @@ REAL_DB="$(readlink -f "$DB")"
 VOL_DIR="$(dirname "$REAL_DB")"
 NEW="$VOL_DIR/warehouse_compact_new.duckdb"
 EXP="$VOL_DIR/compact_export_tmp"
-LOCK=/root/core/.warehouse_write.lock
+# THE writer lock — the SAME file every Python writer flocks via core/db.py
+# (_WRITE_LOCK_PATH). The old private marker file (/root/core/.warehouse_write.lock)
+# was invisible to real writers in BOTH directions: compaction could export+swap while
+# a writer held the real flock (a writer opening the old inode mid-swap would commit
+# into the pre-swap backup = silently lost data), and writers happily wrote during a
+# compaction. Fixed 2026-07-01: hold the REAL flock for the whole export->swap window
+# so writers queue behind compaction (core/db.py waits up to WAREHOUSE_WRITE_LOCK_WAIT_S,
+# default 1800s) and compaction waits briefly for a straggler writer instead of aborting.
+LOCK="${WAREHOUSE_WRITE_LOCK_PATH:-/root/core/warehouse.write.lock}"
+LOCK_WAIT_S="${COMPACT_LOCK_WAIT_S:-900}"
 THRESHOLD_BYTES=$((18*1024*1024*1024))   # only compact when primary > 18GB
 DUCKDB=$(command -v duckdb)
 # Bound DuckDB memory so the EXPORT/IMPORT cannot OOM the 16GB box (root cause of the 2026-06-12
@@ -49,9 +58,18 @@ if [ "$SIZE" -lt "$THRESHOLD_BYTES" ]; then
   LOG "primary $((SIZE/1024/1024/1024))GB < threshold 18GB — skip (no-op)"; exit 0
 fi
 
-if [ -f "$LOCK" ]; then LOG "ABORT: warehouse write-lock held: $(cat "$LOCK")"; exit 1; fi
-echo "compact $(date -u +%FT%TZ)" > "$LOCK"
-trap 'rm -f "$LOCK"' EXIT
+# Acquire the real writer flock (fd 9, held until this process exits). flock -w waits
+# out a straggler writer (e.g. a tag backfill's final upsert) instead of hard-aborting.
+# The pid marker matches core/db.py's format so its stale-marker clearing recognizes us.
+exec 9>>"$LOCK"
+if ! flock -w "$LOCK_WAIT_S" 9; then
+  LOG "ABORT: warehouse writer flock still held after ${LOCK_WAIT_S}s: $(cat "$LOCK" 2>/dev/null)"; exit 1
+fi
+printf 'pid=%s acquired_by=compact_warehouse.sh\n' "$$" > "$LOCK"
+# blank the marker on exit (fd 9 is still open during the trap, so the flock is still
+# ours — no other writer can have written its marker yet). The flock itself releases
+# when the process exits and fd 9 closes.
+trap ': > "$LOCK"' EXIT
 
 FREE=$(df --output=avail -B1 "$VOL_DIR" | tail -1)   # free space on the VOLUME where staging lives
 if [ "$FREE" -lt $((SIZE*FREE_FACTOR_NUM/10)) ]; then
@@ -59,6 +77,13 @@ if [ "$FREE" -lt $((SIZE*FREE_FACTOR_NUM/10)) ]; then
 fi
 
 rm -rf "$NEW" "$EXP"
+
+# Fold any pending WAL into the primary while we hold the writer flock (quiesced), so the
+# export sees a fully-checkpointed file and the swap never leaves a stale warehouse.duckdb.wal
+# behind for the FRESH file to replay (a WAL from the old file replayed into the compacted one
+# would corrupt it). Best-effort: a -readonly export replays WAL in-memory anyway; the swap
+# below also defensively moves any residual .wal aside with the backup.
+"$DUCKDB" "$DB" "CHECKPOINT" >/dev/null 2>&1 || LOG "WARN: pre-export CHECKPOINT failed (continuing; residual WAL is moved aside at swap)"
 
 # exact-count manifest query over every base table (dynamic UNION ALL)
 CQ=$("$DUCKDB" -readonly "$DB" -noheader -list \
@@ -69,7 +94,14 @@ VIEWS_OLD=$("$DUCKDB" -readonly "$DB" -noheader -list "SELECT count(*) FROM duck
 LOG "exporting primary ($((SIZE/1024/1024/1024))GB, memory_limit=$MEMLIMIT)..."
 "$DUCKDB" -readonly "$DB" "$SET_PRELUDE EXPORT DATABASE '$EXP' (FORMAT PARQUET)" || { LOG "ABORT: export failed"; rm -rf "$EXP"; exit 1; }
 LOG "importing into fresh DB (memory_limit=$MEMLIMIT)..."
-"$DUCKDB" "$NEW" "$SET_PRELUDE IMPORT DATABASE '$EXP'" || { LOG "ABORT: import failed"; rm -rf "$EXP" "$NEW"; exit 1; }
+# NOT `IMPORT DATABASE`: that replays schema.sql top-to-bottom and dies on the first
+# view-on-view forward reference (EXPORT does not topologically sort views — this aborted
+# the 2026-07-01 compaction with "Table with name v_inbox_overview does not exist").
+# compact_import.py replays schema.sql MULTI-PASS (deferred statements retry once their
+# dependencies exist) then load.sql, and fails LOUD listing any unresolvable statement.
+SCRIPT_DIR_SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python3 "$SCRIPT_DIR_SELF/compact_import.py" "$EXP" "$NEW" "$MEMLIMIT" "$TMPDIR" \
+  || { LOG "ABORT: import failed"; rm -rf "$EXP" "$NEW"; exit 1; }
 
 "$DUCKDB" -readonly "$NEW" -csv "$CQ ORDER BY t" > /tmp/compact_post.csv 2>/dev/null
 VIEWS_NEW=$("$DUCKDB" -readonly "$NEW" -noheader -list "SELECT count(*) FROM duckdb_views() WHERE NOT internal")
@@ -92,13 +124,17 @@ BK="$VOL_DIR/warehouse.precompact-$(date -u +%Y%m%d-%H%M%S).duckdb"
 # Check each mv explicitly (no `set -e`): a failed backup-mv must ABORT, not fall through to a
 # false "SWAP OK" on the still-original DB. mv2 failure rolls the backup back into place.
 mv "$REAL_DB" "$BK" || { LOG "ABORT: backup mv failed — original untouched"; rm -rf "$EXP" "$NEW"; exit 5; }
-mv "$NEW" "$REAL_DB" || { LOG "ABORT: swap-in mv failed — restoring backup"; mv "$BK" "$REAL_DB"; rm -rf "$EXP"; exit 6; }
+# a residual WAL belongs to the OLD file: move it WITH the backup so the fresh DB can
+# never replay it (we hold the writer flock, so no live writer owns it).
+[ -f "$REAL_DB.wal" ] && mv "$REAL_DB.wal" "$BK.wal"
+mv "$NEW" "$REAL_DB" || { LOG "ABORT: swap-in mv failed — restoring backup"; mv "$BK" "$REAL_DB"; [ -f "$BK.wal" ] && mv "$BK.wal" "$REAL_DB.wal"; rm -rf "$EXP"; exit 6; }
 if ! "$DUCKDB" -readonly "$DB" "SELECT 1" >/dev/null 2>&1; then
   LOG "ABORT: swapped DB unreadable — ROLLING BACK"; rm -f "$REAL_DB"; mv "$BK" "$REAL_DB"; rm -rf "$EXP"; exit 4
 fi
 NEWSIZE=$(stat -c%s "$REAL_DB")
 LOG "SWAP OK: $((SIZE/1024/1024/1024))GB -> $((NEWSIZE/1024/1024/1024))GB freed $(((SIZE-NEWSIZE)/1024/1024/1024))GB. pre-swap backup: $BK"
 rm -rf "$EXP"
-# keep the dated pre-swap backup one cycle; prune older ones (keep newest 1)
+# keep the dated pre-swap backup one cycle; prune older ones (keep newest 1, + its .wal)
 ls -1t "$VOL_DIR"/warehouse.precompact-*.duckdb 2>/dev/null | tail -n +2 | xargs -r rm -f
+ls -1t "$VOL_DIR"/warehouse.precompact-*.duckdb.wal 2>/dev/null | tail -n +2 | xargs -r rm -f
 exit 0

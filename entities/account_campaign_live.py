@@ -109,18 +109,33 @@ def run_account_campaign_live_ingest(ctx: RunContext) -> PhaseResult:
                     rows.append((email, canon_slug, workspace_id,
                                  len(camp_ids), len(active_ids), " | ".join(names), now, ctx.run_id))
 
+                # Stage the workspace in a temp table, then swap it in with TWO set-based
+                # statements. The old per-row INSERT loop (~100k+ autocommit transactions/
+                # night) was a large chunk of this 90-minute ingest and a writer-DB bloat
+                # source (tiny transactions churn row groups). Temp tables are not
+                # WAL-logged, so the executemany staging costs no bloat.
+                ctx.db.execute(
+                    "CREATE OR REPLACE TEMP TABLE _acl_batch ("
+                    "account_email VARCHAR, workspace_slug VARCHAR, workspace_uuid VARCHAR, "
+                    "n_campaigns INTEGER, n_active_campaigns INTEGER, campaigns VARCHAR, "
+                    "_loaded_at TIMESTAMPTZ, _run_id VARCHAR)"
+                )
+                if rows:
+                    ctx.db.executemany(
+                        "INSERT INTO _acl_batch VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        [list(r) for r in rows],
+                    )
                 ctx.db.execute(
                     "DELETE FROM core.account_campaign_live WHERE workspace_uuid = ?",
                     [workspace_id],
                 )
-                for r in rows:
-                    ctx.db.execute(
-                        "INSERT INTO core.account_campaign_live "
-                        "(account_email, workspace_slug, workspace_uuid, n_campaigns, "
-                        " n_active_campaigns, campaigns, _loaded_at, _run_id) "
-                        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT DO NOTHING",
-                        list(r),
-                    )
+                ctx.db.execute(
+                    "INSERT INTO core.account_campaign_live "
+                    "(account_email, workspace_slug, workspace_uuid, n_campaigns, "
+                    " n_active_campaigns, campaigns, _loaded_at, _run_id) "
+                    "SELECT * FROM _acl_batch ON CONFLICT DO NOTHING"
+                )
+                ctx.db.execute("DROP TABLE IF EXISTS _acl_batch")
                 total_inboxes += len(rows)
                 workspaces_done.append(slug)
                 logger.info("account_campaign_live %s (slug=%s): %d inboxes in campaigns across %d campaigns",
