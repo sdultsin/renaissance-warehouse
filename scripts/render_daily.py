@@ -6,24 +6,30 @@ workspace's number can never disagree section-to-section (the class of bug that 
 "§1 Samuel 513k vs §4 150k"). See handoffs/2026-06-30-BUILD-daily-report-full-automation-and-im-reply-time.md
 and deliverables/2026-06-29-daily-report-10pm-sync/RENDERER-SPEC.md.
 
-Canonical sources (verified 2026-06-30):
+Canonical sources (verified 2026-06-30; booking cutover 2026-06-30):
  §1 Email sent + opps  -> Instantly API /campaigns/analytics/daily per workspace (memoized; the SAME
                           object feeds §4 Actual, so §1 sent and §4 Actual are literally one fetch).
- §1 meetings/cheap-reg -> consolidated booking sheet (channel+workspace) + im_bookings.lead_type.
- §2 SMS sent           -> sendivo billing_report.sms_fees.quantity (12720=Ren1, 13922=Ren2, 14603=webform).
+ ALL meetings (§1/§2/§3/§5) -> the portal `raw_im_bookings` (offer='Funding', latest snapshot, deduped
+                          email|phone) — THE post-cutover booking source. The Funding-Form 'Data' sheet
+                          was frozen/retired after 2026-06-29 (0 rows for 06-30), which silently zeroed
+                          every meeting column; im_bookings is the live portal writer (Darcy's form).
+                          channel -> §1 Email / §2 SMS+WhatsApp / §3 Call; workspace -> §1 by-workspace
+                          (ws_alias); partner -> §5; lead_type -> §1 cheap/regular split.
+ §2 SMS sent           -> sendivo billing_report.sms_fees.quantity (12720=Ren1, 13922=Ren2, 14603=Ren3 webform).
  §2 SMS replies (human)-> raw_sendivo_inbound non-opt-out.
- §2 WhatsApp           -> v_sms_dash_wa_daily (sent/delivered/failed/replies); meetings -> booking sheet.
+ §2 WhatsApp           -> v_sms_dash_wa_daily (sent/delivered/failed/replies); meetings -> im_bookings.
  §3 Close             -> core.call (dials/leads/connects @>=60s, ET day) — Close API SoR, under-captures.
  §4 Sending truth      -> Expected = active accounts' configured daily_limit by infra (core.account_label,
                           latest census, no lag); Actual = Instantly daily per workspace (== §1 sent).
- §5 Bookings/partner   -> consolidated booking sheet partner.
+ §5 Bookings/partner   -> im_bookings partner.
  §6 IM reply-time      -> core.email_message (native, fresh): first prospect reply (ue_type 2) -> first
                           our reply (ue_type 3) per thread; median/avg per workspace daily/weekly/monthly.
+ (§1b EMAIL-KPIs-BY-INFRA was removed 2026-06-30 per Sam — layout now matches the June-26 gold tab.)
 
 Usage:  render_daily.py 2026-06-29 ["Jun 29"]      (tab name defaults to "%b %-d" = "Jun 29")
         render_daily.py 2026-06-29 --dry            (print the data, do not write the sheet)
 """
-import json, os, sys, datetime, urllib.request, urllib.parse, collections, concurrent.futures
+import json, os, sys, datetime, urllib.request, urllib.parse, collections
 
 # ---------- repo imports (box: run via .venv/bin/python from REPO_DIR) ----------
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -33,11 +39,6 @@ try:
 except Exception as _e:  # dry/off-box fallback: external fetchers degrade, warehouse still works
     _CREDS = None
     print(f"WARN: credentials unavailable ({_e}); Instantly/sendivo sections will be empty", file=sys.stderr)
-try:
-    from sources.instantly import InstantlyClient   # §1b infra KPIs (campaign-grain + tag map)
-except Exception as _e:
-    InstantlyClient = None
-    print(f"WARN: InstantlyClient import failed ({_e}); §1b infra section will be empty", file=sys.stderr)
 
 # Canonical source-per-metric REGISTRY (config/daily_report_sources.json). The renderer resolves its
 # human-managed / drift-prone sources (Pre-IPO desks, booking sheet, sendivo subs, workspace roster)
@@ -196,45 +197,55 @@ def gget(sid, rng):
     req = urllib.request.Request(url, headers={"Authorization": f"Bearer {_gtok()}"})
     return json.load(urllib.request.urlopen(req, timeout=60)).get("values", [])
 
-# consolidated booking sheet (Channel + Workspace + Partner per booking; portal-fed) — FROM registry
-BOOKINGS_SID, BOOKINGS_TAB = REG.bookings_sheet()
 def _date_variants(d):
-    # booking sheets are human/automation-touched — tolerate every format we've seen so a rendering
-    # change can't silently zero the meeting columns (M4): "Jun 29, 2026", "June 29, 2026",
-    # "2026-06-29", "6/29/2026", "06/29/2026".
+    # Pre-IPO desk sheets are human/automation-touched — tolerate every format we've seen so a rendering
+    # change can't silently zero a desk (M4): "Jun 29, 2026", "June 29, 2026", "2026-06-29",
+    # "6/29/2026", "06/29/2026".
     return {d.strftime("%b %-d, %Y"), d.strftime("%B %-d, %Y"), d.isoformat(),
             d.strftime("%-m/%-d/%Y"), d.strftime("%m/%d/%Y")}
+
+# Booking source (Channel + Workspace + Partner per booking) = the portal `raw_im_bookings` [cutover
+# 2026-06-30]. Feeds ALL meeting columns: §1 (email, by workspace), §2 (SMS + WhatsApp), §3 (Call), §5
+# (by partner). The Funding-Form 'Data' sheet (REG.bookings_sheet()) was frozen/retired after 06-29 —
+# reading it silently zeroed every meeting column for 06-30 (0 rows). im_bookings is the live portal
+# writer, deduped by email|phone (one booking per person; `id` churns, so never key on it — see
+# reference_portal_im_bookings_darcy_form_live_writer_20260630).
 _book_cache = {}
 def consolidated_bookings(date):
-    """deduped (email|phone) bookings for `date`: list of {channel, ws, partner, key}."""
+    """deduped (email|phone) Funding bookings for `date` from the portal mirror `main.raw_im_bookings`
+    (latest snapshot, non-deleted): list of {channel, ws, partner, key, email, phone}. Fail-soft -> []
+    so a warehouse hiccup zeros meetings for the day but never crashes the render."""
     if date in _book_cache:
         return _book_cache[date]
-    d = datetime.date.fromisoformat(date); want = _date_variants(d)
     try:
-        rows = gget(BOOKINGS_SID, f"{BOOKINGS_TAB}!A1:R")
+        rows = wq(f"""
+          WITH b AS (
+            SELECT lower(coalesce(nullif(email,''), phone)) AS k,
+                   max(channel)   AS channel,
+                   max(workspace) AS workspace,
+                   max(partner)   AS partner,
+                   max(email)     AS email,
+                   max(phone)     AS phone
+            FROM main.raw_im_bookings
+            -- Key on `date` = the ET BUSINESS date (a clean 'YYYY-MM-DD' string the portal writes),
+            -- NOT `created_at` (a UTC ingest/reseed timestamp: keying on it splits ~28 rows across
+            -- UTC-midnight into the wrong day and lands every reseeded row on its load date). [Sam 06-30]
+            WHERE _snapshot_date=(SELECT max(_snapshot_date) FROM main.raw_im_bookings)
+              AND offer='Funding' AND substr(coalesce(date,''),1,10)=DATE '{date}'::VARCHAR
+              AND (deleted_at IS NULL OR deleted_at='' OR lower(deleted_at)='null')
+            GROUP BY 1)
+          SELECT k, channel, workspace, partner, email, phone FROM b WHERE k IS NOT NULL AND k<>''""")
     except Exception as e:
-        print(f"WARN consolidated_bookings sheet read failed {date}: {e}", file=sys.stderr)
+        print(f"WARN consolidated_bookings im_bookings read failed {date}: {e}", file=sys.stderr)
         _book_cache[date] = []; return []
-    if not rows:
-        _book_cache[date] = []; return []
-    hdr = rows[0]; ix = {h: i for i, h in enumerate(hdr)}
-    def c(r, n):
-        i = ix.get(n); return (r[i].strip() if i is not None and i < len(r) and r[i] else "")
-    seen, out = set(), []
-    for r in rows[1:]:
-        if c(r, "Date") not in want:
-            continue
-        key = (c(r, "Email").lower() or c(r, "Phone"))
-        if key and key in seen:
-            continue
-        if key:
-            seen.add(key)
-        out.append({"channel": c(r, "Channel"), "ws": ws_alias(c(r, "Workspace")),
-                    "partner": c(r, "Partner") or "(unknown)", "key": key,
-                    "email": c(r, "Email").lower(), "phone": c(r, "Phone")})
+    out = []
+    for k, channel, workspace, partner, email, phone in rows:
+        out.append({"channel": channel or "", "ws": ws_alias(workspace),
+                    "partner": (partner or "").strip() or "(unknown)", "key": k,
+                    "email": (email or "").lower(), "phone": phone or ""})
     if not out:
-        print(f"WARN consolidated_bookings: 0 rows for {date} (date-format drift? all meeting "
-              f"columns will read 0)", file=sys.stderr)
+        print(f"WARN consolidated_bookings: 0 im_bookings rows for {date} (portal snapshot missing the "
+              f"day? all meeting columns will read 0)", file=sys.stderr)
     _book_cache[date] = out
     return out
 
@@ -330,6 +341,7 @@ def get_email():
 SENDIVO_SUB = REG.sendivo_subs()                  # {id: label}
 SUB_REN1 = REG.sendivo_sub_id("Funding")          # 12720 — Ren1 Funding SMS
 SUB_REN2 = REG.sendivo_sub_id("Pre-IPO")          # 13922 — Ren2 Pre-IPO SMS
+SUB_REN3 = REG.sendivo_sub_id("webform")          # 14603 — Ren3 RG3 webform SMS (app-link AIM)
 def get_sms_wa():
     sms = sendivo_sms(DAILY)
     inb = {r[0]: (int(r[1]), int(r[2])) for r in wq(
@@ -342,9 +354,13 @@ def get_sms_wa():
     # DELIVERED + FAIL% (ISKRA "sent" runs ~30-37% failed -> attempted is misleading); KPI=deliv/mtg
     # (folds in #116). SMS has no failed column here -> failed=None -> Fail% "—", delivered≈sent (the
     # sendivo billed/sent count; SMS delivery is ~100%). Funding SMS meetings on Ren1; Pre-IPO on Ren2.
+    # Ren3 (webform) shows sent + replies but meetings=0: im_bookings' SMS channel carries no sub-account,
+    # so ALL SMS-sourced meetings stay on the Ren1 row rather than being double-counted across sub-accounts.
+    # ORDER MATTERS: Ren1 must stay index 0 and Ren2 index 1 (write_summary_block reads SMS_D[0]/[1]).
     rows = []
     s1 = sms.get(SUB_REN1, 0); rows.append(("Renaissance 1 (SMS)", s1, s1, None, inb.get("Renaissance 1", (0, 0))[1], sms_mtg))
     s2 = sms.get(SUB_REN2, 0); rows.append(("Renaissance 2 (SMS · Pre-IPO)", s2, s2, None, inb.get("Renaissance 2", (0, 0))[1], preipo_meetings(DAILY)))
+    s3 = sms.get(SUB_REN3, 0); rows.append(("Renaissance 3 (SMS · webform)", s3, s3, None, inb.get("Renaissance 3", (0, 0))[1], 0))
     wa = wq(f"""SELECT sent, delivered, failed, replies_total FROM main.v_sms_dash_wa_daily
                 WHERE channel='whatsapp' AND metric_date=DATE '{DAILY}'""")
     if wa:
@@ -505,16 +521,17 @@ def verify_sources(report_date):
           f"§1 Instantly: {len(inst)}/{len(WS)} workspaces returned" + (f"; MISSING {missing}" if missing else ""))
     except Exception as e:
         L("WARN", f"§1 Instantly probe failed: {e}")
-    # booking sheet (§1 meetings / §2 / §5) — reachable + required columns present
-    bsid, btab = REG.bookings_sheet()
+    # booking source (§1 meetings / §2 / §3 / §5) = the portal im_bookings [cutover 2026-06-30] — probe
+    # the ACTUAL source (raw_im_bookings has Funding rows for the report day), NOT the retired FF sheet
+    # (probing a decommissioned source would false-flag). 0 rows for the day = the portal snapshot is
+    # missing it -> every meeting column would read 0 (a real, flaggable problem).
     try:
-        brows = gget(bsid, f"{btab}!A1:R"); bhdr = set(brows[0]) if brows else set()
-        need = set(reg["metrics"]["email_meetings_leadtype"]["sheet"].get("required_columns", []))
-        miss = need - bhdr
-        L("OK" if not miss else "DRIFT",
-          f"booking sheet {bsid[:10]}…/{btab}: {len(brows)} rows" + (f"; MISSING cols {sorted(miss)}" if miss else "; required cols present"))
+        bn = consolidated_bookings(report_date)
+        L("OK" if bn else "WARN",
+          f"booking source main.raw_im_bookings (Funding, {report_date}): {len(bn)} deduped bookings"
+          + ("" if bn else " — 0 rows; meetings will render 0 (portal snapshot missing the day?)"))
     except Exception as e:
-        L("DRIFT", f"booking sheet {bsid[:10]}…/{btab} UNREACHABLE: {e}")
+        L("DRIFT", f"booking source main.raw_im_bookings UNREACHABLE: {e}")
     # §2 sendivo billing reachable
     try:
         sm = sendivo_sms(report_date)
@@ -526,10 +543,6 @@ def verify_sources(report_date):
         if m.get("source_type") == "warehouse":
             ok, why = _rel_ok(m["warehouse"]["relation"])
             L("OK" if ok else "DRIFT", f"{mid}: warehouse {m['warehouse']['relation']} " + ("reachable" if ok else f"UNREACHABLE: {why}"))
-    lt = reg["metrics"]["email_meetings_leadtype"].get("leadtype_source")
-    if lt:
-        ok, why = _rel_ok(lt["relation"])
-        L("OK" if ok else "DRIFT", f"email_meetings_leadtype lead_type: warehouse {lt['relation']} " + ("reachable" if ok else f"UNREACHABLE: {why}"))
     # Pre-IPO reconciliation (the ticket's core metric)
     st, drift, sheet, anchor = reconcile_preipo(report_date)
     if st == "OK":
@@ -551,140 +564,6 @@ def verify_sources(report_date):
 if VERIFY:
     sys.exit(0 if verify_sources(DAILY) else 2)
 
-# ---------------------------- §1b: KPIs by infra type (Google / OTD / Milkbox) ----------------------------
-# Infra is the campaign's SENDING TAG (email_tag_list), NEVER the campaign name. The sending tag is the
-# literal infra determinant (it gates which sending-account pool the campaign uses) and is a bounded
-# per-campaign field on GET /campaigns -- so it avoids the runaway /custom-tag-mappings edge-list pull
-# (the all-history account-tag pull that #122 had to cap). Map: 'Reseller Active'->Google,
-# 'Outreach Today Active'->OTD, 'Milkbox Active*'->Milkbox, no infra tag->other, >=2 infra tags->FLAG.
-MILKBOX_SLUGS = {"renaissance-4", "renaissance-5", "koi-and-destroy"}  # F1, F2, F4 only [Sam]
-INFRA_ORDER = ["Google", "OTD", "Milkbox", "other"]
-
-def _infra_of(tag_labels):
-    """campaign sending-tag labels -> ('Google'|'OTD'|'Milkbox'|'other', flagged_tags_or_None)."""
-    hits = []
-    for L in tag_labels:
-        if not L:
-            continue
-        if "Reseller" in L:                hits.append("Google")
-        elif "Outreach Today" in L:        hits.append("OTD")
-        elif L.startswith("Milkbox Active"): hits.append("Milkbox")
-    hits = list(dict.fromkeys(hits))
-    if not hits:
-        return "other", None
-    if len(hits) > 1:
-        return hits[0], hits           # >=2 infra tags -> first wins, but flag it (never double-count)
-    return hits[0], None
-
-def _campaign_day_metrics(client, campaign_id, date):
-    """one campaign's metrics for `date` from /campaigns/analytics/daily (single-day -> _unique fields
-    are valid; the 'do not sum _unique across days' caveat only bites multi-day sums). Returns
-    (sent, opp, human_replies, auto_replies).
-
-    Routed through InstantlyClient._get (NOT raw httpx) so it inherits the browser User-Agent that
-    Instantly's Cloudflare WAF requires (default python-httpx UA is 403'd -- troubleshooting note
-    2026-06-08) AND the 429/5xx-aware backoff. httpx.Client is thread-safe, so one client per
-    workspace shared across the pool is fine.
-
-    SEMANTICS (verified live + matches the warehouse convention in build_campaign_daily.py:10-11):
-    `unique_replies` is the HUMAN reply count (already EXCLUDES automatic), `unique_replies_automatic`
-    is the SEPARATE automatic (OOO/auto-responder) count -- they are NOT subset/superset (live F4 Google
-    showed human=1447 < auto=2970, impossible if auto were a subset of a 'total'). So total replies =
-    human + auto. The handoff's stated 'RR=reply_count/sent, HumanRR=(reply_count-reply_count_automatic)
-    /sent' assumed reply_count was the all-in total; the API does the opposite, so we compute
-    RR(total)=(human+auto)/sent and HumanRR=human/sent (same INTENT, correct against the real fields)."""
-    payload = client._get("/campaigns/analytics/daily",
-                          params={"campaign_id": campaign_id, "start_date": date, "end_date": date})
-    rows = payload if isinstance(payload, list) else (payload.get("items") if isinstance(payload, dict) else []) or []
-    day = next((x for x in rows if str(x.get("date", ""))[:10] == date), None)
-    if not day:
-        return (0, 0, 0, 0)
-    return (int(day.get("sent") or 0), int(day.get("unique_opportunities") or 0),
-            int(day.get("unique_replies") or 0), int(day.get("unique_replies_automatic") or 0))
-
-def get_infra_kpis():
-    """Per (infra x workspace) KPIs for the report day, summed over that infra's campaigns (campaign
-    grain). RR/HumanRR/PositiveRR = % of sent; Email->opp / Email->meeting = emails-per-X ratios.
-    Sends are reconciled to §1: each workspace's infra rows + an 'Unattributed (subseq/other)' row
-    sum to the §1 workspace sent (the §1-vs-Σcampaign gap is subsequence sends, which inherit the
-    parent's infra but are not rolled into the per-campaign analytics endpoint; folding them in would
-    cost ~1.7k calls/night, so we surface the residual as an honest reconciliation row -- the handoff's
-    'other'/'unattributed' bucket). Meetings come from im_bookings.campaign -> Instantly campaign ->
-    infra; most bookings are SMS/script/portal rows with no email campaign -> 'unattributed' (expected).
-    """
-    if not (_CREDS and InstantlyClient):
-        raise RuntimeError("credentials/InstantlyClient unavailable")
-    keys = _CREDS.instantly_workspace_keys()
-    inst_ws = instantly_daily(DAILY)  # §1 per-workspace totals (sent) -- memoized, reused for reconcile
-    name2infra = {}                   # lower(instantly campaign name) -> (slug, infra) for meeting attribution
-    flagged = []                      # campaigns carrying >=2 infra tags
-    by_ws = []                        # [(slug, name, {infra: [sent,opp,human,auto]}, ws_total_sent, unattr_sent, n_failed)]
-    for slug, name in WS:
-        key = keys.get(slug)
-        if not key:
-            continue
-        client = InstantlyClient(key)
-        tags = {t["id"]: (t.get("label") or t.get("name")) for t in client.list_tags()}
-        camps = list(client.list_campaigns())
-        cinf = {}  # campaign_id -> infra
-        for cm in camps:
-            cid = cm.get("id")
-            labels = [tags.get(t, "") for t in (cm.get("email_tag_list") or [])]
-            infra, flag = _infra_of(labels)
-            cinf[cid] = infra
-            if flag:
-                flagged.append((cm.get("name"), flag, name))
-            cn = (cm.get("name") or "").strip().lower()
-            if cn:
-                name2infra[cn] = (slug, infra)
-        agg = {inf: [0, 0, 0, 0] for inf in INFRA_ORDER}
-        n_failed = 0
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
-            futs = {ex.submit(_campaign_day_metrics, client, cm.get("id"), DAILY): cm.get("id") for cm in camps}
-            for f in concurrent.futures.as_completed(futs):
-                cid = futs[f]
-                try:
-                    s, o, rt, ra = f.result()
-                except Exception as e:
-                    n_failed += 1
-                    print(f"WARN infra daily {slug} {cid}: {e}", file=sys.stderr); continue
-                a = agg[cinf.get(cid, "other")]
-                a[0] += s; a[1] += o; a[2] += rt; a[3] += ra
-        # A campaign whose fetch failed (3 retries exhausted) contributes 0 sent -> its real sends fall
-        # into unattr_sent below (still reconciles to §1) but get MIS-labelled as subseq/other. Carry
-        # n_failed so the Unattributed row can flag it instead of reading as a silent subsequence surge.
-        ws_total_sent = inst_ws.get(slug, (0, 0))[0]
-        attr_sent = sum(a[0] for a in agg.values())
-        unattr_sent = max(0, ws_total_sent - attr_sent)
-        by_ws.append((slug, name, agg, ws_total_sent, unattr_sent, n_failed))
-
-    # meetings by infra: im_bookings.campaign (Funding, report day) -> instantly campaign -> infra
-    mtg_by = collections.defaultdict(int)   # (slug, infra) -> meetings
-    unattr_mtg = 0
-    try:
-        # Dedup by email|phone (one meeting per person), same as imbookings_meetings / consolidated_bookings,
-        # so §1b's meeting counts can't disagree with §1/§5 by double-counting a person across bookings.
-        # A person with bookings under >1 campaign is collapsed to one (max(campaign)) -> attributed once.
-        rows = wq(f"""
-          WITH b AS (
-            SELECT lower(coalesce(nullif(email,''), phone)) AS k,
-                   max(lower(trim(coalesce(campaign,'')))) AS c
-            FROM main.raw_im_bookings
-            WHERE _snapshot_date=(SELECT max(_snapshot_date) FROM main.raw_im_bookings)
-              AND offer='Funding' AND substr(coalesce(date,''),1,10)=DATE '{DAILY}'::VARCHAR
-              AND (deleted_at IS NULL OR deleted_at='' OR lower(deleted_at)='null')
-            GROUP BY 1)
-          SELECT c, count(*) n FROM b WHERE k IS NOT NULL AND k<>'' GROUP BY 1""")
-        for c, n in rows:
-            hit = name2infra.get(c)
-            if hit:
-                mtg_by[(hit[0], hit[1])] += int(n)
-            else:
-                unattr_mtg += int(n)
-    except Exception as e:
-        print(f"WARN infra meetings failed {DAILY}: {e}", file=sys.stderr)
-    return {"by_ws": by_ws, "mtg_by": dict(mtg_by), "unattr_mtg": unattr_mtg, "flagged": flagged}
-
 # ============================ collect (per-section failure isolation, C1/C2) ============================
 # One external failure (warehouse 500, sheet error, API timeout) must degrade ONLY its section to a
 # safe sentinel, never take down the whole nightly render. Fallback tuple arities MUST match the
@@ -696,7 +575,7 @@ def _safe(label, fn, default):
         print(f"WARN section '{label}' FAILED ({e}); rendering it empty", file=sys.stderr)
         return default
 _EMAIL_FB = [(name, 0, 0, 0, 0, 0, 0) for _, name in WS]
-_SMS_FB = [("Renaissance 1 (SMS)", 0, 0, None, 0, 0), ("Renaissance 2 (SMS · Pre-IPO)", 0, 0, None, 0, 0), ("WhatsApp (ISKRA)", 0, 0, 0, 0, 0)]
+_SMS_FB = [("Renaissance 1 (SMS)", 0, 0, None, 0, 0), ("Renaissance 2 (SMS · Pre-IPO)", 0, 0, None, 0, 0), ("Renaissance 3 (SMS · webform)", 0, 0, None, 0, 0), ("WhatsApp (ISKRA)", 0, 0, 0, 0, 0)]
 _CLOSE_FB = {"dials": 0, "leads": 0, "connects": 0, "meetings": 0}
 _TRUTH_FB = (None, [(name, 0, 0, 0, 0) for _, name in WS])
 _IMREPLY_FB = ((DAILY, DAILY, DAILY), [(name, 0, None, None, 0, None, None, 0, None, None) for _, name in WS])
@@ -707,7 +586,6 @@ CLOSE_D = _safe("close", get_close, _CLOSE_FB)
 SENDING_CENSUS, SENDING_TRUTH = _safe("truth", get_truth, _TRUTH_FB)
 PARTNER_D, PARTNER_D_TOTAL = _safe("partner", get_partner, ([], 0))
 IMREPLY_PERIODS, IMREPLY_D = _safe("imreply", get_im_reply, _IMREPLY_FB)
-INFRA_D = _safe("infra", get_infra_kpis, {"by_ws": [], "mtg_by": {}, "unattr_mtg": 0, "flagged": []})
 PREIPO_MTG = _safe("preipo", lambda: preipo_meetings(DAILY), 0)
 
 if DRY:
@@ -718,14 +596,6 @@ if DRY:
     print("§4 TRUTH (ws, otd_exp, goog_exp, tot_exp, actual):"); [print("  ", x) for x in SENDING_TRUTH]
     print("§5 PARTNER:", PARTNER_D, "total", PARTNER_D_TOTAL)
     print("§6 IM-REPLY (ws, d_n,d_med,d_avg, w_n,w_med,w_avg, m_n,m_med,m_avg):"); [print("  ", x) for x in IMREPLY_D]
-    print("§1b INFRA KPIs:")
-    for slug, name, agg, wst, unattr, nf in INFRA_D["by_ws"]:
-        print(f"  {name}: ws_sent(§1)={wst} attr={wst-unattr} unattr={unattr} fetch_failed={nf}")
-        for inf in INFRA_ORDER:
-            s, o, h, a = agg[inf]
-            if s or o or h or a:
-                print(f"      {inf:8s} sent={s} opp={o} human={h} auto={a} RR={(h+a)/s if s else 0:.4f} mtg={INFRA_D['mtg_by'].get((slug,inf),0)}")
-    print("  unattributed meetings:", INFRA_D["unattr_mtg"], " flagged(multi-infra-tag):", INFRA_D["flagged"])
     print("Pre-IPO meetings:", PREIPO_MTG)
     sys.exit(0)
 
@@ -747,7 +617,7 @@ def mins(v): return "—" if v is None else round(_f(v))
 def rgb(r, g, b): return {"red": r, "green": g, "blue": b}
 
 def build_and_write(tab, build_fn):
-    rows = []; sec = []; th = []; tot = []; rrrows = []; merges = []; strows = []; data = []; infrows = []
+    rows = []; sec = []; th = []; tot = []; rrrows = []; merges = []; strows = []; data = []
     th_ncol = {}; row_ncol = {}
     def add(r=None): rows.append(r or []); return len(rows) - 1
     EMAIL_HDR_TOP = ["Workspace", "Sent", "Opportunities", "Meetings", "KPI (sent/mtg)", "Cheap", "", "Regular", ""]
@@ -802,45 +672,6 @@ def build_and_write(tab, build_fn):
         for p, n in rows_data:
             ri = add([p, n]); data.append(ri); row_ncol[ri] = W
         ti = add(["TOTAL", total]); tot.append(ti); row_ncol[ti] = W
-    def infra_table(infra, header_label):
-        # KPIs by infra type (sending tag) x workspace. RR/HumanRR/PositiveRR = % of sent;
-        # Email->opp / Email->meeting = emails-per-X ratios. Each workspace's infra rows +
-        # an 'Unattributed (subseq/other)' row reconcile to the §1 workspace sent (the subtotal row).
-        W = 7
-        si = add([header_label]); sec.append(si); row_ncol[si] = W
-        hr = add(["Workspace — Infra", "Sent", "RR", "Human RR", "Positive RR", "Email→opp", "Email→meeting"])
-        th.append(hr); th_ncol[hr] = W
-        def short(nm): return nm.split(" (")[0]
-        def pct(n, d): return (_f(n) / _f(d)) if d else "—"
-        def ratio(n, d): return round(_f(n) / _f(d)) if d else "—"
-        mtg_by = infra.get("mtg_by", {})
-        g_sent = g_h = g_a = g_o = g_m = g_total = 0
-        for slug, name, agg, ws_total_sent, unattr_sent, n_failed in infra.get("by_ws", []):
-            nm = short(name)
-            for inf in INFRA_ORDER:  # Google, OTD, Milkbox, other
-                s, o, h, a = agg.get(inf, [0, 0, 0, 0])
-                if not ((s > 0) or (inf == "Milkbox" and slug in MILKBOX_SLUGS)):
-                    continue
-                m = mtg_by.get((slug, inf), 0)
-                ri = add([f"{nm} — {inf}", s, pct(h + a, s), pct(h, s), pct(o, s), ratio(s, o), ratio(s, m)])
-                data.append(ri); infrows.append(ri); row_ncol[ri] = W
-                g_sent += s; g_h += h; g_a += a; g_o += o; g_m += m
-            if unattr_sent > 0:
-                lbl = f"{nm} — Unattributed (subseq/other)"
-                if n_failed:  # don't let a flaky-fetch night read as a silent subsequence surge
-                    lbl += f"  ⚠ incl. {n_failed} campaign fetch(es) that failed"
-                ri = add([lbl, unattr_sent, "—", "—", "—", "—", "—"])
-                data.append(ri); row_ncol[ri] = W
-            sti = add([f"{nm} — TOTAL (= §1 sent)", ws_total_sent, "—", "—", "—", "—", "—"])
-            tot.append(sti); row_ncol[sti] = W
-            g_total += ws_total_sent
-        gi = add(["TOTAL · rates over attributed sends", g_total, pct(g_h + g_a, g_sent), pct(g_h, g_sent),
-                  pct(g_o, g_sent), ratio(g_sent, g_o), ratio(g_sent, g_m)])
-        tot.append(gi); infrows.append(gi); row_ncol[gi] = W
-        um = infra.get("unattr_mtg", 0)
-        if um:
-            ni = add([f"(email→meeting note: {um} Funding meetings on {DAILY} had no resolvable email campaign — SMS/script/portal — so are not in any infra row above)"])
-            data.append(ni); row_ncol[ni] = W
     def imreply_table(rows_data, label):
         W = 10
         si = add([label]); sec.append(si); row_ncol[si] = W
@@ -850,11 +681,17 @@ def build_and_write(tab, build_fn):
         for name, dn, dmed, davg, wn, wmed, wavg, mn, mmed, mavg in rows_data:
             ri = add([name, dn, mins(dmed), mins(davg), wn, mins(wmed), mins(wavg), mn, mins(mmed), mins(mavg)])
             data.append(ri); row_ncol[ri] = W
+        # Explicit empty-state so a legitimately-quiet in-window day (or the ~24h email_message sync lag)
+        # never reads as a clobbered/missing §6 — the header + a per-workspace shell ALWAYS render, and
+        # this note names WHY the daily column is thin (the watchdog anchors on this section existing).
+        if not any((r[1] or 0) for r in rows_data):
+            note = add(["(no in-window prospect email replies for %s — 12-8pm ET Mon-Fri arrivals only; "
+                        "same-day replies often unanswered yet + email_message sync lags ~24h — weekly/"
+                        "monthly carry the signal)" % DAILY]); data.append(note); row_ncol[note] = W
         pend = add(["SMS · WhatsApp first-reply time", "pending", "pending", "pending", "pending", "pending", "pending", "pending", "pending", "pending"])
         data.append(pend); row_ncol[pend] = W
     build_fn(dict(add=add, email_table=email_table, sms_wa_table=sms_wa_table, truth_table=truth_table,
-                  close_table=close_table, partner_table=partner_table, imreply_table=imreply_table,
-                  infra_table=infra_table))
+                  close_table=close_table, partner_table=partner_table, imreply_table=imreply_table))
 
     meta = api("GET", BASE + "?fields=sheets(properties(sheetId,title),bandedRanges(bandedRangeId),conditionalFormats)")
     sh = next((s for s in meta["sheets"] if s["properties"]["title"] == tab), None)
@@ -881,9 +718,6 @@ def build_and_write(tab, build_fn):
         reqs.append({"repeatCell": {"range": rng(i, i + 1, 4, 5), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}}}, "fields": "userEnteredFormat.numberFormat"}})
     for i in strows:
         reqs.append({"repeatCell": {"range": rng(i, i + 1, 5, 6), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}}, "fields": "userEnteredFormat.numberFormat"}})
-    for i in infrows:  # §1b RR / Human RR / Positive RR (cols 2,3,4) as percents
-        for c in (2, 3, 4):
-            reqs.append({"repeatCell": {"range": rng(i, i + 1, c, c + 1), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}}}, "fields": "userEnteredFormat.numberFormat"}})
     for i in sorted(set(data) | set(tot) | set(strows)):
         reqs.append({"repeatCell": {"range": rng(i, i + 1, 1, NCOL), "cell": {"userEnteredFormat": {"horizontalAlignment": "RIGHT"}}, "fields": "userEnteredFormat.horizontalAlignment"}})
         reqs.append({"repeatCell": {"range": rng(i, i + 1, 0, 1), "cell": {"userEnteredFormat": {"horizontalAlignment": "LEFT"}}, "fields": "userEnteredFormat.horizontalAlignment"}})
@@ -951,7 +785,6 @@ def daily(ctx):
     add([f"DAILY REVOPS REPORT — Business Funding · {DAILY}"])
     add([os.environ.get("DAILY_SUBTITLE", f"Daily · {DAILY} · single-source-of-truth (warehouse + Instantly/sendivo live)")]); add()
     ctx["email_table"](EMAIL_D, f"1 · EMAIL + WARM LEADS — by workspace · day {DAILY}"); add()
-    ctx["infra_table"](INFRA_D, f"1b · EMAIL KPIs BY INFRA TYPE — Google / OTD / Milkbox (Milkbox = F1/F2/F4 only) × workspace · by campaign sending-tag · day {DAILY}"); add()
     ctx["sms_wa_table"](SMS_D, f"2 · SMS + WHATSAPP — by channel · day {DAILY}"); add()
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
     ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (active capacity) vs actual sends · no-lag · census {SENDING_CENSUS}"); add()
