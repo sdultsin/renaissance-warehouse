@@ -70,8 +70,15 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
         echo "orchestrator partial (some ingests failed); publishing dashboards anyway" | tee -a "$LOG_FILE"
     fi
 
+    # Compaction failure must ALERT, not just log: it silently no-op'ing for 2 weeks is how
+    # the writer DB ballooned to 171GB (2026-06-16..30). rc=0 covers success AND the healthy
+    # below-threshold skip; every abort path exits nonzero -> Slack (non-fatal to the nightly).
     echo "compacting warehouse (skips unless bloated)" | tee -a "$LOG_FILE"
-    "$SCRIPT_DIR/compact_warehouse.sh" 2>&1 | tee -a "$LOG_FILE" || echo "compaction non-fatal failure/skip" | tee -a "$LOG_FILE"
+    if ! "$SCRIPT_DIR/compact_warehouse.sh" 2>&1 | tee -a "$LOG_FILE"; then
+        echo "compaction non-fatal failure (alerting)" | tee -a "$LOG_FILE"
+        "$PYTHON" "$SCRIPT_DIR/alert_slack.py" ":warning: warehouse compaction FAILED tonight (nightly continues; writer-DB bloat keeps growing until fixed) — grep '[compact' /root/renaissance-warehouse/logs/nightly.log for the ABORT reason" \
+            2>&1 | tee -a "$LOG_FILE" || true
+    fi
 
     # Signature->phone self-enrichment (sig-phone Phase 2): extract US phones from
     # tonight's new inbound reply signatures -> public.leads enriched_phone sidecar.

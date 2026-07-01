@@ -125,16 +125,24 @@ def run_account_campaign_live_ingest(ctx: RunContext) -> PhaseResult:
                         "INSERT INTO _acl_batch VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
                         [list(r) for r in rows],
                     )
-                ctx.db.execute(
-                    "DELETE FROM core.account_campaign_live WHERE workspace_uuid = ?",
-                    [workspace_id],
-                )
-                ctx.db.execute(
-                    "INSERT INTO core.account_campaign_live "
-                    "(account_email, workspace_slug, workspace_uuid, n_campaigns, "
-                    " n_active_campaigns, campaigns, _loaded_at, _run_id) "
-                    "SELECT * FROM _acl_batch ON CONFLICT DO NOTHING"
-                )
+                # One transaction: an INSERT failure can no longer leave the workspace
+                # empty behind a committed DELETE (full-replace is now atomic).
+                ctx.db.execute("BEGIN TRANSACTION")
+                try:
+                    ctx.db.execute(
+                        "DELETE FROM core.account_campaign_live WHERE workspace_uuid = ?",
+                        [workspace_id],
+                    )
+                    ctx.db.execute(
+                        "INSERT INTO core.account_campaign_live "
+                        "(account_email, workspace_slug, workspace_uuid, n_campaigns, "
+                        " n_active_campaigns, campaigns, _loaded_at, _run_id) "
+                        "SELECT * FROM _acl_batch ON CONFLICT DO NOTHING"
+                    )
+                    ctx.db.execute("COMMIT")
+                except Exception:
+                    ctx.db.execute("ROLLBACK")
+                    raise
                 ctx.db.execute("DROP TABLE IF EXISTS _acl_batch")
                 total_inboxes += len(rows)
                 workspaces_done.append(slug)
