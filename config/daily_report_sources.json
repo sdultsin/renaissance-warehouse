@@ -4,6 +4,7 @@
     "purpose": "The SINGLE machine-readable map of metric -> {source type, exact id, tab, desk/owner, dedup key, reconciliation anchor} for the Daily RevOps Report. scripts/render_daily.py resolves its human-managed / drift-prone sources (Pre-IPO desks, booking sheet, sendivo sub-accounts, workspace roster) FROM this file, so registry = code = reality (no comment-vs-code drift). A chat building or QAing the report reads THIS to answer 'am I sourcing the right thing for this metric?' WITHOUT a human hand-feeding it. Run `render_daily.py <date> --verify` to confirm every source is live, correctly-shaped, and (for Pre-IPO) reconciles to the team tally.",
     "verified": "2026-06-30",
     "verified_against": "live renderer scripts/render_daily.py PR #117/#123; reference_daily_report_canonical_sources_20260630; handoffs/2026-06-30-DATA-TICKET-preipo-source-mapping-incompleteness.md",
+    "cutover_2026_06_30": "ALL meetings (§1/§2/§3/§5) moved from the Funding-Form 'Data' sheet -> the portal main.raw_im_bookings (the sheet froze after 06-29 and silently zeroed 06-30 meetings). §1b EMAIL-KPIs-BY-INFRA removed (layout now = June-26 gold). §2 gained the Renaissance 3 (webform, sub 14603) SMS row. Ref handoffs/2026-06-30-BUILD-daily-report-v3-jun30-complete-jun29-repair.md.",
     "owners": "RevOps orchestrator (registry) + Grace (Pre-IPO desks / mid-funnel)",
     "schema": {
       "source_type": "sheet | warehouse | api  — where the metric is read from",
@@ -47,23 +48,25 @@
     },
 
     "email_meetings_leadtype": {
-      "section": "§1 Meetings + Cheap/Regular split",
-      "what": "Email-channel meetings per workspace (count) + cheap-vs-regular MCA split.",
-      "source_type": "sheet",
+      "section": "§1 Meetings + Cheap/Regular split (and the booking universe for §2/§3/§5)",
+      "what": "ALL meetings (§1 email by workspace, §2 SMS+WhatsApp, §3 Call, §5 by partner) + cheap-vs-regular MCA split. ONE booking source, deduped email|phone, split by `channel`.",
+      "source_type": "warehouse",
+      "warehouse": {
+        "relation": "main.raw_im_bookings",
+        "filter": "offer='Funding', latest _snapshot_date, non-deleted; channel -> §1 Email / §2 SMS+WhatsApp / §3 Call; workspace -> §1 by-workspace via ws_alias(); partner -> §5",
+        "date_column": "date  (ET BUSINESS date, a clean 'YYYY-MM-DD' string — NOT created_at, a UTC ingest/reseed timestamp that splits ~28 rows across UTC-midnight into the wrong day [Sam 06-30])",
+        "dedup_key": "email|phone  (one booking per person; `id` churns on Darcy reseeds, never key on it)",
+        "leadtype_rule": "cheap = lead_type='cheap'; regular = any other non-empty lead_type",
+        "key_columns": ["channel", "workspace", "partner", "email", "phone", "date", "lead_type", "offer", "_snapshot_date", "deleted_at"]
+      },
+      "cutover": "2026-06-30 — was the Funding-Form 'Data' sheet below; that sheet froze/retired after 06-29 (0 rows for 06-30), which silently zeroed every meeting column. im_bookings is the live portal writer (Darcy's form). Ref reference_renaissance_portal_supabase_booking_source_20260629 / reference_portal_im_bookings_darcy_form_live_writer_20260630.",
       "sheet": {
         "spreadsheet_id": "1vaExhxu319o2CSoQtjWRV49lq5GowOeJzo1_GHXIIqM",
         "tab": "Data",
-        "filter": "Channel == 'Email'",
+        "status": "RETIRED as the renderer's booking source 2026-06-30 (kept here only as the legacy Funding-Form reconciliation target until portal-vs-FF tallies 100%). NOT read by render_daily anymore.",
         "date_column": "Date",
         "dedup_key": "email|phone",
-        "owner": "portal-fed consolidated booking sheet (Channel + Workspace + Partner per booking)",
         "required_columns": ["Date", "Channel", "Workspace", "Partner", "Email", "Phone"]
-      },
-      "leadtype_source": {
-        "source_type": "warehouse",
-        "relation": "main.raw_im_bookings",
-        "key_columns": ["email", "phone", "lead_type", "offer", "date", "_snapshot_date", "deleted_at"],
-        "rule": "offer='Funding', cheap = lead_type='cheap', joined to booking by email|phone"
       },
       "reconciliation": null
     },
@@ -99,7 +102,7 @@
       "what": "WhatsApp sent / delivered / failed / replies (ISKRA 'sent' runs ~30-37% failed; KPI = delivered/mtg).",
       "source_type": "warehouse",
       "warehouse": { "relation": "main.v_sms_dash_wa_daily", "filter": "channel='whatsapp'", "key_columns": ["sent", "delivered", "failed", "replies_total", "metric_date"] },
-      "meetings_source": "consolidated booking sheet, Channel == 'WhatsApp'",
+      "meetings_source": "main.raw_im_bookings, channel == 'WhatsApp' [cutover 2026-06-30; was the Funding-Form sheet]",
       "reconciliation": null
     },
 
@@ -152,7 +155,7 @@
       "what": "Dials / distinct leads / connects (>=60s real convo, ET day). Close is the system of record; it UNDER-captures vs the warm-callers' own EOD tallies — note it, do not 'fix' it.",
       "source_type": "warehouse",
       "warehouse": { "relation": "core.call", "key_columns": ["occurred_at", "duration_seconds", "close_lead_id"], "connect_threshold_seconds": 60 },
-      "meetings_source": "consolidated booking sheet, Channel == 'Call'",
+      "meetings_source": "main.raw_im_bookings, channel == 'Call' [cutover 2026-06-30; was the Funding-Form sheet]",
       "reconciliation": null
     },
 
@@ -168,9 +171,9 @@
 
     "bookings_by_partner": {
       "section": "§5 Bookings by partner",
-      "what": "Meetings booked grouped by partner.",
-      "source_type": "sheet",
-      "sheet": { "spreadsheet_id": "1vaExhxu319o2CSoQtjWRV49lq5GowOeJzo1_GHXIIqM", "tab": "Data", "date_column": "Date", "dedup_key": "email|phone", "group_by": "Partner" },
+      "what": "Meetings booked grouped by partner (all channels).",
+      "source_type": "warehouse",
+      "warehouse": { "relation": "main.raw_im_bookings", "filter": "offer='Funding', latest _snapshot_date, non-deleted", "date_column": "date (ET business date)", "dedup_key": "email|phone", "group_by": "partner", "note": "cutover 2026-06-30; was the Funding-Form 'Data' sheet (frozen after 06-29)" },
       "reconciliation": null
     },
 
