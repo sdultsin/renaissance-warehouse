@@ -86,6 +86,7 @@
         ]
       },
       "wrong_sources": ["sendivo delivery_metrics returns the DEFAULT account (~178) regardless of sub_account_id — NOT the SMS-sent source"],
+      "delivered_failed": "§2 SMS Delivered + Fail% [added 2026-07-01, Jun-30 accuracy pass] = warehouse main.v_sms_campaign_performance summed per sub_account_name ('Renaissance 1/2/3') for the day (SMS delivery is NOT ~100% — 06-30 Ren1 ran 14% failed). Sent stays this billing quantity. Fail-soft: no view row for a sub/day (same-day sync lag) -> delivered≈sent, Fail% '—' (the pre-07-01 behavior).",
       "reconciliation": null
     },
 
@@ -113,8 +114,8 @@
     },
 
     "sms_campaign_leaderboard": {
-      "section": "§2c SMS campaign leaderboard (sent -> opp)",
-      "what": "Per-campaign sent -> opp ranking over the same trailing fully-classified window, best converters first (lowest sent/opp), campaigns with >= 10 in-window opps.",
+      "section": "§2c SMS campaign leaderboard — REMOVED from the report 2026-07-01 (Jun-30 accuracy pass); the view main.v_sms_campaign_performance stays and now feeds §2 delivered/failed. Entry kept for the attribution intel below.",
+      "what": "Per-campaign sent -> opp ranking over the same trailing fully-classified window, best converters first (lowest sent/opp), campaigns with >= 10 in-window opps. NOT rendered since 2026-07-01.",
       "source_type": "warehouse",
       "warehouse": {
         "relation": "main.v_sms_campaign_performance (sent) + derived.sms_reply_is_positive_qwen (opps) attributed via main.v_sendivo_number_campaign (our_number -> campaign)",
