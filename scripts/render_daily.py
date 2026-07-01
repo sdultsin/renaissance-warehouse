@@ -364,6 +364,35 @@ SENDIVO_SUB = REG.sendivo_subs()                  # {id: label}
 SUB_REN1 = REG.sendivo_sub_id("Funding")          # 12720 — Ren1 Funding SMS
 SUB_REN2 = REG.sendivo_sub_id("Pre-IPO")          # 13922 — Ren2 Pre-IPO SMS
 SUB_REN3 = REG.sendivo_sub_id("webform")          # 14603 — Ren3 RG3 webform SMS (app-link AIM)
+
+def webform_submissions(date):
+    """Ren3's conversion metric = completed Lumara apply-now web-form fills for the ET day [Sam 06-30].
+    Source = the LIVE comms Supabase `comms.lead_application` ("the money table", one row per fill),
+    deduped by prospect (email|phone). Queried LIVE — NOT the warehouse mirror main.raw_comms_lead_application,
+    which lags (last-loaded hours behind → 0 same-day) AND carries duplicate loads — so the current-day
+    number is real, same principle as §1/§2 reading Instantly/sendivo live. Fail-soft -> 0 (a comms
+    hiccup zeros only Ren3's webform count, never the render). Conn = COMMS_SUPABASE_DB_URL (.env)."""
+    url = _CREDS.optional("COMMS_SUPABASE_DB_URL") if _CREDS else None
+    if not url:
+        print("WARN webform_submissions: COMMS_SUPABASE_DB_URL unavailable -> 0", file=sys.stderr)
+        return 0
+    try:
+        import psycopg2
+        conn = psycopg2.connect(url, connect_timeout=15)
+        try:
+            conn.set_session(readonly=True)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT count(DISTINCT lower(coalesce(nullif(email,''), prospect_number)))
+                    FROM comms.lead_application
+                    WHERE (created_at AT TIME ZONE 'America/New_York')::date = %s""", (date,))
+                return int(cur.fetchone()[0] or 0)
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"WARN webform_submissions failed {date}: {e}", file=sys.stderr)
+        return 0
+
 def get_sms_wa():
     sms = sendivo_sms(DAILY)
     inb = {r[0]: (int(r[1]), int(r[2])) for r in wq(
@@ -376,13 +405,15 @@ def get_sms_wa():
     # DELIVERED + FAIL% (ISKRA "sent" runs ~30-37% failed -> attempted is misleading); KPI=deliv/mtg
     # (folds in #116). SMS has no failed column here -> failed=None -> Fail% "—", delivered≈sent (the
     # sendivo billed/sent count; SMS delivery is ~100%). Funding SMS meetings on Ren1; Pre-IPO on Ren2.
-    # Ren3 (webform) shows sent + replies but meetings=0: im_bookings' SMS channel carries no sub-account,
-    # so ALL SMS-sourced meetings stay on the Ren1 row rather than being double-counted across sub-accounts.
+    # Ren3 (webform): the "meetings" column shows completed WEB-FORM FILLS (Lumara apply-now), NOT
+    # meetings — Ren3 is a form-conversion line [Sam 06-30]. KPI = sent / webforms (same sent/x formula
+    # as the other rows). SMS-sourced MEETINGS stay on the Ren1 row (im_bookings' SMS channel carries no
+    # sub-account) — Ren3 does not double-count them. The shared column is headed "Meetings/Webform".
     # ORDER MATTERS: Ren1 must stay index 0 and Ren2 index 1 (write_summary_block reads SMS_D[0]/[1]).
     rows = []
     s1 = sms.get(SUB_REN1, 0); rows.append(("Renaissance 1 (SMS)", s1, s1, None, inb.get("Renaissance 1", (0, 0))[1], sms_mtg))
     s2 = sms.get(SUB_REN2, 0); rows.append(("Renaissance 2 (SMS · Pre-IPO)", s2, s2, None, inb.get("Renaissance 2", (0, 0))[1], preipo_meetings(DAILY)))
-    s3 = sms.get(SUB_REN3, 0); rows.append(("Renaissance 3 (SMS · webform)", s3, s3, None, inb.get("Renaissance 3", (0, 0))[1], 0))
+    s3 = sms.get(SUB_REN3, 0); rows.append(("Renaissance 3 (SMS · webform)", s3, s3, None, inb.get("Renaissance 3", (0, 0))[1], webform_submissions(DAILY)))
     wa = wq(f"""SELECT sent, delivered, failed, replies_total FROM main.v_sms_dash_wa_daily
                 WHERE channel='whatsapp' AND metric_date=DATE '{DAILY}'""")
     if wa:
@@ -802,7 +833,7 @@ def build_and_write(tab, build_fn):
         # KPI = delivered/mtg. SMS: failed=None -> Fail% "—", delivered≈sent. (folds in #116)
         W = 7
         si = add([header_label]); sec.append(si); row_ncol[si] = W
-        hr = add(["Channel / workspace", "Sent", "Delivered", "Fail %", "Human RR", "Meetings", "KPI (deliv/mtg)"]); th.append(hr); th_ncol[hr] = W
+        hr = add(["Channel / workspace", "Sent", "Delivered", "Fail %", "Human RR", "Meetings/Webform", "KPI"]); th.append(hr); th_ncol[hr] = W
         def failpct(failed, sent): return (f"'{round(100.0*failed/sent)}%" if sent else "'0%") if failed is not None else "—"
         ts = td = tf = thr = tm = 0; any_fail = False
         for label, sent, deliv, failed, reps, m in rows_data:
@@ -945,7 +976,6 @@ def build_and_write(tab, build_fn):
 
 def write_summary_block(sid):
     """Cream right-side 'Business / Funding' summary block (cols L-O), GENERATED from section data."""
-    def short(ws): return ws.split(" (")[0]
     def ratio(a, b): return round(a / b) if b else ""
     # SMS_D rows: (label, sent, delivered, failed, replies, meetings)
     sms1 = SMS_D[0] if len(SMS_D) > 0 else ("", 0, 0, None, 0, 0)
@@ -957,7 +987,7 @@ def write_summary_block(sid):
            ["WORKSPACE", "Email Sent", "Meeting Booked", "Meeting to Booked"]]
     ts = tm = 0
     for ws, sent, hr, opps, m, c, r in wsrows:
-        blk.append([short(ws), sent, m, ratio(sent, m)]); ts += sent; tm += m
+        blk.append([ws, sent, m, ratio(sent, m)]); ts += sent; tm += m  # full name incl CM suffix "(Sam)" [Sam 06-30]
     blk.append(["Total", ts, tm, ratio(ts, tm)]); blk.append(["", "", "", ""])
     for lbl, s, m in [("SMS Funding", sms1[1], sms1[5]), ("SDR (Close)", CLOSE_D["dials"], CLOSE_D["meetings"]),
                       ("Warm Leads", warm[1], warm[4]), ("WhatsApp Funding (delivered)", wa[2], wa[5])]:
@@ -977,6 +1007,14 @@ def write_summary_block(sid):
         {"repeatCell": {"range": br(r0 + 1, r0 + 2), "cell": {"userEnteredFormat": {"backgroundColor": CREAM, "horizontalAlignment": "CENTER", "textFormat": {"bold": True}}}, "fields": "userEnteredFormat(backgroundColor,horizontalAlignment,textFormat)"}},
         {"repeatCell": {"range": br(r0 + 9, r0 + 10), "cell": {"userEnteredFormat": {"textFormat": {"bold": True}}}, "fields": "userEnteredFormat.textFormat"}},
         {"repeatCell": {"range": br(r0 + 2, r1, 12, 15), "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}, "horizontalAlignment": "RIGHT"}}, "fields": "userEnteredFormat(numberFormat,horizontalAlignment)"}},
+        # Column widths for the summary block (cols L,M,N,O = 11..14). The main-table width loop only
+        # sizes cols A..J, so without this L stays ~100px and the labels truncate ("Max's workspac",
+        # "WhatsApp Fundi", "WhatsApp PRE-"). Persisted every render. L wide (long labels like "WhatsApp
+        # Funding (delivered)"); M/N/O sized for their numbers + the "Meeting to Booked" header.
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 11, "endIndex": 12}, "properties": {"pixelSize": 220}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 12, "endIndex": 13}, "properties": {"pixelSize": 110}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 13, "endIndex": 14}, "properties": {"pixelSize": 125}, "fields": "pixelSize"}},
+        {"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "COLUMNS", "startIndex": 14, "endIndex": 15}, "properties": {"pixelSize": 140}, "fields": "pixelSize"}},
         {"updateBorders": {"range": br(r0, r1), "top": thin, "bottom": thin, "left": thin, "right": thin, "innerHorizontal": thin, "innerVertical": thin}}]
     api("POST", BASE + ":batchUpdate", {"requests": reqs})
 
