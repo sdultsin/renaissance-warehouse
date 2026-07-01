@@ -12,6 +12,13 @@ Mirrors EXACTLY what scripts/render_daily.py live-pulls at render time
       campaign tag dimensions (email_tag_list ids + labels). NO tag->tier/infra
       mapping here — that taxonomy is a pending business definition; §1b's
       _infra_of() stays in the renderer until the flip decision.
+  raw_instantly_campaign_dim               <- DURABLE campaign registry: one
+      upserted row per campaign_id ever seen (latest name/status/tags +
+      immutable first_seen_name/first_seen_at). Campaign NAMES are UNSTABLE
+      (the bounce guard prefixes 'BOUNCED '; other renames happen) — campaign_id
+      is the only stable key. Append/upsert, NEVER wipe-and-reload: the queued
+      campaign-scoreboard registry (handoffs/2026-07-01-campaign-scoreboard-
+      standing-view.md) is expected to seed from this table.
   raw_instantly_tag_def                    <- per-id GET /custom-tags/{id} for
       ids actually referenced by campaigns (bounded; avoids paging the full
       multi-thousand-row RG tag catalogs — the #124/#126 runaway class).
@@ -94,6 +101,23 @@ _CAMP_UPSERT = (
     f"VALUES ({', '.join('?' for _ in _CAMP_COLS)}) "
     "ON CONFLICT (campaign_id, date) DO UPDATE SET "
     + ", ".join(f"{c} = excluded.{c}" for c in _CAMP_COLS if c not in ("campaign_id", "date"))
+)
+
+# Durable campaign identity: first_seen_name / first_seen_at are IMMUTABLE
+# (deliberately absent from the UPDATE SET); everything else tracks latest.
+_DIM_UPSERT = (
+    "INSERT INTO raw_instantly_campaign_dim (campaign_id, workspace_slug, "
+    "campaign_name, campaign_status, first_seen_name, first_seen_at, "
+    "last_seen_at, tag_ids, tag_labels, _loaded_at, _run_id) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+    "ON CONFLICT (campaign_id) DO UPDATE SET "
+    "workspace_slug = excluded.workspace_slug, "
+    "campaign_name = excluded.campaign_name, "
+    "campaign_status = excluded.campaign_status, "
+    "last_seen_at = excluded.last_seen_at, "
+    "tag_ids = excluded.tag_ids, "
+    "tag_labels = excluded.tag_labels, "
+    "_loaded_at = excluded._loaded_at, _run_id = excluded._run_id"
 )
 
 _TAG_UPSERT = (
@@ -226,6 +250,17 @@ def _write_workspace(conn, slug: str, fetched: dict, labels: dict[str, str],
     by_id = {c["id"]: c for c in fetched["campaigns"]}
     conn.execute("BEGIN")
     try:
+        # Durable campaign dim: upsert EVERY campaign listed (even zero-activity
+        # ones) so campaign_id + raw tag dims survive renames/reloads.
+        for c in fetched["campaigns"]:
+            tids = c.get("email_tag_list") or []
+            conn.execute(
+                _DIM_UPSERT,
+                [c["id"], slug, c.get("name"), _int_or_none(c.get("status")),
+                 c.get("name"), now, now,
+                 json.dumps(tids), json.dumps([labels.get(t) for t in tids]),
+                 now, run_id],
+            )
         ws_rows = 0
         for day in fetched["ws_days"]:
             d = str(day.get("date", ""))[:10]

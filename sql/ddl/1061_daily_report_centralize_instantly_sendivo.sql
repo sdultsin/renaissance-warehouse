@@ -60,11 +60,15 @@ CREATE TABLE IF NOT EXISTS raw_instantly_workspace_analytics_daily (
 -- =====================================================================
 -- §1b campaign-grain daily analytics (per campaign per day, w/ raw tags)
 -- =====================================================================
+-- campaign_id is the ONLY stable campaign key (names get renamed — e.g. the
+-- bounce guard's 'BOUNCED ' prefix); campaign_name here is a convenience copy
+-- of the latest name at load time. Durable identity lives in
+-- raw_instantly_campaign_dim below.
 CREATE TABLE IF NOT EXISTS raw_instantly_campaign_analytics_daily (
   campaign_id                VARCHAR NOT NULL,
   date                       DATE    NOT NULL,
   workspace_slug             VARCHAR NOT NULL,
-  campaign_name              VARCHAR,
+  campaign_name              VARCHAR,            -- latest name at load (UNSTABLE; key on campaign_id)
   campaign_status            INTEGER,            -- Instantly v2 status code (1 active, 2 paused, ...)
   sent                       BIGINT,
   contacted                  BIGINT,
@@ -84,6 +88,31 @@ CREATE TABLE IF NOT EXISTS raw_instantly_campaign_analytics_daily (
   _loaded_at                 TIMESTAMPTZ NOT NULL,
   _run_id                    VARCHAR NOT NULL,
   PRIMARY KEY (campaign_id, date)
+);
+
+-- =====================================================================
+-- DURABLE campaign dimension registry (append/upsert, NEVER wipe-and-reload)
+-- =====================================================================
+-- Campaign NAMES are UNSTABLE: the bounce guard renames campaigns by prefixing
+-- 'BOUNCED ' (campaign_id unchanged), and other renames happen too. campaign_id
+-- is the ONLY stable key. This table keeps one durable row per campaign ever
+-- seen: latest name/status/tags AND the first-seen name, surviving renames and
+-- nightly reloads (unlike the campaign→account mapping, which is wiped nightly —
+-- 809 June campaigns → only 135 still resolvable). The queued campaign-scoreboard
+-- registry (handoffs/2026-07-01-campaign-scoreboard-standing-view.md) is expected
+-- to seed from here.
+CREATE TABLE IF NOT EXISTS raw_instantly_campaign_dim (
+  campaign_id       VARCHAR PRIMARY KEY,
+  workspace_slug    VARCHAR NOT NULL,
+  campaign_name     VARCHAR,            -- LATEST name (mutable; renames overwrite)
+  campaign_status   INTEGER,            -- latest status code
+  first_seen_name   VARCHAR,            -- name at first ingest (immutable)
+  first_seen_at     TIMESTAMPTZ,        -- when this ingest first saw the campaign (immutable)
+  last_seen_at      TIMESTAMPTZ,        -- last run that saw the campaign in /campaigns
+  tag_ids           VARCHAR,            -- JSON array: latest raw email_tag_list UUIDs
+  tag_labels        VARCHAR,            -- JSON array: latest resolved raw labels (NO tier mapping)
+  _loaded_at        TIMESTAMPTZ NOT NULL,
+  _run_id           VARCHAR NOT NULL
 );
 
 -- =====================================================================
