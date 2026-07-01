@@ -15,9 +15,11 @@ rebuild each run (core.meeting is a pure projection of its two raw sources).
 
 Campaign attribution for sheet rows = main.norm_campaign_name() join to the campaign universe
 (raw_pipeline_campaigns); ~97.5% of email submissions resolve directly. The residual (genuine
-non-campaign labels / truncated names) land with campaign_id NULL and match_method='unmatched' —
-those are the campaigns flagged as carrying inaccurate data (per the DoD), and the 4-tier fallback
-matcher is the safety net for them.
+non-campaign labels / truncated names) land with campaign_id NULL and match_method='unmatched'.
+The real match_method vocabulary (no "4-tier matcher" exists — DATA-2 docstring fix 2026-07-01):
+sheet-era: 'sheet_norm' (norm-name join) | 'unmatched' | 'partner_sheet' (step 2.5) |
+'email_reply_backfill' (step 2b) | 'sms_phone_sendivo' (step 2e); slack-era rows carry the legacy
+matcher values ('exact' | 'alias' | 'normalized' | 'manual*' | 'llm_*' | ..., see 20_meeting.sql).
 
 WS5 v3 [2026-06-21] — canonical business-date + workspace-normalized D6 attribution + D7 SMS split:
   * meeting_date  = col A "Date" (the business date Grace + the sheet pivots use); the sheet rows
@@ -595,8 +597,18 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
     #        campaign_name_raw for meetings-by-blast). meeting_id namespaced 'summit:'/'collins:' (never
     #        collides with the Funding-Form 'sheet:'). Runs AFTER step 2 so the dedup-vs-Funding-Form
     #        NOT EXISTS sees the just-inserted Funding-Form rows. NOT gated on CUTOVER (no competing
-    #        Slack/Funding-Form Pre-IPO source — verified 0 overlap). Workspace/cm_workspace left NULL so
-    #        these never leak CM credit onto a funding workspace.
+    #        Slack/Funding-Form Pre-IPO source — verified 0 overlap).
+    #        WORKSPACE (DATA-2 B3, 2026-07-01): Collins/Summit partner-desk rows now attribute to the
+    #        synthetic Sendivo (Renaissance 2) workspace — Sendivo Pre-IPO-family sends are 100%
+    #        Renaissance 2 (0 from Ren1/Ren3) and the 28 already-attributed Pre-IPO siblings all carry
+    #        'Sendivo (Renaissance 2)' / slug 'sendivo-renaissance-2' (mirrored exactly here). This is
+    #        the deterministic partner+offer desk rule (no phone join); it covers the 433 June rows AND
+    #        the 91 Apr/May Collins rows (524 total — Sam-sanctioned Apr/May extension, 2026-07-01).
+    #        NB: slug 'sendivo-renaissance-2' is a SYNTHETIC label, NOT core.workspace slug
+    #        'renaissance-2' (= Funding 5 / Eyver) — dim row seeded by the DATA-2 core.workspace DDL.
+    #        campaign_id stays NULL by design (Sendivo has no registry in core.campaign);
+    #        match_method stays 'partner_sheet' (view 1018 offer logic + run metrics key on it).
+    #        cm_workspace stays NULL so these never leak CM credit onto a funding workspace.
     db.execute(
         f"""
         INSERT INTO core.meeting
@@ -658,13 +670,13 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
           NULL                               AS inbox_manager,       -- partner-side setter stays in the raw table, not an IM
           d.meeting_date                     AS meeting_date,        -- canonical (col A "Date" = booked-on)
           CAST(d.meeting_date AS TIMESTAMP)  AS submission_ts,
-          NULL                               AS workspace_name,      -- partner desk, not a Renaissance workspace
-          NULL                               AS workspace_slug,
-          NULL                               AS workspace_canonical,
+          'Sendivo (Renaissance 2)'          AS workspace_name,      -- B3 desk rule: Pre-IPO desks send 100% via Sendivo Ren2
+          'sendivo-renaissance-2'            AS workspace_slug,      -- SYNTHETIC slug (NOT 'renaissance-2' = Funding 5)
+          'Sendivo (Renaissance 2)'          AS workspace_canonical, -- mirrors the 28 already-attributed Pre-IPO siblings
           NULL                               AS cm_workspace,        -- no CM credit (prevents Pre-IPO leaking onto a funding CM)
           'Pre-IPO'                          AS program,
           'Pre-IPO'                          AS offer,
-          NULL                               AS sendivo_sub_account
+          CASE WHEN d.channel = 'SMS' THEN 'Renaissance 2' END AS sendivo_sub_account  -- 107 contract: SMS-only; NULL otherwise
         FROM ps_dedup d
         -- DEDUP vs the Funding rows inserted in steps 2 + 2-IMB: drop a partner row whose (lead_email,
         -- meeting_date) already exists as a Funding meeting (same booking logged twice). 0 today
@@ -716,6 +728,163 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
           ) WHERE rn = 1
         ) AS b
         WHERE m.meeting_id = b.meeting_id
+        """
+    )
+
+    # -- 2e. SMS phone -> Sendivo send-log -> campaign_name + sub_account (DATA-2, 2026-07-01).
+    #        Funding SMS meetings booked off a Sendivo blast have NO Instantly campaign, so the
+    #        norm-name join leaves them match_method='unmatched'. Recover the originating blast by
+    #        phone: resolve the lead's phone10 (imb rows via raw_im_bookings.id = source_event_id;
+    #        frozen-FF 'sheet:' rows via the lead_email -> im_bookings fallback, nearest booking
+    #        date), then take the MOST RECENT rich-send-log message sent AT/BEFORE the meeting date
+    #        (strict — never attribute a send AFTER the booking; the "nearest after" fallback the
+    #        investigator drafted was dropped per the B5 verifier: 7 impossible-causation rows).
+    #        SETS campaign_name_raw (Sendivo campaign label; campaign_id stays NULL — Sendivo has no
+    #        registry in core.campaign, so this is NOT campaign-id attribution), workspace_* only
+    #        when the row has NO label at all (name-anchored fill; sub_account -> 'Sendivo
+    #        (Renaissance N)' via core.workspace_alias, never a hand CASE),
+    #        match_method='sms_phone_sendivo', match_confidence=0.7. Only CAMPAIGN-BEARING send-log
+    #        rows count (a row never leaves 'unmatched' without gaining an attribution), de-duped to
+    #        the latest load per sendivo_log_id (the mirror re-pulls a 6h overlap).
+    #        GUARDS (verifier-mandated): channel='SMS' + match_method='unmatched' + campaign NULL +
+    #        offer <> 'Pre-IPO' (Pre-IPO desk rows belong to the step-2.5 B3 rule; without this, 11
+    #        Collins/Summit SMS bookings leak into the Funding attribution path). Yield is bounded by
+    #        the rich send-log window (raw_sendivo_outbound_message starts 2026-06-26) — a DATA gap,
+    #        not a logic gap; coverage grows as the send-log accumulates (idempotent full rebuild).
+    db.execute(
+        f"""
+        UPDATE core.meeting AS m
+        SET campaign_name_raw   = COALESCE(m.campaign_name_raw, b.campaign_name),
+            -- workspace fill is NAME-anchored: only a row with NO label at all takes the resolved
+            -- triple (an existing label wins in full — never a mixed name/slug pair from two sources).
+            workspace_name      = COALESCE(m.workspace_name, b.ws_name),
+            workspace_slug      = CASE WHEN m.workspace_name IS NULL OR m.workspace_name = ''
+                                       THEN b.ws_slug ELSE m.workspace_slug END,
+            workspace_canonical = CASE WHEN m.workspace_name IS NULL OR m.workspace_name = ''
+                                       THEN b.ws_canon ELSE m.workspace_canonical END,
+            sendivo_sub_account = COALESCE(m.sendivo_sub_account, b.sub_account_name),
+            match_method        = 'sms_phone_sendivo',
+            match_confidence    = 0.7
+        FROM (
+          WITH tgt AS (
+            SELECT meeting_id, meeting_date, source_event_id, lead_email
+            FROM core.meeting
+            WHERE (is_duplicate_of IS NULL OR is_duplicate_of = '')
+              AND (campaign_id IS NULL OR campaign_id = '')
+              AND channel = 'SMS'
+              AND match_method = 'unmatched'
+              AND COALESCE(offer, '') <> 'Pre-IPO'
+              AND (meeting_id LIKE 'sheet:%' OR meeting_id LIKE 'imb:%')
+          ),
+          rib AS (  -- live portal bookings, latest snapshot only (same pin as step 2-IMB)
+            SELECT id,
+                   NULLIF(lower(trim(email)), '') AS email_k,
+                   NULLIF(right(regexp_replace(CAST(phone AS VARCHAR), '[^0-9]', '', 'g'), 10), '') AS phone10,
+                   TRY_CAST("date" AS DATE) AS booking_date
+            FROM {IMB}
+            WHERE _source = '{IMB_SOURCE_TAG}'
+              AND _snapshot_date = (SELECT max(_snapshot_date) FROM {IMB}
+                                    WHERE _source = '{IMB_SOURCE_TAG}')
+              AND phone IS NOT NULL
+          ),
+          ph AS (   -- phone via booking id (imb rows), else via lead_email (frozen-FF rows)
+            SELECT t.meeting_id, t.meeting_date, r.phone10,
+                   0 AS dist, r.id AS tiebreak
+            FROM tgt t JOIN rib r ON CAST(r.id AS VARCHAR) = t.source_event_id
+            WHERE t.meeting_id LIKE 'imb:%'
+            UNION ALL
+            SELECT t.meeting_id, t.meeting_date, r.phone10,
+                   abs(datediff('day', r.booking_date, t.meeting_date)) AS dist, r.id AS tiebreak
+            FROM tgt t JOIN rib r ON r.email_k = t.lead_email
+            WHERE t.meeting_id LIKE 'sheet:%' AND t.lead_email IS NOT NULL
+          ),
+          ph1 AS (  -- one phone per meeting: nearest same-lead booking, deterministic tiebreak
+            SELECT meeting_id, meeting_date, phone10 FROM (
+              SELECT *, ROW_NUMBER() OVER (PARTITION BY meeting_id ORDER BY dist, tiebreak) AS prn
+              FROM ph WHERE phone10 IS NOT NULL AND length(phone10) = 10
+            ) WHERE prn = 1
+          ),
+          slog AS (  -- de-dup the append-only send-log mirror (overlap re-pulls carry duplicate
+                     -- sendivo_log_ids; latest load wins — same pattern as v_sendivo_outbound_blast,
+                     -- which is NOT reused here because it filters blast_id IS NOT NULL while this
+                     -- step needs CAMPAIGN-bearing rows), and require a campaign_name so a row never
+                     -- exits the 'unmatched' bucket without gaining an attribution.
+            SELECT phone10, campaign_name, sub_account_name, sent_at, sendivo_log_id FROM (
+              SELECT *, ROW_NUMBER() OVER (PARTITION BY sendivo_log_id ORDER BY _loaded_at DESC) AS lrn
+              FROM main.raw_sendivo_outbound_message
+              WHERE campaign_name IS NOT NULL
+            ) WHERE lrn = 1
+          ),
+          ranked AS (  -- most-recent send AT/BEFORE the meeting; rn=1 collapses multi-blast phones (no fan-out)
+            SELECT p.meeting_id, s.campaign_name, s.sub_account_name,
+                   ROW_NUMBER() OVER (PARTITION BY p.meeting_id
+                                      ORDER BY s.sent_at DESC, s.sendivo_log_id) AS rn
+            FROM ph1 p
+            JOIN slog s
+              ON s.phone10 = p.phone10
+             AND CAST(s.sent_at AS DATE) <= p.meeting_date
+          )
+          SELECT r.meeting_id, r.campaign_name, r.sub_account_name,
+                 a.alias_name              AS ws_name,
+                 a.warehouse_slug          AS ws_slug,
+                 a.canonical_current_name  AS ws_canon
+          FROM ranked r
+          LEFT JOIN core.workspace_alias a
+            ON a.alias_name = 'Sendivo (' || r.sub_account_name || ')'
+          WHERE r.rn = 1
+        ) AS b
+        WHERE m.meeting_id = b.meeting_id
+        """
+    )
+
+    # -- 2f. HISTORICAL campaign -> workspace backfill (DATA-2 B4, 2026-07-01). Pre-cutover Slack
+    #        rows carry a campaign_id but were inserted with workspace_* NULL (the Slack source has
+    #        no col-O). Resolve workspace from the campaign dimension — 3-tier, first hit wins:
+    #        (1) raw_pipeline_campaigns.workspace_id, which is a SLUG (joining it as a UUID returns
+    #            0 — the verified trap), incl. the one display-form label 'Renaissance 2' normalized
+    #            to slug 'renaissance-2' (= Funding 5; 2 campaigns / 44 meetings);
+    #        (2) raw_instantly_campaign.workspace_id (UUID);
+    #        (3) core.campaign.workspace_id (UUID).
+    #        ROW_NUMBER-by-priority => exactly one workspace per campaign (verified no fan-out),
+    #        slug+name always from the same row.
+    #        Only fills workspace-NULL non-dup rows with a campaign_id; June rows are untouched by
+    #        construction (every June workspace-NULL row is also campaign-NULL). Resolves 7,435 of
+    #        8,831 all-time + ~1,394 more once the 4 cancelled slugs (outlook-2, renaissance-6/7,
+    #        erc-2) are re-seeded in core.workspace (the DATA-7 dim DDL shipped with this change).
+    db.execute(
+        """
+        UPDATE core.meeting AS m
+        SET workspace_slug      = p.slug,
+            workspace_name      = p.name,
+            workspace_canonical = p.name   -- core.workspace.name IS the canonical current display name;
+                                           -- without it v_meeting_canonical buckets these '(unmapped)'
+        FROM (
+          SELECT campaign_id, slug, name FROM (
+            -- rn=1 picks slug+name from the SAME row, fully deterministic on pri ties
+            -- (arg_min per-column could mix two workspaces if a campaign ever relabeled).
+            SELECT campaign_id, slug, name,
+                   ROW_NUMBER() OVER (PARTITION BY campaign_id ORDER BY pri, slug, name) AS rn
+            FROM (
+              SELECT DISTINCT rpc.campaign_id, w.slug, w.name, 1 AS pri
+                FROM main.raw_pipeline_campaigns rpc
+                JOIN core.workspace w
+                  ON (CASE WHEN rpc.workspace_id = 'Renaissance 2' THEN 'renaissance-2'
+                           ELSE rpc.workspace_id END) = w.slug
+              UNION
+              SELECT DISTINCT ric.campaign_id, w.slug, w.name, 2 AS pri
+                FROM main.raw_instantly_campaign ric
+                JOIN core.workspace w ON ric.workspace_id = w.workspace_id
+              UNION
+              SELECT DISTINCT c.campaign_id, w.slug, w.name, 3 AS pri
+                FROM core.campaign c
+                JOIN core.workspace w ON c.workspace_id = w.workspace_id
+            )
+          ) WHERE rn = 1
+        ) AS p
+        WHERE m.campaign_id = p.campaign_id
+          AND (m.is_duplicate_of IS NULL OR m.is_duplicate_of = '')
+          AND m.campaign_id <> ''
+          AND (m.workspace_name IS NULL OR m.workspace_name = '')
         """
     )
 
@@ -849,6 +1018,14 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
     imb_dupes = db.execute(
         "SELECT count(*) FROM core.meeting WHERE meeting_id LIKE 'imb:%' AND is_duplicate_of IS NOT NULL"
     ).fetchone()[0]
+    # DATA-2 attribution extensions (2026-07-01) — observable step yields.
+    sms_phone_matched = db.execute(
+        "SELECT count(*) FROM core.meeting WHERE match_method='sms_phone_sendivo'"
+    ).fetchone()[0]
+    slack_ws_backfilled = db.execute(
+        "SELECT count(*) FROM core.meeting WHERE source='slack' "
+        "AND workspace_name IS NOT NULL AND workspace_name <> ''"
+    ).fetchone()[0]
     # Pre-IPO partner-desk rows (Summit + Collins) — net-new meetings by channel, all offer='Pre-IPO'.
     partner_by_channel = db.execute(
         "SELECT channel, count(*) FROM core.meeting WHERE match_method='partner_sheet' GROUP BY 1 ORDER BY 1"
@@ -863,10 +1040,12 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
                        partner_unmapped)
     logger.info("core.meeting rebuilt: %d rows %s; Funding email-meetings unmatched=%d "
                 "(reply-backfilled=%d, email-attribution=%.2f%%); im_bookings meetings=%d %s "
-                "(soft-flagged dupes=%d); partner Pre-IPO meetings=%d %s",
+                "(soft-flagged dupes=%d); partner Pre-IPO meetings=%d %s; "
+                "SMS phone->sendivo matched=%d; slack ws-backfilled=%d",
                 n, dict(by_source), sheet_unmatched, sheet_backfilled, sheet_attr_pct or 0.0,
                 imb_total, dict(imb_by_channel), imb_dupes,
-                partner_total, dict(partner_by_channel))
+                partner_total, dict(partner_by_channel),
+                sms_phone_matched, slack_ws_backfilled)
     return PhaseResult(
         rows_in=n, rows_out=n,
         notes={"by_source": dict(by_source), "sheet_email_unmatched": sheet_unmatched,
@@ -875,5 +1054,7 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
                "imb_meetings": imb_total, "imb_by_channel": dict(imb_by_channel),
                "imb_soft_flagged_dupes": imb_dupes,
                "partner_preipo_meetings": partner_total,
-               "partner_preipo_by_channel": dict(partner_by_channel)},
+               "partner_preipo_by_channel": dict(partner_by_channel),
+               "sms_phone_sendivo_matched": sms_phone_matched,
+               "slack_ws_backfilled": slack_ws_backfilled},
     )
