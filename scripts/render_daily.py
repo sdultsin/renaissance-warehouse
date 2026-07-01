@@ -403,17 +403,39 @@ def get_sms_wa():
     wa_mtg = sum(1 for b in book if b["channel"].lower() == "whatsapp")
     # Row shape: (label, sent, delivered, failed|None, human_replies, meetings).  WhatsApp surfaces
     # DELIVERED + FAIL% (ISKRA "sent" runs ~30-37% failed -> attempted is misleading); KPI=deliv/mtg
-    # (folds in #116). SMS has no failed column here -> failed=None -> Fail% "—", delivered≈sent (the
-    # sendivo billed/sent count; SMS delivery is ~100%). Funding SMS meetings on Ren1; Pre-IPO on Ren2.
+    # (folds in #116). SMS delivered/failed come from main.v_sms_campaign_performance (raw sendivo
+    # campaign-daily rollup) per sub-account [Jun-30 accuracy pass 07-01]: SMS delivery is NOT ~100%
+    # (06-30 Ren1 ran 14% failed), so delivered=sent + Fail% "—" understated real failures. Sent stays
+    # the sendivo BILLING quantity (the calibrated §2 source; the view's own sent tracks it within
+    # ~0.01%). Fail-soft: no view row for a sub/day (same-day sync lag) -> legacy (delivered≈sent,
+    # failed=None -> Fail% "—"), never a crash. Funding SMS meetings on Ren1; Pre-IPO on Ren2.
     # Ren3 (webform): the "meetings" column shows completed WEB-FORM FILLS (Lumara apply-now), NOT
     # meetings — Ren3 is a form-conversion line [Sam 06-30]. KPI = sent / webforms (same sent/x formula
     # as the other rows). SMS-sourced MEETINGS stay on the Ren1 row (im_bookings' SMS channel carries no
     # sub-account) — Ren3 does not double-count them. The shared column is headed "Meetings/Webform".
     # ORDER MATTERS: Ren1 must stay index 0 and Ren2 index 1 (write_summary_block reads SMS_D[0]/[1]).
+    perf = {}
+    try:
+        for r in wq(f"""SELECT sub_account_name, sum(delivered), sum(failed)
+                        FROM main.v_sms_campaign_performance
+                        WHERE metric_date = DATE '{DAILY}' AND sub_account_name IS NOT NULL
+                        GROUP BY 1"""):
+            perf[r[0]] = (int(r[1] or 0), int(r[2] or 0))
+    except Exception as e:
+        print(f"WARN get_sms_wa: v_sms_campaign_performance unavailable for {DAILY} ({e}); "
+              "SMS rows fall back to delivered≈sent, Fail% '—'", file=sys.stderr)
+    def deliv_failed(sub_name, billed_sent):
+        p = perf.get(sub_name)
+        if p is None:
+            if billed_sent:
+                print(f"WARN get_sms_wa: no v_sms_campaign_performance row for '{sub_name}' on {DAILY} "
+                      f"(billed {billed_sent}); rendering delivered≈sent, Fail% '—'", file=sys.stderr)
+            return billed_sent, None
+        return p
     rows = []
-    s1 = sms.get(SUB_REN1, 0); rows.append(("Renaissance 1 (SMS)", s1, s1, None, inb.get("Renaissance 1", (0, 0))[1], sms_mtg))
-    s2 = sms.get(SUB_REN2, 0); rows.append(("Renaissance 2 (SMS · Pre-IPO)", s2, s2, None, inb.get("Renaissance 2", (0, 0))[1], preipo_meetings(DAILY)))
-    s3 = sms.get(SUB_REN3, 0); rows.append(("Renaissance 3 (SMS · webform)", s3, s3, None, inb.get("Renaissance 3", (0, 0))[1], webform_submissions(DAILY)))
+    s1 = sms.get(SUB_REN1, 0); d1, f1 = deliv_failed("Renaissance 1", s1); rows.append(("Renaissance 1 (SMS)", s1, d1, f1, inb.get("Renaissance 1", (0, 0))[1], sms_mtg))
+    s2 = sms.get(SUB_REN2, 0); d2, f2 = deliv_failed("Renaissance 2", s2); rows.append(("Renaissance 2 (SMS · Pre-IPO)", s2, d2, f2, inb.get("Renaissance 2", (0, 0))[1], preipo_meetings(DAILY)))
+    s3 = sms.get(SUB_REN3, 0); d3, f3 = deliv_failed("Renaissance 3", s3); rows.append(("Renaissance 3 (SMS · webform)", s3, d3, f3, inb.get("Renaissance 3", (0, 0))[1], webform_submissions(DAILY)))
     wa = wq(f"""SELECT sent, delivered, failed, replies_total FROM main.v_sms_dash_wa_daily
                 WHERE channel='whatsapp' AND metric_date=DATE '{DAILY}'""")
     if wa:
@@ -423,7 +445,7 @@ def get_sms_wa():
     rows.append(("WhatsApp (ISKRA)", ws_, wd, wf, wr, wa_mtg))
     return rows
 
-# ---------------------------- §2b/§2c SMS KPI-to-opp + campaign leaderboard ----------------------------
+# ---------------------------- §2b SMS KPI-to-opp ----------------------------
 # The SMS "opp" (opportunity) = a POSITIVE-INTENT inbound reply, per the CURRENT-native notion:
 # derived.sms_reply_is_positive_qwen.is_positive (the Qwen classifier already shipped as the warehouse's
 # SMS positive-reply signal — we surface it, we do NOT build a bespoke reclassifier [Sam 2026-06-30]).
@@ -481,38 +503,8 @@ def get_sms_kpi_to_opp():
                   GROUP BY 1 ORDER BY 1""")
     return {"dates": dates, "rows": [(r[0], int(r[1] or 0), int(r[2] or 0)) for r in rows]}
 
-def get_sms_leaderboard(limit=30, min_opps=10, min_sent=20000):
-    """Per-CAMPAIGN sent -> opp leaderboard over the trailing fully-classified window. Sends from
-    main.v_sms_campaign_performance; opps = Qwen positive replies attributed to the campaign by reply
-    number -> campaign (main.v_sendivo_number_campaign is 1:1 our_number->campaign, 100% of opps map).
-    CAMPAIGN grain, NOT per-blast: the per-blast outbound-message log ties only ~22% of opps to a blast
-    (blocked on Sendivo blast_id on the won-export — Larry). Ranked best-first (lowest Sent/opp) among
-    campaigns ACTIVELY sending in-window (>= min_sent sent AND >= min_opps opps): the min_sent floor drops
-    campaigns whose in-window opps are replies to OUT-of-window sends (tiny sent -> artefactual ~2 sent/opp)."""
-    dates, inlist = _sms_win_inlist()
-    if not inlist:
-        return {"dates": [], "rows": []}
-    rows = wq(f"""
-      WITH nc AS (
-        SELECT our_number, any_value(campaign_id) campaign_id
-        FROM main.v_sendivo_number_campaign WHERE campaign_id IS NOT NULL GROUP BY 1),
-      opp AS (
-        SELECT nc.campaign_id, count(*) opps
-        FROM derived.sms_reply_is_positive_qwen q
-        JOIN main.raw_sendivo_inbound i ON i.inbound_message_id = q.reply_id
-        JOIN nc ON nc.our_number = ('+' || ltrim(i.our_number, '+'))
-        WHERE q.is_positive AND CAST(i.received_at AS DATE) IN ({inlist})
-        GROUP BY 1),
-      snd AS (
-        SELECT campaign_id, any_value(campaign_name) campaign_name, any_value(sub_account_name) sub_account, sum(sent) sent
-        FROM main.v_sms_campaign_performance WHERE metric_date IN ({inlist}) GROUP BY 1)
-      SELECT COALESCE(snd.sub_account, '(no-send)'), COALESCE(snd.campaign_name, CAST(opp.campaign_id AS VARCHAR)),
-             COALESCE(snd.sent, 0), COALESCE(opp.opps, 0)
-      FROM snd FULL JOIN opp USING (campaign_id)
-      WHERE COALESCE(opp.opps, 0) >= {int(min_opps)} AND COALESCE(snd.sent, 0) >= {int(min_sent)}
-      ORDER BY COALESCE(snd.sent, 0) * 1.0 / NULLIF(opp.opps, 0) ASC NULLS LAST
-      LIMIT {int(limit)}""")
-    return {"dates": dates, "rows": [(r[0], r[1], int(r[2] or 0), int(r[3] or 0)) for r in rows]}
+# (§2c campaign leaderboard REMOVED from the report 2026-07-01 per the Jun-30 accuracy pass — the
+# underlying warehouse view main.v_sms_campaign_performance stays and now feeds §2 delivered/failed.)
 
 def get_close():
     c = wq(f"""SELECT COUNT(*) dials, COUNT(DISTINCT close_lead_id) leads,
@@ -972,7 +964,6 @@ _IMREPLY_FB = ((DAILY, DAILY, DAILY), [(name, 0, None, None, 0, None, None, 0, N
 EMAIL_D = _safe("email", get_email, _EMAIL_FB)
 SMS_D = _safe("sms_wa", get_sms_wa, _SMS_FB)
 SMS_KPI_D = _safe("sms_kpi_to_opp", get_sms_kpi_to_opp, {"dates": [], "rows": []})
-SMS_LB_D = _safe("sms_leaderboard", get_sms_leaderboard, {"dates": [], "rows": []})
 CLOSE_D = _safe("close", get_close, _CLOSE_FB)
 SENDING_CENSUS, SENDING_TRUTH = _safe("truth", get_truth, _TRUTH_FB)
 PARTNER_D, PARTNER_D_TOTAL = _safe("partner", get_partner, ([], 0))
@@ -993,7 +984,6 @@ if DRY:
     print("§1 EMAIL:");    [print("  ", x) for x in EMAIL_D]
     print("§2 SMS/WA:");   [print("  ", x) for x in SMS_D]
     print(f"§2b SMS KPI-to-opp (window {SMS_KPI_D.get('dates')}):"); [print("   ", r, "sent/opp=", (round(r[1]/r[2]) if r[1] and r[2] else '—')) for r in SMS_KPI_D.get("rows", [])]
-    print(f"§2c SMS leaderboard (top {len(SMS_LB_D.get('rows', []))}):"); [print("   ", r, "sent/opp=", (round(r[2]/r[3]) if r[2] and r[3] else '—')) for r in SMS_LB_D.get("rows", [])]
     print("§3 CLOSE:", CLOSE_D)
     print("§4 TRUTH (ws, otd_exp, goog_exp, tot_exp, actual, otd_actual, goog_actual):"); [print("  ", x) for x in SENDING_TRUTH]
     print("§5 PARTNER:", PARTNER_D, "total", PARTNER_D_TOTAL)
@@ -1071,26 +1061,6 @@ def build_and_write(tab, build_fn):
                 f"Sent/opp = the KPI-to-opp gate (lower = better). Window = {len(d)} fully-classified day(s) "
                 f"{d[0]}..{d[-1]} (≥90% of that day's human replies classified); same-day opps lag ~2-3d so are "
                 f"not shown live. Ren3 webform sends route via the AIM API (not in the campaign feed) -> Sent/opp n/a.")
-        ni = add([note]); data.append(ni); row_ncol[ni] = W
-    def sms_leaderboard_table(lb_d, header_label):
-        # §2c — per-CAMPAIGN sent -> opp leaderboard over the same trailing window. CAMPAIGN grain (not
-        # per-blast): reply number -> campaign is 1:1 and maps 100% of opps; per-blast ties only ~22%
-        # (blocked on Sendivo blast_id on the export — Larry). Best converters first (lowest Sent/opp).
-        W = 5
-        si = add([header_label]); sec.append(si); row_ncol[si] = W
-        hr = add(["Campaign / script", "WS", "Sent", "Opps", "Sent/opp"]); th.append(hr); th_ncol[hr] = W
-        d = lb_d.get("dates") or []
-        if not lb_d.get("rows"):
-            ni = add(["(pending — SMS opp classification not yet available for the trailing window)"]); data.append(ni); row_ncol[ni] = W
-            return
-        for ws, camp, sent, opps in lb_d["rows"]:
-            spo = round(sent / opps) if (opps and sent) else "—"
-            ri = add([(camp or "")[:40], ws, sent, opps, spo]); data.append(ri); row_ncol[ri] = W
-        note = (f"Best converters first (lowest Sent/opp). Actively-sending campaigns only (≥20k sent AND ≥10 opps in-window; "
-                f"the floor drops campaigns whose in-window opps are replies to out-of-window sends). Window {d[0]}..{d[-1]}. "
-                f"opp = Qwen positive reply; attribution: reply number → campaign (100% of opps mapped). Per-BLAST/script "
-                f"attribution needs Sendivo blast_id on the export (pending Larry) — the outbound-message log currently ties "
-                f"only ~22% of opps to a blast, so this ranks at CAMPAIGN grain.")
         ni = add([note]); data.append(ni); row_ncol[ni] = W
     def truth_table(header_label):
         W = 8
@@ -1173,7 +1143,7 @@ def build_and_write(tab, build_fn):
             data.append(ni); row_ncol[ni] = W
     build_fn(dict(add=add, email_table=email_table, sms_wa_table=sms_wa_table, truth_table=truth_table,
                   close_table=close_table, partner_table=partner_table, imreply_table=imreply_table,
-                  infra_table=infra_table, sms_kpi_table=sms_kpi_table, sms_leaderboard_table=sms_leaderboard_table))
+                  infra_table=infra_table, sms_kpi_table=sms_kpi_table))
 
     meta = api("GET", BASE + "?fields=sheets(properties(sheetId,title),bandedRanges(bandedRangeId),conditionalFormats)")
     sh = next((s for s in meta["sheets"] if s["properties"]["title"] == tab), None)
@@ -1239,11 +1209,17 @@ def write_summary_block(sid):
     wsrows = [r for r in EMAIL_D if not r[0].lower().startswith("warm")]
     blk = [[f"{DAILY_TAB} — Business / Funding · {DAILY}", "", "", ""],
            ["WORKSPACE", "Email Sent", "Meeting Booked", "Meeting to Booked"]]
-    ts = tm = 0
+    # Total = §1's TOTAL BY CONSTRUCTION: summed over ALL §1 rows (same list email_table totals),
+    # INCLUDING Warm leads — Warm is displayed in the channel group below but was silently missing
+    # from this total (06-30 read 2,419,145 vs §1's 2,433,955; the 14,810 gap was Warm). Summing
+    # EMAIL_D directly means the yellow total and §1's TOTAL can never disagree again.
+    ts = sum(x[1] for x in EMAIL_D); tm = sum(x[4] for x in EMAIL_D)
     for ws, sent, hr, opps, m, c, r in wsrows:
-        blk.append([ws, sent, m, ratio(sent, m)]); ts += sent; tm += m  # full name incl CM suffix "(Sam)" [Sam 06-30]
-    blk.append(["Total", ts, tm, ratio(ts, tm)]); blk.append(["", "", "", ""])
-    for lbl, s, m in [("SMS Funding", sms1[1], sms1[5]), ("SDR (Close)", CLOSE_D["dials"], CLOSE_D["meetings"]),
+        blk.append([ws, sent, m, ratio(sent, m)])  # full name incl CM suffix "(Sam)" [Sam 06-30]
+    blk.append(["Total (incl. Warm)", ts, tm, ratio(ts, tm)]); blk.append(["", "", "", ""])
+    # NO "SDR (Close)" row here: Close's 388 were DIALS, not emails — an Email-Sent block must not
+    # carry dial counts [Jun-30 accuracy pass 07-01]. Close lives in §3 only.
+    for lbl, s, m in [("SMS Funding", sms1[1], sms1[5]),
                       ("Warm Leads", warm[1], warm[4]), ("WhatsApp Funding (delivered)", wa[2], wa[5])]:
         blk.append([lbl, s, m, ratio(s, m)])
     blk.append(["", "", "", ""])
@@ -1279,8 +1255,12 @@ def daily(ctx):
     ctx["email_table"](EMAIL_D, f"1 · EMAIL + WARM LEADS — by workspace · day {DAILY}"); add()
     ctx["infra_table"](INFRA_D, f"1b · EMAIL KPIs BY INFRASTRUCTURE — Google (reseller) / OTD / Milkbox · all workspaces · day {DAILY}"); add()
     ctx["sms_wa_table"](SMS_D, f"2 · SMS + WHATSAPP — by channel · day {DAILY}"); add()
-    ctx["sms_kpi_table"](SMS_KPI_D, "2b · SMS KPI-to-opp — texts per opportunity by workspace · trailing fully-classified window (the web-form-economics gate)"); add()
-    ctx["sms_leaderboard_table"](SMS_LB_D, "2c · SMS campaign leaderboard — sent → opp · trailing fully-classified window"); add()
+    # §2b header CARRIES its window explicitly ("7-day trailing …"), so it can never again read as a
+    # contradiction of §2's single-day numbers (06-30: §2 Ren3 94,796/day vs §2b 111,328/7d — both right).
+    _w = SMS_KPI_D.get("dates") or []
+    _win = (f"{len(_w)}-day TRAILING window {_w[0]}..{_w[-1]} — NOT the single day above"
+            if _w else "trailing fully-classified window")
+    ctx["sms_kpi_table"](SMS_KPI_D, f"2b · SMS KPI-to-opp — texts per opportunity by workspace · {_win} (the web-form-economics gate)"); add()
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
     ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (active capacity) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · no-lag · census {SENDING_CENSUS}"); add()
     ctx["partner_table"](PARTNER_D, PARTNER_D_TOTAL, f"5 · BOOKINGS BY PARTNER · day {DAILY}"); add()
