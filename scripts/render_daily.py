@@ -544,17 +544,22 @@ def get_truth():
     return census, out
 
 def get_partner():
-    """§5 BOOKINGS BY PARTNER — the PARTNER lens on the day's bookings. It must mirror the portal's
-    "BY PARTNER" view (what Grace reads), which is OFFER-AGNOSTIC: it counts Funding AND Pre-IPO
-    (the Collins/Summit desks) alike. consolidated_bookings() is offer='Funding'-locked (correct for
-    the §1/§2/§3 Funding MEETING columns), so §5 must NOT reuse it — doing so silently dropped the
-    Pre-IPO partners and rendered 132 vs the portal's 160 on 2026-06-30 (Collins 18 + Summit 10).
-    The Pre-IPO desks are ALSO shown as a channel lens (§2 Ren2 / "SMS IPO" via preipo_meetings); that
-    is a different cut of the same meetings, not additive to a single total, so no double-count — same
-    as the June-26 gold §5, which carried Collins/Summit. Dedup one meeting per person WITHIN each
-    partner (email|phone), matching the report's one-person-one-meeting convention (and the portal, when
-    a day has no cross-partner dupes); do NOT cross-dedup across partners (Pre-IPO desks are additive).
-    Null-key rows (no email AND no phone) drop out, same as consolidated_bookings."""
+    """§5 BOOKINGS BY PARTNER = ALL bookings for the day, EVERY time [Sam 2026-07-01]. It is the
+    partner lens that must equal the portal's offer-agnostic "BY PARTNER" view (what Grace reads).
+    Sources, in priority order:
+      1. the portal `main.raw_im_bookings` — ALL offers (Funding + Pre-IPO), per-partner email|phone
+         dedup. This is the primary/authoritative source and covers every channel going forward.
+      2. the Pre-IPO desk SHEETS (Collins/Summit) — used ONLY for a desk the portal does not yet
+         carry that day. The Pre-IPO desks migrated INTO the portal on 2026-06-30 (offer='Pre-IPO');
+         BEFORE that (e.g. 06-29) they lived only in the Google sheets, so a portal-only §5 would miss
+         them. Once the portal carries a desk it is authoritative (06-30: portal Collins 18 / Summit 10
+         reconciled to the sheets exactly), so we do NOT also add the sheet -> no double-count.
+    NB on the 06-29 source switch: the Funding bookings that were in the retired Business-Funding form
+    sheet were already imported into the portal that day (06-29 portal = 123), so they need no separate
+    union here; only the Pre-IPO desks (still sheet-only on 06-29) do. consolidated_bookings() stays
+    offer='Funding'-locked for the §1/§2/§3 MEETING columns; §5 must NOT reuse it. Dedup one booking
+    per person WITHIN each partner (email|phone); do NOT cross-dedup across partners (desks are additive).
+    Null-key rows (no email AND no phone) drop, same as consolidated_bookings."""
     try:
         rows = wq(f"""
           SELECT coalesce(nullif(trim(partner), ''), '(unknown)')         AS partner,
@@ -566,11 +571,23 @@ def get_partner():
           GROUP BY 1""")
     except Exception as e:
         print(f"WARN get_partner im_bookings read failed {DAILY}: {e}", file=sys.stderr)
-        return [], 0
-    # int(n) in the filter too: the query API can serialize a BIGINT count as a JSON string, and
-    # a truthy "0" would otherwise leak a spurious '(unknown) 0' row. Secondary sort key = partner
-    # name so tied counts render deterministically (wq row order is arbitrary).
-    pr = sorted(((p, int(n)) for p, n in rows if int(n)), key=lambda x: (-x[1], x[0]))
+        rows = []
+    # int(n) in the filter too: the query API can serialize a BIGINT count as a JSON string, and a
+    # truthy "0" would otherwise leak a spurious '(unknown) 0' row.
+    cnt = {p: int(n) for p, n in rows if int(n)}
+    # Union the Pre-IPO desk sheets, but ONLY for a desk the portal doesn't already carry this day
+    # (else 06-30+ would double-count the desks the portal now owns). preipo_by_desk is cached, so
+    # this reuses the read §2 already did. Fail-soft: a sheet hiccup never breaks §5. Presence check is
+    # case/whitespace-insensitive so a desk vs partner casing mismatch can't leak a duplicate row.
+    present = {str(k).strip().casefold() for k in cnt}
+    try:
+        for desk, dn in preipo_by_desk(DAILY)["by_desk"].items():
+            if int(dn) and str(desk).strip().casefold() not in present:
+                cnt[desk] = int(dn)
+    except Exception as e:
+        print(f"WARN get_partner preipo-desk union failed {DAILY}: {e}", file=sys.stderr)
+    # Secondary sort key = partner name so tied counts render deterministically.
+    pr = sorted(cnt.items(), key=lambda x: (-x[1], x[0]))
     return pr, sum(n for _, n in pr)
 
 def get_im_reply():
