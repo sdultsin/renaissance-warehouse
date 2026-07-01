@@ -570,10 +570,14 @@ def get_truth():
     # zero) — currently 0 for every reporting workspace on the last-good census.
     asplit = {}   # slug -> (otd_actual, google_actual, unmapped_actual)
     for r in wq(f"""
-        WITH ws_cens AS (
+        WITH ws_cens AS (   -- IDENTICAL census pick to Expected's `used`/`cap` (max census that
+                            -- actually HOLDS Active OTD/Google rows), so the split and Expected always
+                            -- read a workspace at the SAME census — never diverge on a partial-capture
+                            -- day whose newest census holds only Outlook/retired rows.
               SELECT workspace_slug, max(census_date) AS cd FROM core.account_label
-              WHERE workspace_slug IN ({SLUGS_SQL}) GROUP BY 1),
-             lbl AS (
+              WHERE workspace_slug IN ({SLUGS_SQL})
+                AND lifecycle='Active' AND infra IN ('OTD','Google') GROUP BY 1),
+             lbl AS (   -- ALL infra rows (incl. Outlook) at that census, to bucket every sender
               SELECT al.workspace_slug, al.email, al.infra
               FROM core.account_label al JOIN ws_cens w
                 ON w.workspace_slug=al.workspace_slug AND w.cd=al.census_date),
@@ -1194,8 +1198,8 @@ def build_and_write(tab, build_fn):
     reqs.append({"repeatCell": {"range": rng(0, NROW, 0, 1), "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}}, "fields": "userEnteredFormat.numberFormat"}})
     for i in rrrows:  # §2 Human RR (col 4) as a percent
         reqs.append({"repeatCell": {"range": rng(i, i + 1, 4, 5), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}}}, "fields": "userEnteredFormat.numberFormat"}})
-    for i in strows:
-        reqs.append({"repeatCell": {"range": rng(i, i + 1, 5, 6), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}}, "fields": "userEnteredFormat.numberFormat"}})
+    for i in strows:  # §4 Fulfillment % — col 7 (shifted +2 by the Actual OTD/Google columns)
+        reqs.append({"repeatCell": {"range": rng(i, i + 1, 7, 8), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}}, "fields": "userEnteredFormat.numberFormat"}})
     for i in infrows:  # §1b RR / Human RR / Positive RR (cols 2,3,4) as percents
         for c in (2, 3, 4):
             reqs.append({"repeatCell": {"range": rng(i, i + 1, c, c + 1), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}}}, "fields": "userEnteredFormat.numberFormat"}})
