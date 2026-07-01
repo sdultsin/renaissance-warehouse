@@ -11,27 +11,43 @@ itself) kills the whole import:
 
 That aborted the 2026-07-01 nightly compaction and left the writer DB at 171 GB.
 
-This driver replays the export the same way IMPORT DATABASE does (schema.sql, then
-load.sql), but runs schema.sql in MULTI-PASS: statements that fail with a catalog/
-binder error (missing dependency) are retried on the next pass, when their
-dependencies exist. Fixpoint reached with failures remaining -> exit non-zero and
-print every failing statement + error, so compact_warehouse.sh ABORTS and keeps the
-original DB (fail-loud, never a silently incomplete copy). Data COPYs (load.sql) are
-order-independent and run once; ANY failure there is fatal.
+This driver replays the export in THREE phases instead of IMPORT DATABASE's two:
+
+1. SCHEMA (multi-pass, indexes deferred): statements failing on catalog/binder errors
+   (missing dependency) retry on the next pass, when their dependencies exist.
+   Fixpoint with failures remaining -> exit non-zero listing every failing statement,
+   so compact_warehouse.sh ABORTS and keeps the original DB. CREATE [UNIQUE] INDEX
+   statements are NOT run here — see phase 3.
+2. DATA (load.sql COPYs, order-independent, threads-bounded): running the COPYs into
+   INDEX-FREE tables. Loading a 32.5M-row table (raw_pipeline_conversation_messages,
+   16GB parquet) with its 5 ART indexes live blew the 8GB memory_limit at COMMIT
+   ("failed to pin block of size 256.0 KiB (7.4 GiB/7.4 GiB used)") at threads=8 AND
+   threads=2, and a failed index-commit leaves partial rows so a same-table retry then
+   dies on "Duplicate key" (both observed live 2026-07-01). Deferring index creation
+   removes index maintenance from the COPY commit entirely (standard bulk-load
+   practice). threads=2 caps parallel row-group writer memory; a COPY that still fails
+   gets ONE retry at threads=1 after clearing its partial rows (DELETE) + CHECKPOINT.
+   A second failure aborts loud.
+3. INDEXES: the deferred CREATE [UNIQUE] INDEX statements run one-at-a-time on the
+   fully-loaded tables (each build gets the whole memory budget; a UNIQUE index build
+   also re-verifies uniqueness). Any failure aborts loud — the original DB is kept.
 
 Usage: compact_import.py <export_dir> <new_db_path> <memory_limit> <temp_dir>
 Exit codes: 0 ok; 2 bad args/missing export files; 3 unresolvable schema statements;
-4 data load failure.
+4 data load failure; 5 index build failure.
 """
 
 from __future__ import annotations
 
+import re
 import sys
 from pathlib import Path
 
 import duckdb
 
 MAX_PASSES = 25  # dependency chains are shallow; each pass must make progress anyway
+_INDEX_RE = re.compile(r"^\s*CREATE\s+(?:UNIQUE\s+)?INDEX\b", re.IGNORECASE)
+_COPY_TARGET_RE = re.compile(r"^\s*COPY\s+(\S+)\s+FROM\b", re.IGNORECASE)
 
 
 def _first_line(s: str, n: int = 160) -> str:
@@ -56,11 +72,13 @@ def main() -> int:
     con.execute(f"SET memory_limit='{memlimit}'")
     con.execute(f"SET temp_directory='{tmpdir}'")
 
-    # --- schema: multi-pass so view-on-view ordering can never abort the import ------
-    pending = [
+    # --- 1. schema (multi-pass; CREATE INDEX deferred to phase 3) --------------------
+    all_stmts = [
         s for s in duckdb.extract_statements(schema_sql.read_text())
         if s.query.strip().rstrip(";").strip()
     ]
+    deferred_indexes = [s for s in all_stmts if _INDEX_RE.match(s.query)]
+    pending = [s for s in all_stmts if not _INDEX_RE.match(s.query)]
     total = len(pending)
     for pass_no in range(1, MAX_PASSES + 1):
         failed: list[tuple] = []  # (statement, error)
@@ -72,7 +90,8 @@ def main() -> int:
                 failed.append((stmt, exc))
             # any OTHER exception type is a real error: fail loud immediately
         if not failed:
-            print(f"schema: {total} statements applied in {pass_no} pass(es)")
+            print(f"schema: {total} statements applied in {pass_no} pass(es) "
+                  f"({len(deferred_indexes)} indexes deferred)")
             break
         if len(failed) == len(pending):
             # fixpoint with failures left -> genuinely broken statements, not ordering
@@ -88,14 +107,7 @@ def main() -> int:
               f"({len(pending)} pending)", file=sys.stderr)
         return 3
 
-    # --- data: COPY ... FROM parquet, order-independent, one shot, fatal on error ----
-    # threads=2 for the load phase: at the box default (8 threads / 8 vCPU) the commit of a
-    # very large single-table COPY pins more dirty blocks than an 8GB memory_limit allows —
-    # observed 2026-07-01 on raw_pipeline_conversation_messages (16GB parquet, 32.5M fat-text
-    # rows): "Failed to commit: failed to pin block of size 256.0 KiB (7.4 GiB/7.4 GiB used)".
-    # Loads are IO-bound; fewer threads costs little and scales peak memory down linearly.
-    # A COPY that still hits a memory/pin error gets ONE retry at threads=1 after a
-    # CHECKPOINT (frees pinned blocks from prior loads); a second failure aborts loud.
+    # --- 2. data: COPY ... FROM parquet into index-free tables -----------------------
     con.execute("SET threads=2")
     loads = [
         s for s in duckdb.extract_statements(load_sql.read_text())
@@ -106,8 +118,13 @@ def main() -> int:
             con.execute(stmt.query)
         except (duckdb.OutOfMemoryException, duckdb.TransactionException) as exc:
             print(f"data: statement {i}/{len(loads)} hit {type(exc).__name__} at threads=2; "
-                  f"retrying at threads=1: {_first_line(stmt.query, 100)}")
+                  f"clearing partial rows + retrying at threads=1: {_first_line(stmt.query, 100)}")
             try:
+                # a failed commit can leave partial rows behind — clear the target table
+                # first or the retry dies on duplicates (observed live 2026-07-01).
+                m = _COPY_TARGET_RE.match(stmt.query)
+                if m:
+                    con.execute(f"DELETE FROM {m.group(1)}")
                 con.execute("CHECKPOINT")
                 con.execute("SET threads=1")
                 con.execute(stmt.query)
@@ -121,6 +138,17 @@ def main() -> int:
                   f"{_first_line(stmt.query)}\n  -> {exc}", file=sys.stderr)
             return 4
     print(f"data: {len(loads)} COPY statements applied")
+
+    # --- 3. indexes: build one-at-a-time on the loaded tables ------------------------
+    con.execute("CHECKPOINT")  # flush load buffers so index builds get the full budget
+    for j, stmt in enumerate(deferred_indexes, 1):
+        try:
+            con.execute(stmt.query)
+        except Exception as exc:  # noqa: BLE001
+            print(f"ABORT: index build failed ({j}/{len(deferred_indexes)}): "
+                  f"{_first_line(stmt.query)}\n  -> {exc}", file=sys.stderr)
+            return 5
+    print(f"indexes: {len(deferred_indexes)} built")
 
     con.execute("CHECKPOINT")
     con.close()
