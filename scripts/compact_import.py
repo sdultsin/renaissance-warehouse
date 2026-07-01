@@ -89,6 +89,14 @@ def main() -> int:
         return 3
 
     # --- data: COPY ... FROM parquet, order-independent, one shot, fatal on error ----
+    # threads=2 for the load phase: at the box default (8 threads / 8 vCPU) the commit of a
+    # very large single-table COPY pins more dirty blocks than an 8GB memory_limit allows —
+    # observed 2026-07-01 on raw_pipeline_conversation_messages (16GB parquet, 32.5M fat-text
+    # rows): "Failed to commit: failed to pin block of size 256.0 KiB (7.4 GiB/7.4 GiB used)".
+    # Loads are IO-bound; fewer threads costs little and scales peak memory down linearly.
+    # A COPY that still hits a memory/pin error gets ONE retry at threads=1 after a
+    # CHECKPOINT (frees pinned blocks from prior loads); a second failure aborts loud.
+    con.execute("SET threads=2")
     loads = [
         s for s in duckdb.extract_statements(load_sql.read_text())
         if s.query.strip().rstrip(";").strip()
@@ -96,6 +104,18 @@ def main() -> int:
     for i, stmt in enumerate(loads, 1):
         try:
             con.execute(stmt.query)
+        except (duckdb.OutOfMemoryException, duckdb.TransactionException) as exc:
+            print(f"data: statement {i}/{len(loads)} hit {type(exc).__name__} at threads=2; "
+                  f"retrying at threads=1: {_first_line(stmt.query, 100)}")
+            try:
+                con.execute("CHECKPOINT")
+                con.execute("SET threads=1")
+                con.execute(stmt.query)
+                con.execute("SET threads=2")
+            except Exception as exc2:  # noqa: BLE001
+                print(f"ABORT: data load failed on statement {i}/{len(loads)} even at "
+                      f"threads=1: {_first_line(stmt.query)}\n  -> {exc2}", file=sys.stderr)
+                return 4
         except Exception as exc:  # noqa: BLE001 — report which COPY failed, then abort
             print(f"ABORT: data load failed on statement {i}/{len(loads)}: "
                   f"{_first_line(stmt.query)}\n  -> {exc}", file=sys.stderr)
