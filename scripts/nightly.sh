@@ -247,10 +247,20 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     THREADS_NIGHTLY_STAGE=/root/core/threads_nightly_stage.jsonl
     echo "email-thread sync (native reply threads — nightly incremental, local-only)" | tee -a "$LOG_FILE"
     ( set -a; [ -f /root/core/.env.threads ] && . /root/core/.env.threads; set +a
+      set -o pipefail
       export WAREHOUSE_PULL_THREADS=1
       rm -f "$THREADS_NIGHTLY_STAGE" "$THREADS_NIGHTLY_STAGE".* 2>/dev/null
-      "$PYTHON" -m entities.email_thread_sync fetch --local-only --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE"
-      "$PYTHON" -m entities.email_thread_sync apply --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE"
+      # [2026-07-01] FAIL-SAFE cap on the per-lead /emails fetch. When the committed watermark falls
+      # behind (429-throttled backlog), the fetch can exceed a nightly window and HANG the singleton
+      # nightly lock for 10-15h (build-fan-out incident 2026-07-01 — same class as the #124/#126 tag
+      # runaway). Time-box the fetch; APPLY only on a CLEAN (exit-0) fetch. A timed-out/partial fetch
+      # is DISCARDED — the 2-day watermark OVERLAP re-pulls the same window next run, so NOTHING is
+      # skipped; email_message just holds last-good for the day. Durable fix = resumable ordered drain.
+      if timeout -k 30s "${THREADS_FETCH_TIMEOUT:-60m}" "$PYTHON" -m entities.email_thread_sync fetch --local-only --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE"; then
+          "$PYTHON" -m entities.email_thread_sync apply --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE"
+      else
+          echo "WARN email_thread fetch incomplete/timed-out (>${THREADS_FETCH_TIMEOUT:-60m} backlog) — skipping apply, keeping last-good (no watermark advance; 2d overlap re-pulls next run)" | tee -a "$LOG_FILE"
+      fi
       rm -f "$THREADS_NIGHTLY_STAGE" "$THREADS_NIGHTLY_STAGE".* 2>/dev/null ) \
         || echo "WARN email_thread_sync_nightly_failed (continuing)" | tee -a "$LOG_FILE"
     # keep apply manifests out of the repo working tree (gitignored too, belt + suspenders)
