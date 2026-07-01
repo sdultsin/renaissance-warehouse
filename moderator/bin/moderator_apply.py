@@ -65,9 +65,12 @@ _APPLY_NOW_LOCK_WAIT_S = int(os.environ.get("MODERATOR_APPLY_NOW_LOCK_WAIT_S", "
 # the test profile / a relocation. Default = the prod droplet layout.
 PUBLISHER_PY = os.environ.get("MODERATOR_PUBLISHER_PY", "/opt/duckdb/bin/publisher.py")
 PUBLISHER_PYTHON = os.environ.get("MODERATOR_PUBLISHER_PYTHON", "/opt/duckdb/venv/bin/python")
-# Max seconds to let the promote run before we stop waiting on it (a full ~50GB copy is ~10 min;
-# give generous headroom). The apply has already committed by then — promote can be retried.
-PROMOTE_TIMEOUT_S = int(os.environ.get("MODERATOR_PROMOTE_TIMEOUT_S", "1200"))
+# Max seconds to let the promote run before we stop waiting on it. subprocess.run(timeout=) KILLS
+# the publisher child at this ceiling, so it must comfortably exceed the REAL copy time: the serving
+# snapshot is a full byte-copy of the warehouse — ~183GB ≈ 22 min as of 2026-07-01, and it grows —
+# so the old 1200s default killed every apply-now promote. The apply has already committed by then —
+# a killed promote can be retried.
+PROMOTE_TIMEOUT_S = int(os.environ.get("MODERATOR_PROMOTE_TIMEOUT_S", "3600"))
 # The warehouse repo checkout co-located on the box — its core/ package owns the apply tooth.
 WAREHOUSE_ROOT = mc.WAREHOUSE_ROOT
 
