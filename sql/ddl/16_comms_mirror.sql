@@ -6,11 +6,12 @@
 -- comms-orchestration Supabase MCP (list_tables verbose). Do NOT guess columns;
 -- the real schema differs significantly from analogous warehouse tables.
 --
--- Convention (matches 04_pipeline_mirror.sql):
---   * raw_* tables are append-only snapshots keyed by _run_id.
+-- Convention (REPLACE-style since 2026-07-01, warehouse-flags#12):
+--   * raw_* tables hold exactly ONE full snapshot (one row per source id).
 --   * _loaded_at = ingestion wall-clock (NOT NULL); _run_id = orchestrator run.
---   * Mirror DELETEs by _run_id then INSERTs (idempotent within a run); prior
---     runs are preserved.
+--   * Mirror DELETEs the whole table then INSERTs a fresh snapshot, atomically
+--     per table (idempotent; prior runs are NOT preserved — the original
+--     keep-history design stacked 12-34 snapshots and inflated naive SUMs).
 --
 -- Type conventions (Postgres -> DuckDB):
 --   text                       -> VARCHAR

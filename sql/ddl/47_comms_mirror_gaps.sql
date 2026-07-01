@@ -12,9 +12,11 @@
 --
 -- Mirrored via DuckDB postgres_scanner (see entities/comms_mirror.py), same
 -- conventions as 16_comms_mirror.sql:
---   * raw_* tables are append-only snapshots keyed by _run_id.
+--   * raw_* tables hold exactly ONE full snapshot (REPLACE-style since
+--     2026-07-01, warehouse-flags#12; one row per source id).
 --   * _loaded_at = ingestion wall-clock (NOT NULL); _run_id = orchestrator run.
---   * Mirror DELETEs by _run_id then INSERTs (idempotent within a run).
+--   * Mirror DELETEs the whole table then INSERTs a fresh snapshot (atomic per
+--     table, idempotent).
 --
 -- Column names/types verified 2026-06-08 against the live source via the
 -- comms-orchestration Supabase MCP (list_tables verbose, schema comms).

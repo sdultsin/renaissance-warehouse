@@ -2,13 +2,19 @@
 
 Mirrors the analytically-valuable tables from the comms-orchestration Postgres
 (Sendivo SMS + warm-call + AIM) into ``raw_comms_*`` tables using DuckDB's
-``postgres_scanner`` extension. Same v1 approach as ``pipeline_mirror.py``: a
-small set of high-value tables copied wholesale on each run (full-refresh per
-table, idempotent by ``_run_id``).
+``postgres_scanner`` extension: a small set of high-value tables copied
+wholesale on each run.
 
-Append-only at the warehouse layer: every run writes a fresh snapshot tagged
-with the ``_run_id`` so history is kept, but a given run is idempotent
-(re-running deletes that run's rows first).
+REPLACE-style at the warehouse layer (2026-07-01, warehouse-flags#12): each run
+atomically DELETEs the whole raw table and INSERTs a fresh full snapshot, so a
+table always holds exactly ONE snapshot (one row per source id) and re-running
+is idempotent. The original design deleted only the current ``_run_id``'s rows
+("history is kept"), which meant every nightly run APPENDED a full table copy —
+tables grew to 12-34 stacked snapshots and naive aggregates (credit spend, opp
+counts) read ~3-30x inflated. Nothing ever consumed the old snapshots (every
+downstream reader filtered to the latest ``_run_id``), so history was dropped.
+DELETE + INSERT run in one transaction per table: a mid-run crash can never
+leave a table empty or half-loaded for readers.
 
 Source schemas differ per table: most live in ``comms``; ``ai_decision_log``
 lives in ``audit``. Each entry carries its source schema so the SELECT can
@@ -153,12 +159,20 @@ def _run_comms_mirror(ctx: "RunContext") -> PhaseResult:
     try:
         total = 0
         for source_schema, pg_table, raw_table in _TABLES:
-            conn.execute(f"DELETE FROM {raw_table} WHERE _run_id = ?", [ctx.run_id])
             sql = _build_select(ctx, source_schema, pg_table, raw_table)
-            conn.execute(sql, [ctx.run_id])
-            n = conn.execute(
-                f"SELECT count(*) FROM {raw_table} WHERE _run_id = ?", [ctx.run_id]
-            ).fetchone()[0]
+            # Atomic REPLACE (warehouse-flags#12): wipe the previous snapshot and
+            # load the new one in a single transaction. The old per-_run_id DELETE
+            # appended a full copy every run (12-34x duplication, inflated SUMs).
+            conn.execute("BEGIN")
+            try:
+                conn.execute(f"DELETE FROM {raw_table}")
+                conn.execute(sql, [ctx.run_id])
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
+            # Post-replace the table IS this run's snapshot.
+            n = conn.execute(f"SELECT count(*) FROM {raw_table}").fetchone()[0]
             logger.info(
                 "mirrored %s.%s -> %s: %d rows", source_schema, pg_table, raw_table, n
             )
