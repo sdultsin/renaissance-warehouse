@@ -536,28 +536,69 @@ def get_truth():
     Actual 529,670. This read-side carry-forward mirrors the build-side fix in entities/account_census.py
     (#133) so §4 Expected never collapses to 0 for a still-active workspace on a partial census. When the
     census is complete this is identical to the old global-max behavior (per-ws max == global max for
-    every workspace), so it is a strict safety net, not a behavior change on healthy days."""
+    every workspace), so it is a strict safety net, not a behavior change on healthy days.
+
+    Expected counts ONLY census-connected accounts (core.account_census.status=1) [2026-07-01, Sam]:
+    a disconnected/paused inbox keeps lifecycle='Active' (ever-sent-cold is history, not state), so
+    without the status predicate §4 reported capacity that physically cannot send — e.g. Renaissance 1
+    on 2026-07-01: Expected 101,465 while 43,455 of it sat on 2,897 connection_error accounts (the
+    cancelled-reseller wave); true connected capacity 57,950 matched the 56,472 actually sent. The
+    excluded capacity is printed loud (NOTE below) so a disconnect wave is visible, not silently
+    dropped. status is COALESCEd to 1 on a missing/NULL census row so a census gap can only ever
+    OVERSTATE Expected (fail toward the old behavior), never silently shrink it."""
     # `elig` = eligible (Active OTD/Google) capacity per (ws, census, infra); the filter lives INSIDE
     # the CTE so a workspace's "last-good" census is the latest one that actually HAS Active OTD/Google
     # rows — not merely the latest census it appears in (which could hold only Outlook/retired rows and
     # re-zero Expected after the outer filter).
     cap = {(r[0], r[1]): float(r[2] or 0) for r in wq(
         f"""WITH elig AS (
-              SELECT workspace_slug, census_date, infra, sum(daily_limit) AS cap
-              FROM core.account_label
-              WHERE workspace_slug IN ({SLUGS_SQL})
-                AND lifecycle='Active' AND infra IN ('OTD','Google')
+              SELECT al.workspace_slug, al.census_date, al.infra, sum(al.daily_limit) AS cap
+              FROM core.account_label al JOIN core.account_census c
+                ON c.census_date=al.census_date AND c.workspace_slug=al.workspace_slug
+               AND c.email=al.email
+              WHERE al.workspace_slug IN ({SLUGS_SQL})
+                AND al.lifecycle='Active' AND al.infra IN ('OTD','Google')
+                AND COALESCE(c.status, 1) = 1
               GROUP BY 1,2,3),
             ws_latest AS (SELECT workspace_slug, max(census_date) AS census_date FROM elig GROUP BY 1)
             SELECT e.workspace_slug, e.infra, e.cap
             FROM elig e JOIN ws_latest USING (workspace_slug, census_date)""")}
     # Per-workspace census actually used (same eligibility as `cap`) — for the header + carry-forward flag.
     used = {r[0]: r[1] for r in wq(
-        f"""SELECT workspace_slug, max(census_date)
-            FROM core.account_label
-            WHERE workspace_slug IN ({SLUGS_SQL})
-              AND lifecycle='Active' AND infra IN ('OTD','Google')
+        f"""SELECT al.workspace_slug, max(al.census_date)
+            FROM core.account_label al JOIN core.account_census c
+              ON c.census_date=al.census_date AND c.workspace_slug=al.workspace_slug
+             AND c.email=al.email
+            WHERE al.workspace_slug IN ({SLUGS_SQL})
+              AND al.lifecycle='Active' AND al.infra IN ('OTD','Google')
+              AND COALESCE(c.status, 1) = 1
             GROUP BY 1""")}
+    # Capacity EXCLUDED by the status=1 predicate at each workspace's used census — printed loud so a
+    # disconnect wave shows up in the log as phantom capacity, not as a silent Expected shrink.
+    disc = {r[0]: float(r[1] or 0) for r in wq(
+        f"""WITH ws_latest AS (
+              SELECT al.workspace_slug, max(al.census_date) AS census_date
+              FROM core.account_label al JOIN core.account_census c
+                ON c.census_date=al.census_date AND c.workspace_slug=al.workspace_slug
+               AND c.email=al.email
+              WHERE al.workspace_slug IN ({SLUGS_SQL})
+                AND al.lifecycle='Active' AND al.infra IN ('OTD','Google')
+                AND COALESCE(c.status, 1) = 1
+              GROUP BY 1)
+            SELECT al.workspace_slug, sum(al.daily_limit)
+            FROM core.account_label al
+            JOIN ws_latest w ON w.workspace_slug=al.workspace_slug AND w.census_date=al.census_date
+            JOIN core.account_census c
+              ON c.census_date=al.census_date AND c.workspace_slug=al.workspace_slug
+             AND c.email=al.email
+            WHERE al.lifecycle='Active' AND al.infra IN ('OTD','Google')
+              AND COALESCE(c.status, 1) <> 1
+            GROUP BY 1""")}
+    if disc:
+        print(f"NOTE §4 Expected excludes {sum(disc.values()):,.0f}/day configured capacity sitting on "
+              f"disconnected/paused Active accounts (census status<>1): "
+              + ", ".join(f"{s}={v:,.0f}" for s, v in sorted(disc.items(), key=lambda x: -x[1])),
+              file=sys.stderr)
     inst = instantly_daily(DAILY)
     # Per-infra ACTUAL split (OTD vs Google) — account-level sends (core.sending_account_daily) mapped
     # to infra via EACH workspace's last-good census (the SAME per-workspace carry-forward used above
@@ -571,12 +612,17 @@ def get_truth():
     asplit = {}   # slug -> (otd_actual, google_actual, unmapped_actual)
     for r in wq(f"""
         WITH ws_cens AS (   -- IDENTICAL census pick to Expected's `used`/`cap` (max census that
-                            -- actually HOLDS Active OTD/Google rows), so the split and Expected always
-                            -- read a workspace at the SAME census — never diverge on a partial-capture
-                            -- day whose newest census holds only Outlook/retired rows.
-              SELECT workspace_slug, max(census_date) AS cd FROM core.account_label
-              WHERE workspace_slug IN ({SLUGS_SQL})
-                AND lifecycle='Active' AND infra IN ('OTD','Google') GROUP BY 1),
+                            -- actually HOLDS CONNECTED Active OTD/Google rows), so the split and
+                            -- Expected always read a workspace at the SAME census — never diverge on a
+                            -- partial-capture day whose newest census holds only Outlook/retired rows.
+              SELECT al.workspace_slug, max(al.census_date) AS cd
+              FROM core.account_label al JOIN core.account_census cc
+                ON cc.census_date=al.census_date AND cc.workspace_slug=al.workspace_slug
+               AND cc.email=al.email
+              WHERE al.workspace_slug IN ({SLUGS_SQL})
+                AND al.lifecycle='Active' AND al.infra IN ('OTD','Google')
+                AND COALESCE(cc.status, 1) = 1
+              GROUP BY 1),
              lbl AS (   -- ALL infra rows (incl. Outlook) at that census, to bucket every sender
               SELECT al.workspace_slug, al.email, al.infra
               FROM core.account_label al JOIN ws_cens w
@@ -1282,7 +1328,7 @@ def daily(ctx):
     ctx["sms_kpi_table"](SMS_KPI_D, "2b · SMS KPI-to-opp — texts per opportunity by workspace · trailing fully-classified window (the web-form-economics gate)"); add()
     ctx["sms_leaderboard_table"](SMS_LB_D, "2c · SMS campaign leaderboard — sent → opp · trailing fully-classified window"); add()
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
-    ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (active capacity) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · no-lag · census {SENDING_CENSUS}"); add()
+    ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (CONNECTED active capacity; disconnected/paused inboxes excluded) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · no-lag · census {SENDING_CENSUS}"); add()
     ctx["partner_table"](PARTNER_D, PARTNER_D_TOTAL, f"5 · BOOKINGS BY PARTNER · day {DAILY}"); add()
     ctx["imreply_table"](IMREPLY_D, f"6 · IM REPLY-TIME — first-reply latency by workspace · 12-8pm ET Mon-Fri arrivals only · daily / weekly / monthly · email (SMS+WA pending) · Grace & Sam")
 
