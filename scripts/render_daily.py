@@ -441,9 +441,8 @@ def sms_complete_window(max_days=7, cov_threshold=0.9, lookback_days=21):
     a sorted list of ISO date strings (may be []). Memoized; fail-soft -> []."""
     if "w" in _sms_win_cache:
         return _sms_win_cache["w"]
-    dates = []
     try:
-        rows = wq(f"""
+        rows = _retry(lambda: wq(f"""
           WITH cov AS (
             SELECT CAST(received_at AS DATE) d, count(*) FILTER (WHERE NOT is_opt_out) human
             FROM main.raw_sendivo_inbound
@@ -456,12 +455,13 @@ def sms_complete_window(max_days=7, cov_threshold=0.9, lookback_days=21):
           SELECT cov.d
           FROM cov LEFT JOIN cls USING (d)
           WHERE cov.human > 0 AND COALESCE(cls.classified, 0) >= {float(cov_threshold)} * cov.human
-          ORDER BY cov.d DESC LIMIT {int(max_days)}""")
+          ORDER BY cov.d DESC LIMIT {int(max_days)}"""), label="sms_window")
         dates = sorted(str(r[0])[:10] for r in rows)
+        _sms_win_cache["w"] = dates   # memoize ONLY a successful computation, so a transient blip on the
+        return dates                  # first (§2b) call doesn't permanently blank §2c too — it retries.
     except Exception as e:
         print(f"WARN sms_complete_window failed: {e}", file=sys.stderr)
-    _sms_win_cache["w"] = dates
-    return dates
+        return []
 
 def _sms_win_inlist():
     dates = sms_complete_window()
@@ -496,10 +496,15 @@ def get_sms_leaderboard(limit=30, min_opps=10, min_sent=20000):
       WITH nc AS (
         SELECT our_number, any_value(campaign_id) campaign_id
         FROM main.v_sendivo_number_campaign WHERE campaign_id IS NOT NULL GROUP BY 1),
+      inb AS (   -- dedup raw_sendivo_inbound to 1 row/message BEFORE the qwen join: the table is 1:1 on
+                 -- inbound_message_id today but _run_id re-ingestion has inflated it ~9x historically
+                 -- (sql/ddl/34,90), which would fan out count(*) opps. Mirrors the funnel's `ibm` CTE.
+        SELECT inbound_message_id, any_value(our_number) our_number, max(received_at) received_at
+        FROM main.raw_sendivo_inbound GROUP BY 1),
       opp AS (
         SELECT nc.campaign_id, count(*) opps
         FROM derived.sms_reply_is_positive_qwen q
-        JOIN main.raw_sendivo_inbound i ON i.inbound_message_id = q.reply_id
+        JOIN inb i ON i.inbound_message_id = q.reply_id
         JOIN nc ON nc.our_number = ('+' || ltrim(i.our_number, '+'))
         WHERE q.is_positive AND CAST(i.received_at AS DATE) IN ({inlist})
         GROUP BY 1),
