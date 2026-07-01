@@ -4,8 +4,9 @@
 # Detect+alert by default; set TRANSCRIBE_WATCHDOG_HEAL=1 to also auto-run the (idempotent,
 # lock-robust) transcribe job when a gap is found.
 #
-# Cron (UTC, droplet) — daily at 09:00, after the 08:30 transcribe run has had time to finish:
-#   0 9 * * * /root/renaissance-warehouse/scripts/transcribe_coverage_watchdog.sh >> \
+# Cron (UTC, droplet) — daily at 01:00, after the 23:30 transcribe run has had time to finish
+# (both moved out of the nightly writer window 2026-07-01 — nightly can hold the lock 10+ hours):
+#   0 1 * * * /root/renaissance-warehouse/scripts/transcribe_coverage_watchdog.sh >> \
 #             /root/renaissance-warehouse/logs/transcribe_watchdog.log 2>&1
 set -u
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

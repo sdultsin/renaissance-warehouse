@@ -25,8 +25,10 @@ LOCK-ROBUSTNESS (the 2026-06-16 hardening — see handoffs/2026-06-16-call-trans
   waits (niced, in memory) and commits when the writer frees. A coverage watchdog
   (scripts/transcribe_coverage_watchdog.py) independently alerts #cc-sam if a gap ever persists.
 
-Cron (UTC) — scheduled clear of the 03:30 nightly window + the 06:00-07:30 writer stack:
-    30 8 * * *  cd /root/renaissance-warehouse && .venv/bin/python scripts/transcribe_calls.py >> logs/transcribe.log 2>&1
+Cron (UTC) — 23:30, clear of the nightly writer window (nightly moved to 05:30 and can run
+10+ hours when an upstream fetch hangs — it held the lock through the old 08:30 slot, which is
+what stalled transcripts 06-28→07-01):
+    30 23 * * *  cd /root/renaissance-warehouse && .venv/bin/python scripts/transcribe_calls.py >> logs/transcribe.log 2>&1
 """
 from __future__ import annotations
 
@@ -66,7 +68,14 @@ _BACKOFF_CAP_S = float(os.environ.get("CALL_TRANSCRIBE_BACKOFF_CAP_S", "120"))
 # live DB is unreachable for the whole budget.
 _SNAPSHOT = Path(os.environ.get("CALL_TRANSCRIBE_SNAPSHOT", "/opt/duckdb/warehouse_current.duckdb"))
 
-_LOCK_MARKERS = ("could not set lock", "conflicting lock", "database is locked")
+_LOCK_MARKERS = (
+    "could not set lock",
+    "conflicting lock",
+    "database is locked",
+    # core/db.py in-process flock timeout (RuntimeError, 2026-06 hardening) — without this
+    # marker the flush CRASHED the whole run instead of deferring (2026-06-30/07-01 stall).
+    "could not acquire warehouse writer lock",
+)
 
 _PENDING_SQL = """
     SELECT call_id, recording_url, duration_seconds
