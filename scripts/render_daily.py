@@ -22,14 +22,19 @@ Canonical sources (verified 2026-06-30; booking cutover 2026-06-30):
  §4 Sending truth      -> Expected = active accounts' configured daily_limit by infra (core.account_label,
                           latest census, no lag); Actual = Instantly daily per workspace (== §1 sent).
  §5 Bookings/partner   -> im_bookings partner.
- §6 IM reply-time      -> core.email_message (native, fresh): first prospect reply (ue_type 2) -> first
-                          our reply (ue_type 3) per thread; median/avg per workspace daily/weekly/monthly.
- (§1b EMAIL-KPIs-BY-INFRA was removed 2026-06-30 per Sam — layout now matches the June-26 gold tab.)
+ §6 IM reply-time      -> core.email_message (native, NIGHTLY-synced — D-1 at best, so the report-day
+                          DAILY column is structurally thin/empty and back-fills on later renders):
+                          BUSINESS MINUTES (clock runs 12-8pm ET Mon-Fri only) from each thread's first
+                          prospect reply (ue_type 2) to our first reply (ue_type 3); med/avg per
+                          workspace daily/weekly/monthly. Spec locked with Grace 06-30.
+ §1b EMAIL KPIs BY INFRA   -> live (re-added after the 06-30 removal); renders INFRA_RENDER_ROWS only
+                          (Google/OTD — Milkbox row wiped 2026-07-01 per the 100%-or-wipe rule,
+                          pending the centralize-pass rebuild; nonzero Milkbox sends WARN loud).
 
 Usage:  render_daily.py 2026-06-29 ["Jun 29"]      (tab name defaults to "%b %-d" = "Jun 29")
         render_daily.py 2026-06-29 --dry            (print the data, do not write the sheet)
 """
-import json, os, sys, datetime, urllib.request, urllib.parse, collections, concurrent.futures
+import json, os, sys, datetime, statistics, urllib.request, urllib.parse, collections, concurrent.futures
 
 # ---------- repo imports (box: run via .venv/bin/python from REPO_DIR) ----------
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -65,10 +70,15 @@ DRY = "--dry" in sys.argv
 VERIFY = "--verify" in sys.argv  # source self-check: probe every source + reconcile Pre-IPO; no sheet write
 # Default to TODAY (ET), never a hardcoded past date — a mis-templated cron must not silently render
 # a stale day into a today-named tab (M6). The sync always passes REPORT_DATE explicitly.
+# ET_TZ = THE one ET timezone object for this file (§6 clock math + today-default share it — never
+# re-derive ET per function). None => zoneinfo unavailable: today-default degrades to UTC date and
+# §6 raises into _safe (renders empty + WARN) rather than compute SLA math in a wrong fixed offset.
 try:
     from zoneinfo import ZoneInfo
-    _today_et = datetime.datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    ET_TZ = ZoneInfo("America/New_York")
+    _today_et = datetime.datetime.now(ET_TZ).date().isoformat()
 except Exception:
+    ET_TZ = None
     _today_et = datetime.date.today().isoformat()
 REPORT_DATE = args[0] if args else _today_et
 _d = datetime.date.fromisoformat(REPORT_DATE)
@@ -129,7 +139,12 @@ WH_TOKEN = _wh_token()
 def wq(sql):
     req = urllib.request.Request(WH_BASE + "/query", data=json.dumps({"sql": sql}).encode(),
         headers={"Authorization": f"Bearer {WH_TOKEN}", "Content-Type": "application/json"}, method="POST")
-    return json.load(urllib.request.urlopen(req, timeout=180))["rows"]
+    resp = json.load(urllib.request.urlopen(req, timeout=180))
+    # A truncated result would silently understate whatever aggregates from it (§6 pulls row-level
+    # pairs); fail LOUD -> _safe renders that section empty + WARN, never a wrong-but-plausible number.
+    if resp.get("truncated"):
+        raise RuntimeError(f"warehouse query TRUNCATED at {resp.get('row_count')} rows — refusing partial data")
+    return resp["rows"]
 
 # ---------------------------- external fetchers (memoized) ----------------------------
 import httpx, time
@@ -703,61 +718,118 @@ def get_partner():
     pr = sorted(cnt.items(), key=lambda x: (-x[1], x[0]))
     return pr, sum(n for _, n in pr)
 
-def get_im_reply():
-    """§6 IM reply-time from the native core.email_message: first prospect reply (ue_type 2) ->
-    first our reply (ue_type 3) in the same thread; median/avg per workspace, daily/weekly/monthly.
+def _biz_minutes(p, r, tz):
+    """§6 SLA latency = BUSINESS MINUTES accrued only inside 12:00-20:00 ET Mon-Fri between aware
+    datetimes p (first prospect reply) and r (our first reply after it): for each ET business day d
+    in [p, r], sum GREATEST(0, LEAST(r, d 20:00) - GREATEST(p, d 12:00)). A Saturday arrival answered
+    Monday 12:05pm ET = 5.0. An answer landing before the clock ever opens (e.g. Sat->Sun) = 0.0.
+    DST-correct: the per-day window bounds are built as ET wall-clock via zoneinfo."""
+    if r <= p:
+        return 0.0
+    d = p.astimezone(tz).date()
+    end = r.astimezone(tz).date()
+    tot = 0.0
+    while d <= end:
+        if d.isoweekday() <= 5:
+            o = datetime.datetime.combine(d, datetime.time(12), tzinfo=tz)
+            c = datetime.datetime.combine(d, datetime.time(20), tzinfo=tz)
+            lo = p if p > o else o
+            hi = r if r < c else c
+            if hi > lo:
+                tot += (hi - lo).total_seconds() / 60.0
+        d += datetime.timedelta(days=1)
+    return tot
 
-    BUSINESS-HOURS WINDOW [Grace, 06-30 funnel sync]: only prospect replies that ARRIVE
-    12pm-8pm ET, Mon-Fri are counted. IMs log in at 11am ET (first hour = catch-up) and don't
-    work nights/weekends, so an 11pm or Saturday arrival is not answerable and would massively
-    inflate latency. After-hours/weekend arrivals are EXCLUDED from the calc entirely (not clamped)
-    -- the difference between a real ~3-8 min median and a garbage one. The window is applied to the
-    prospect-reply ARRIVAL (p_et = message_at in ET); the response time itself is measured as-is, and
-    the day/week/month buckets use the ET arrival date. message_at is TIMESTAMP WITH TIME ZONE (UTC);
-    `AT TIME ZONE 'America/New_York'` yields the ET wall-clock. isodow 1-5 = Mon-Fri; hour 12..19 =
-    12pm-8pm. NOTE: the most-recent day's DAILY column is inherently thin -- same-day prospect replies
-    are often not yet answered (or the native our-reply sync lags); weekly/monthly carry the signal.
-    The window is applied AFTER ranking (seq=1), so a thread whose FIRST reply arrived off-hours is
-    excluded entirely (it is not re-pointed to a later in-window reply) -- the literal 'first reply
-    only' reading of the spec."""
+def _clock_open_date(p, tz):
+    """§6 report bucket = the ET date the thread's SLA clock OPENS, not the raw arrival date. A
+    weekday arrival before 20:00 ET opens that day (pre-noon arrivals open at noon, still that day);
+    a post-8pm or weekend arrival opens the next Mon-Fri day (Sat -> Mon)."""
+    e = p.astimezone(tz)
+    d = e.date()
+    if e.isoweekday() <= 5 and e < datetime.datetime.combine(d, datetime.time(20), tzinfo=tz):
+        return d
+    d += datetime.timedelta(days=1)
+    while d.isoweekday() > 5:
+        d += datetime.timedelta(days=1)
+    return d
+
+def get_im_reply():
+    """§6 IM reply-time from core.email_message: average/median BUSINESS MINUTES from each thread's
+    FIRST prospect reply (ue_type 2) to our first reply after it (ue_type 3), per workspace,
+    daily / trailing-7d weekly / MTD monthly.
+
+    SPEC [locked with Grace 06-30, supersedes the arrival-filter reading]: the SLA clock accrues
+    ONLY inside 12:00-20:00 ET Mon-Fri (IMs log in 11am ET, first hour = catch-up; no nights/
+    weekends). ALL first prospect replies count — an off-window/weekend arrival is NOT excluded;
+    its clock simply opens at the next window-open (a Saturday arrival answered Monday 12:05pm ET
+    = 5 minutes). Latency = the per-day clamp in _biz_minutes (computed in Python — the pairs come
+    from the warehouse, the clamp+buckets happen here). Each thread buckets on the day its clock
+    OPENS (_clock_open_date), so an off-window arrival lands on the next business day. Unanswered
+    threads are dropped (never a fake latency); first-response-only via seq=1 per thread_id.
+
+    FRESHNESS: core.email_message is NIGHTLY-synced — D-1 at best BY DESIGN, so the report-day
+    DAILY column is structurally thin/empty on day D itself and back-fills on later renders;
+    weekly/monthly carry the signal. Do NOT 'fix' that by switching sources."""
+    if ET_TZ is None:                      # no zoneinfo -> _safe renders §6 empty + WARN, never
+        raise RuntimeError("zoneinfo unavailable — refusing §6 SLA math in a wrong fixed offset")
+    tz = ET_TZ
     wk = (_d - datetime.timedelta(days=6)).isoformat()
     mo = _d.replace(day=1).isoformat()
-    sql = f"""
+    # Pull from 4 days BEFORE the earliest bucket day: an off-window arrival opens its clock up to
+    # 3 calendar days later (Fri 20:00 ET -> Mon 12:00 ET), so e.g. a Saturday May-30 arrival
+    # buckets into Mon Jun-01 and must be in the pull for a June MTD.
+    pull = (min(datetime.date.fromisoformat(wk), datetime.date.fromisoformat(mo))
+            - datetime.timedelta(days=4)).isoformat()
+    # Query notes (each clause is load-bearing):
+    #  - seq ranks over the thread's FULL history (no date filter inside inbound), partitioned per
+    #    workspace; the pull window only limits which FIRSTS are fetched (`i.p_ts >= pull`). Ranking
+    #    inside the window would misclassify a follow-up reply in an older thread as that thread's
+    #    "first" AND make a re-rendered period drift with the render date. A true-first before
+    #    `pull` clock-opens before every bucket day by construction, so nothing in-period is lost.
+    #  - `ours` is matched on thread_id AND ws: 406 thread_ids span multiple workspaces (measured
+    #    2026-07-01), so an unscoped min() could close ws-A's clock with ws-B's reply.
+    #  - Unanswered threads are filtered SERVER-side (r IS NOT NULL): they're ~85% of first-reply
+    #    rows (measured 66k/78k), and shipping them row-level would put the pull on a collision
+    #    course with the read API's 100k-row truncation cap (=> wq raises => §6 empty late-month).
+    #    Python re-guards r_ms anyway (belt+braces).
+    rows = wq(f"""
       WITH inbound AS (
         SELECT thread_id, workspace_id AS ws, message_at AS p_ts,
-               (message_at AT TIME ZONE 'America/New_York') AS p_et,
-               row_number() OVER (PARTITION BY thread_id ORDER BY message_at, message_id) AS seq
+               row_number() OVER (PARTITION BY thread_id, workspace_id
+                                  ORDER BY message_at, message_id) AS seq
         FROM core.email_message
-        WHERE ue_type=2 AND thread_id IS NOT NULL AND message_at >= DATE '{mo}'),
-      ours AS (SELECT thread_id, message_at AS r_ts FROM core.email_message
-               WHERE ue_type=3 AND thread_id IS NOT NULL AND message_at >= DATE '{mo}'),
-      paired AS (
-        SELECT i.ws, CAST(i.p_et AS DATE) d,
-               date_diff('minute', i.p_ts,
-                 (SELECT min(o.r_ts) FROM ours o WHERE o.thread_id=i.thread_id AND o.r_ts > i.p_ts)) AS lat
+        WHERE ue_type=2 AND thread_id IS NOT NULL),
+      ours AS (SELECT thread_id, workspace_id AS ws, message_at AS r_ts FROM core.email_message
+               WHERE ue_type=3 AND thread_id IS NOT NULL AND message_at >= DATE '{pull}')
+      SELECT * FROM (
+        SELECT i.ws AS ws, epoch_ms(i.p_ts) AS p,
+               epoch_ms((SELECT min(o.r_ts) FROM ours o
+                         WHERE o.thread_id=i.thread_id AND o.ws=i.ws AND o.r_ts > i.p_ts)) AS r
         FROM inbound i
-        WHERE i.seq=1
-          AND extract(isodow FROM i.p_et) BETWEEN 1 AND 5
-          AND extract(hour   FROM i.p_et) BETWEEN 12 AND 19)
-      SELECT ws,
-        count(*) FILTER (WHERE d=DATE '{DAILY}' AND lat IS NOT NULL),
-        median(lat) FILTER (WHERE d=DATE '{DAILY}' AND lat IS NOT NULL),
-        avg(lat)    FILTER (WHERE d=DATE '{DAILY}' AND lat IS NOT NULL),
-        count(*) FILTER (WHERE d>=DATE '{wk}' AND d<=DATE '{DAILY}' AND lat IS NOT NULL),
-        median(lat) FILTER (WHERE d>=DATE '{wk}' AND d<=DATE '{DAILY}' AND lat IS NOT NULL),
-        avg(lat)    FILTER (WHERE d>=DATE '{wk}' AND d<=DATE '{DAILY}' AND lat IS NOT NULL),
-        count(*) FILTER (WHERE d<=DATE '{DAILY}' AND lat IS NOT NULL),
-        median(lat) FILTER (WHERE d<=DATE '{DAILY}' AND lat IS NOT NULL),
-        avg(lat)    FILTER (WHERE d<=DATE '{DAILY}' AND lat IS NOT NULL)
-      FROM paired WHERE ws IN ({SLUGS_SQL}) GROUP BY 1"""
-    rows = {r[0]: r for r in wq(sql)}
+        WHERE i.seq=1 AND i.p_ts >= DATE '{pull}' AND i.ws IN ({SLUGS_SQL}))
+      WHERE r IS NOT NULL""")
+    day0, wk0, mo0 = _d, datetime.date.fromisoformat(wk), datetime.date.fromisoformat(mo)
+    utc = datetime.timezone.utc
+    lats = {}  # ws -> {"d"/"w"/"m": [business-minute latencies]}
+    for ws, p_ms, r_ms in rows:
+        if r_ms is None:
+            continue  # unanswered thread — dropped
+        p = datetime.datetime.fromtimestamp(float(p_ms) / 1000.0, tz=utc)
+        r = datetime.datetime.fromtimestamp(float(r_ms) / 1000.0, tz=utc)
+        d = _clock_open_date(p, tz)
+        if d > day0:
+            continue  # clock opens after the report day (e.g. a post-8pm arrival on DAILY)
+        lat = _biz_minutes(p, r, tz)
+        b = lats.setdefault(ws, {"d": [], "w": [], "m": []})
+        if d == day0: b["d"].append(lat)
+        if d >= wk0:  b["w"].append(lat)
+        if d >= mo0:  b["m"].append(lat)
+    def _stats(v):
+        return (len(v), statistics.median(v) if v else None, sum(v) / len(v) if v else None)
     out = []
     for slug, name in WS:
-        r = rows.get(slug)
-        if r:
-            out.append((name, r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9]))
-        else:
-            out.append((name, 0, None, None, 0, None, None, 0, None, None))
+        b = lats.get(slug, {"d": [], "w": [], "m": []})
+        out.append((name,) + _stats(b["d"]) + _stats(b["w"]) + _stats(b["m"]))
     return (DAILY, wk, mo), out
 
 # ============================ source self-verify (the DATA-TICKET fix) ============================
@@ -868,8 +940,14 @@ if VERIFY:
 # per-campaign field on GET /campaigns -- so it avoids the runaway /custom-tag-mappings edge-list pull
 # (the all-history account-tag pull that #122 had to cap). Map: 'Reseller Active'->Google,
 # 'Outreach Today Active'->OTD, 'Milkbox Active*'->Milkbox, no infra tag->other, >=2 infra tags->FLAG.
-MILKBOX_SLUGS = {"renaissance-4", "renaissance-5", "koi-and-destroy"}  # F1, F2, F4 only [Sam]
-INFRA_ORDER = ["Google", "OTD", "Milkbox", "other"]
+INFRA_ORDER = ["Google", "OTD", "Milkbox", "other"]   # classifier buckets (_infra_of) — unchanged
+# The §1b RENDERED rows — THE single sync point for the sheet row set, the DRY print, the TOTAL
+# label and the §1b header. Milkbox REMOVED [Sam 2026-07-01]: its attribution renders a wrong 0
+# today, and per the 100%-or-wipe rule a wrong row comes OFF the report until the centralize-pass
+# rebuild. Restore = add it back HERE (labels/total/header all derive). The classifier still buckets
+# Milkbox; nonzero Milkbox sends WARN loud in infra_table — never silently swallowed.
+INFRA_RENDER_ROWS = ["Google", "OTD"]
+INFRA_RENDER_LABEL = {"Google": "Google (reseller)", "OTD": "OTD", "Milkbox": "Milkbox"}
 
 def _infra_of(tag_labels):
     """campaign sending-tag labels -> ('Google'|'OTD'|'Milkbox'|'other', flagged_tags_or_None)."""
@@ -1022,10 +1100,21 @@ IMREPLY_PERIODS, IMREPLY_D = _safe("imreply", get_im_reply, _IMREPLY_FB)
 PREIPO_MTG = _safe("preipo", lambda: preipo_meetings(DAILY), 0)
 INFRA_D = _safe("infra", get_infra_kpis, {"by_ws": [], "mtg_by": {}, "unattr_mtg": 0, "flagged": []})
 
+# Milkbox row is wiped from §1b (see INFRA_RENDER_ROWS) — if the classifier still attributed
+# volume to it, WARN LOUD here, in BOTH --dry and write paths (never silently swallow). Covers
+# sends AND meetings: meetings lag sends by days, so a send-only guard would miss a booking
+# landing after its Milkbox campaign went quiet.
+_mb_sent = sum(a.get("Milkbox", [0, 0, 0, 0])[0] for _s, _n, a, *_ in INFRA_D.get("by_ws", []))
+_mb_mtg = sum(n for (_s, _inf), n in INFRA_D.get("mtg_by", {}).items() if _inf == "Milkbox")
+if _mb_sent or _mb_mtg:
+    print(f"WARN §1b: Milkbox-classified volume on {DAILY} is NOT rendered (row wiped 2026-07-01 "
+          f"pending rebuild): sends={_mb_sent}, meetings={_mb_mtg} — still in §1/§4/§5 totals.",
+          file=sys.stderr)
+
 if DRY:
     print(f"REPORT_DATE={DAILY}  TAB={DAILY_TAB}  census(§4)={SENDING_CENSUS}  periods(§6)={IMREPLY_PERIODS}")
     if INFRA_D.get("by_ws"):
-        _ia = {inf: [0,0,0,0] for inf in ("Google","OTD","Milkbox")}; _im = {inf: 0 for inf in ("Google","OTD","Milkbox")}
+        _ia = {inf: [0,0,0,0] for inf in INFRA_RENDER_ROWS}; _im = {inf: 0 for inf in INFRA_RENDER_ROWS}
         for _s,_n,_a,_t,_u,_f in INFRA_D["by_ws"]:
             for inf in _ia:
                 for i in range(4): _ia[inf][i] += _a.get(inf,[0,0,0,0])[i]
@@ -1146,26 +1235,38 @@ def build_and_write(tab, build_fn):
     def imreply_table(rows_data, label):
         W = 10
         si = add([label]); sec.append(si); row_ncol[si] = W
-        hr_top = add(["Workspace", "Daily", "", "", "Weekly (7d)", "", "", "Monthly (MTD)", "", ""]); th.append(hr_top)
+        hr_top = add(["Workspace", "Daily (trailing — source is nightly-fed, D-1)", "", "", "Weekly (7d)", "", "", "Monthly (MTD)", "", ""]); th.append(hr_top)
         hr_sub = add(["", "n", "Median min", "Avg min", "n", "Median min", "Avg min", "n", "Median min", "Avg min"]); th.append(hr_sub)
         merges.append((hr_top, 1, 4)); merges.append((hr_top, 4, 7)); merges.append((hr_top, 7, 10)); th_ncol[hr_top] = th_ncol[hr_sub] = W
         for name, dn, dmed, davg, wn, wmed, wavg, mn, mmed, mavg in rows_data:
             ri = add([name, dn, mins(dmed), mins(davg), wn, mins(wmed), mins(wavg), mn, mins(mmed), mins(mavg)])
             data.append(ri); row_ncol[ri] = W
-        # Explicit empty-state so a legitimately-quiet in-window day (or the ~24h email_message sync lag)
-        # never reads as a clobbered/missing §6 — the header + a per-workspace shell ALWAYS render, and
-        # this note names WHY the daily column is thin (the watchdog anchors on this section existing).
+        # Explicit empty-state so a legitimately-quiet day (or the nightly email_message sync lag)
+        # never reads as a clobbered/missing §6 — the header + a per-workspace shell ALWAYS render.
+        # TWO distinct notes: daily-only empty (weekly/monthly have data) = the NORMAL D-1 pattern;
+        # everything empty = the pull FAILED (_safe fallback) or a total source gap — say THAT, never
+        # print the benign by-design explanation over a broken query (wrong-but-plausible is the
+        # exact failure mode the wq truncation guard exists to prevent).
         if not any((r[1] or 0) for r in rows_data):
-            note = add(["(no in-window prospect email replies for %s — 12-8pm ET Mon-Fri arrivals only; "
-                        "same-day replies often unanswered yet + email_message sync lags ~24h — weekly/"
-                        "monthly carry the signal)" % DAILY]); data.append(note); row_ncol[note] = W
+            if any((r[4] or 0) or (r[7] or 0) for r in rows_data):
+                note = add(["(no answered first-reply pairs clocked to %s yet — core.email_message "
+                            "is nightly-fed (D-1 at best by design), so day-D's daily cell is "
+                            "structurally empty on day D and back-fills on later renders; weekly/"
+                            "monthly carry the signal)" % DAILY])
+            else:
+                note = add(["(!) §6 rendered EMPTY for %s — the warehouse pull failed or returned "
+                            "no pairs at all (see render stderr); this is NOT the normal D-1 "
+                            "sync-lag pattern" % DAILY])
+            data.append(note); row_ncol[note] = W
         pend = add(["SMS · WhatsApp first-reply time", "pending", "pending", "pending", "pending", "pending", "pending", "pending", "pending", "pending"])
         data.append(pend); row_ncol[pend] = W
     def infra_table(infra, header_label):
         # §1b — one row PER INFRASTRUCTURE, summed across ALL workspaces (Sam 2026-06-30; Google == reseller).
         # RR=(human+auto)/sent, HumanRR=human/sent, PositiveRR=opp/sent, Email->opp=sent/opp, Email->meeting=sent/mtg.
-        INFRA_ROWS = ["Google", "OTD", "Milkbox"]
-        INFRA_LABEL = {"Google": "Google (reseller)", "OTD": "OTD", "Milkbox": "Milkbox"}
+        # Row set/labels derive from the module-level INFRA_RENDER_ROWS (single sync point — see
+        # its comment for the Milkbox wipe rationale).
+        INFRA_ROWS = INFRA_RENDER_ROWS
+        INFRA_LABEL = INFRA_RENDER_LABEL
         W = 7
         si = add([header_label]); sec.append(si); row_ncol[si] = W
         hr = add(["Infrastructure", "Sent", "RR", "Human RR", "Positive RR", "Email\u2192opp", "Email\u2192meeting"])
@@ -1186,7 +1287,7 @@ def build_and_write(tab, build_fn):
             ri = add([INFRA_LABEL[inf], s, pct(h + a, s), pct(h, s), pct(o, s), ratio(s, o), ratio(s, m)])
             data.append(ri); infrows.append(ri); row_ncol[ri] = W
             gs += s; gh += h; ga += a; go += o; gm += m
-        gi = add(["TOTAL (3 infra)", gs, pct(gh + ga, gs), pct(gh, gs), pct(go, gs), ratio(gs, go), ratio(gs, gm)])
+        gi = add([f"TOTAL ({len(INFRA_ROWS)} infra)", gs, pct(gh + ga, gs), pct(gh, gs), pct(go, gs), ratio(gs, go), ratio(gs, gm)])
         tot.append(gi); infrows.append(gi); row_ncol[gi] = W
         um = infra.get("unattr_mtg", 0)
         if um:
@@ -1304,7 +1405,7 @@ def daily(ctx):
     add([f"DAILY REVOPS REPORT — Business Funding · {DAILY}"])
     add([os.environ.get("DAILY_SUBTITLE", f"Daily · {DAILY} · single-source-of-truth (warehouse + Instantly/sendivo live)")]); add()
     ctx["email_table"](EMAIL_D, f"1 · EMAIL + WARM LEADS — by workspace · day {DAILY}"); add()
-    ctx["infra_table"](INFRA_D, f"1b · EMAIL KPIs BY INFRASTRUCTURE — Google (reseller) / OTD / Milkbox · all workspaces · day {DAILY}"); add()
+    ctx["infra_table"](INFRA_D, f"1b · EMAIL KPIs BY INFRASTRUCTURE — {' / '.join(INFRA_RENDER_LABEL[i] for i in INFRA_RENDER_ROWS)} · all workspaces · day {DAILY} (Milkbox row wiped 2026-07-01 pending rebuild)"); add()
     ctx["sms_wa_table"](SMS_D, f"2 · SMS + WHATSAPP — by channel · day {DAILY}"); add()
     # §2b header CARRIES its window explicitly ("7-day trailing …"), so it can never again read as a
     # contradiction of §2's single-day numbers (06-30: §2 Ren3 94,796/day vs §2b 111,328/7d — both right).
@@ -1315,7 +1416,7 @@ def daily(ctx):
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
     ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (CONNECTED active capacity; disconnected/paused inboxes excluded) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · no-lag · census {SENDING_CENSUS}"); add()
     ctx["partner_table"](PARTNER_D, PARTNER_D_TOTAL, f"5 · BOOKINGS BY PARTNER · day {DAILY}"); add()
-    ctx["imreply_table"](IMREPLY_D, f"6 · IM REPLY-TIME — first-reply latency by workspace · 12-8pm ET Mon-Fri arrivals only · daily / weekly / monthly · email (SMS+WA pending) · Grace & Sam")
+    ctx["imreply_table"](IMREPLY_D, f"6 · IM REPLY-TIME — business minutes to first reply, by workspace · clock runs 12-8pm ET Mon-Fri only (all arrivals count; off-hours clock opens next window) · daily / weekly / monthly · email (SMS+WA pending) · Grace & Sam")
 
 def _alert(text):
     """Best-effort drift alert via the established scripts/alert_slack.py path; never raises (the tab
