@@ -17,7 +17,7 @@ mkdir -p logs
 
 SENT_FLOOR="${SENT_FLOOR:-1000}"     # a real day sends 100k+; <1000 == the evening pull didn't land
 REPORT_DATE="$(TZ=America/New_York date +%F)"
-TAB="$(date -d "$REPORT_DATE" +'%B %-d')"
+TAB="$(date -d "$REPORT_DATE" +'%b %-d')"   # "Jun 30" — MUST match render_daily.py's %b tab name (was %B "June 30" -> false "no tab '<Month> DD'" SLA MISS)
 READER_TOK="$(awk -F'\t' '$2=="cc-service-reader"{print $1}' /opt/duckdb/allowed_tokens.txt)"
 WH_API="https://renaissance-droplet.tailae5c80.ts.net/query"
 PY=".venv/bin/python"
