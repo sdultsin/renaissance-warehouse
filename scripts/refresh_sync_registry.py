@@ -110,6 +110,22 @@ OVERRIDES: dict[str, dict] = {
     "raw_registrar_domains": dict(
         cadence="once", source="registrar",
         notes="one-time registrar snapshot; no automated loader; refresh manually"),
+    # ── Daily-report centralization mirrors (DDL 1061, 2026-07-01). Explicit
+    # biz-date SLAs so the litmus alert fires on DATA staleness (the outcome),
+    # not just "the sync ran" — these back the report's §1/§1b/§2 sections once
+    # the renderer flips. biz_sla_days=2 matches the raw_instantly_email pattern.
+    "raw_instantly_workspace_analytics_daily": dict(
+        biz_date_column="date", biz_sla_days=2,
+        notes="§1 email sent/opps per workspace/day (entities/instantly_analytics_daily.py, "
+              "'instantly' phase); biz-recency SLA 2d"),
+    "raw_instantly_campaign_analytics_daily": dict(
+        biz_date_column="date", biz_sla_days=2,
+        notes="§1b per-campaign daily w/ raw tag dims (entities/instantly_analytics_daily.py); "
+              "biz-recency SLA 2d"),
+    "raw_sendivo_billing_daily": dict(
+        biz_date_column="metric_date", biz_sla_days=2,
+        notes="§2 SMS sent + $/day per sub-account (entities/sendivo_billing_daily.py, "
+              "'sendivo' phase); biz-recency SLA 2d"),
 }
 
 # Curated core/derived decision tables to register IF they exist (raw_ are auto).
