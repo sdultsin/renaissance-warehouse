@@ -31,7 +31,13 @@ EXP="$VOL_DIR/compact_export_tmp"
 # default 1800s) and compaction waits briefly for a straggler writer instead of aborting.
 LOCK="${WAREHOUSE_WRITE_LOCK_PATH:-/root/core/warehouse.write.lock}"
 LOCK_WAIT_S="${COMPACT_LOCK_WAIT_S:-900}"
-THRESHOLD_BYTES=$((18*1024*1024*1024))   # only compact when primary > 18GB
+# Only compact when the primary exceeds this. Calibrated 2026-07-01: the first successful
+# compaction landed at 75GB — that is the REAL data size, not bloat (the old 18GB threshold
+# predates the email-thread/message tables and would re-trigger a pointless ~47-min full
+# compaction EVERY night on a freshly-compacted file). 120GB = real size + ~45GB of genuine
+# bloat headroom, so the nightly compacts only when there is real space to reclaim.
+# Override for a one-off: COMPACT_THRESHOLD_GB=1 scripts/compact_warehouse.sh
+THRESHOLD_BYTES=$(( ${COMPACT_THRESHOLD_GB:-120}*1024*1024*1024 ))
 DUCKDB=$(command -v duckdb)
 # Bound DuckDB memory so the EXPORT/IMPORT cannot OOM the 16GB box (root cause of the 2026-06-12
 # nightly oom-kill: the IMPORT hit ~12.9GB RSS at the default ~80%-RAM limit). Spill to disk instead.
@@ -55,7 +61,7 @@ LOG(){ echo "[compact $(date -u +%FT%TZ)] $*"; }
 # 165GB unchecked. REAL_DB is the dereferenced path, so SIZE is the actual file size.
 SIZE=$(stat -c%s "$REAL_DB" 2>/dev/null || echo 0)
 if [ "$SIZE" -lt "$THRESHOLD_BYTES" ]; then
-  LOG "primary $((SIZE/1024/1024/1024))GB < threshold 18GB — skip (no-op)"; exit 0
+  LOG "primary $((SIZE/1024/1024/1024))GB < threshold $((THRESHOLD_BYTES/1024/1024/1024))GB — skip (no-op)"; exit 0
 fi
 
 # Acquire the real writer flock (fd 9, held until this process exits). flock -w waits
