@@ -416,11 +416,11 @@ def get_sms_wa():
     # ORDER MATTERS: Ren1 must stay index 0 and Ren2 index 1 (write_summary_block reads SMS_D[0]/[1]).
     perf = {}
     try:
-        for r in wq(f"""SELECT sub_account_name, sum(delivered), sum(failed)
+        for r in wq(f"""SELECT sub_account_name, sum(sent), sum(delivered), sum(failed)
                         FROM main.v_sms_campaign_performance
                         WHERE metric_date = DATE '{DAILY}' AND sub_account_name IS NOT NULL
                         GROUP BY 1"""):
-            perf[r[0]] = (int(r[1] or 0), int(r[2] or 0))
+            perf[r[0]] = (int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
     except Exception as e:
         print(f"WARN get_sms_wa: v_sms_campaign_performance unavailable for {DAILY} ({e}); "
               "SMS rows fall back to delivered≈sent, Fail% '—'", file=sys.stderr)
@@ -431,7 +431,17 @@ def get_sms_wa():
                 print(f"WARN get_sms_wa: no v_sms_campaign_performance row for '{sub_name}' on {DAILY} "
                       f"(billed {billed_sent}); rendering delivered≈sent, Fail% '—'", file=sys.stderr)
             return billed_sent, None
-        return p
+        vsent, vdeliv, vfail = p
+        # Tripwire [code-review 07-01]: on a FULLY-loaded day the view's own sent tracks billing
+        # within ~0.03%. A mid-load partial day would silently UNDERSTATE delivered/failed behind a
+        # plausible Fail% — worse than the '—' it replaces (100%-or-wipe rule). >5% divergence ->
+        # treat the view's day as partial and fall back to legacy.
+        if billed_sent and abs(vsent - billed_sent) > 0.05 * billed_sent:
+            print(f"WARN get_sms_wa: v_sms_campaign_performance sent={vsent} diverges >5% from billed "
+                  f"{billed_sent} for '{sub_name}' on {DAILY} (partial day-load?); rendering "
+                  "delivered≈sent, Fail% '—'", file=sys.stderr)
+            return billed_sent, None
+        return vdeliv, vfail
     rows = []
     s1 = sms.get(SUB_REN1, 0); d1, f1 = deliv_failed("Renaissance 1", s1); rows.append(("Renaissance 1 (SMS)", s1, d1, f1, inb.get("Renaissance 1", (0, 0))[1], sms_mtg))
     s2 = sms.get(SUB_REN2, 0); d2, f2 = deliv_failed("Renaissance 2", s2); rows.append(("Renaissance 2 (SMS · Pre-IPO)", s2, d2, f2, inb.get("Renaissance 2", (0, 0))[1], preipo_meetings(DAILY)))
@@ -1305,7 +1315,7 @@ def daily(ctx):
     # contradiction of §2's single-day numbers (06-30: §2 Ren3 94,796/day vs §2b 111,328/7d — both right).
     _w = SMS_KPI_D.get("dates") or []
     _win = (f"{len(_w)}-day TRAILING window {_w[0]}..{_w[-1]} — NOT the single day above"
-            if _w else "trailing fully-classified window")
+            if (_w and SMS_KPI_D.get("rows")) else "trailing fully-classified window")
     ctx["sms_kpi_table"](SMS_KPI_D, f"2b · SMS KPI-to-opp — texts per opportunity by workspace · {_win} (the web-form-economics gate)"); add()
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
     ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (CONNECTED active capacity; disconnected/paused inboxes excluded) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · no-lag · census {SENDING_CENSUS}"); add()
