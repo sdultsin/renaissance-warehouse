@@ -16,12 +16,16 @@ Canonical sources (verified 2026-06-30; booking cutover 2026-06-30):
                           channel -> §1 Email / §2 SMS+WhatsApp / §3 Call; workspace -> §1 by-workspace
                           (ws_alias); partner -> §5; lead_type -> §1 cheap/regular split.
  §2 SMS sent           -> sendivo billing_report.sms_fees.quantity (12720=Ren1, 13922=Ren2, 14603=Ren3 webform).
- §2 SMS Cost $ (actual)-> WAREHOUSE main.raw_sendivo_billing_daily.sms_fee_usd (nightly upsert; the
-                          actual carrier-billed SMS-fee $/day per sub) + Cost/mtg·form = cost ÷ that
-                          row's meetings (Ren3: web-form fills). Partial/missing day-row -> '—' + WARN
+ §2 SMS Cost $ (actual)-> WAREHOUSE main.raw_sendivo_billing_daily.total_spend (nightly upsert; the
+                          ALL-IN Sendivo $/day per sub: SMS fees + carrier fees + any setup/renewal/
+                          brand/phone fees — sms_fee_usd ALONE understated ~3x by excluding carrier
+                          fees, which bill per segment) + Cost/mtg·form = cost ÷ that row's meetings
+                          (Ren3: web-form fills). Partial/missing day-row -> '—' + WARN
                           (100%-or-wipe), back-fills post-nightly. WhatsApp: no cost feed -> '—'.
- §2b SMS cost (window) -> v_sms_workspace_funnel.cost_usd (campaign-feed $) over the SAME trailing
-                          fully-classified window as §2b's opps; Cost/opp = cost ÷ opps.
+ §2b SMS cost (window) -> raw_sendivo_billing_daily.total_spend (all-in $, SAME basis as §2) summed
+                          over the SAME trailing fully-classified window as §2b's opps; Cost/opp =
+                          cost ÷ opps. (Was funnel campaign-feed cost_usd = the carrier-fee component
+                          only — understated all-in spend ~1.6x; fixed 2026-07-01.)
  §3 warm-caller MTD    -> core.call, 1st-of-month..report-day (ET): dials / distinct people / connects>=60s.
  §1 Opp→mtg %          -> meetings ÷ opportunities, same same-day frame as §1's columns ('—' when opps=0).
  §2 SMS replies (human)-> raw_sendivo_inbound non-opt-out.
@@ -226,18 +230,21 @@ def sendivo_sms(date):
 
 _billing_cache = {}
 def sendivo_billing_cost(date):
-    """{sub_account_id: (sms_fee_qty, sms_fee_usd)} for `date` from the WAREHOUSE
+    """{sub_account_id: (sms_fee_qty, total_spend_usd)} for `date` from the WAREHOUSE
     main.raw_sendivo_billing_daily (nightly 'sendivo billing_daily' phase, upsert-keyed
     (metric_date, sub_account_id)) — the §2 actual-$ SMS cost feed [backlog A1, 2026-07-01].
     NEW columns read the warehouse (the centralize direction); §2 Sent deliberately STAYS on the
-    live billing API (no existing-metric repoint — that flip is gated). sms_fee_usd is the actual
-    carrier-billed SMS-fee $ (June-30 sanity: sub 12720 = $346.03). Fail-soft -> {} (cost cells
-    render '—' + WARN), never crashes §2."""
+    live billing API (no existing-metric repoint — that flip is gated). $ = total_spend, the API's
+    own ALL-IN figure (sms_fee_usd + carrier_fee_usd + setup/renewal/brand/phone fees; sms_fee_usd
+    ALONE understated ~3x — carrier fees bill per SEGMENT, so carrier_fee_qty > message count.
+    July-1 sanity: sub 12720 sms_fee $754.03 + carrier $1,489.83 = total_spend $2,243.87).
+    sms_fee_qty still returned as the freshness tripwire vs live billed sent. Fail-soft -> {}
+    (cost cells render '—' + WARN), never crashes §2."""
     if date in _billing_cache:
         return _billing_cache[date]
     out = {}
     try:
-        for r in wq(f"""SELECT sub_account_id, sms_fee_qty, sms_fee_usd
+        for r in wq(f"""SELECT sub_account_id, sms_fee_qty, total_spend
                         FROM main.raw_sendivo_billing_daily WHERE metric_date=DATE '{date}'"""):
             out[int(r[0])] = (int(r[1] or 0), float(r[2] or 0.0))
     except Exception as e:
@@ -486,7 +493,9 @@ def get_sms_wa():
                   "delivered≈sent, Fail% '—'", file=sys.stderr)
             return billed_sent, None
         return vdeliv, vfail
-    # §2 Cost $ (actual) [backlog A1] = warehouse raw_sendivo_billing_daily.sms_fee_usd for the day.
+    # §2 Cost $ (actual) [backlog A1] = warehouse raw_sendivo_billing_daily.total_spend for the day
+    # (all-in Sendivo $: SMS fees + carrier fees + setup/renewal/brand/phone fees — NOT sms_fee_usd,
+    # which excluded carrier fees and understated spend ~3x).
     # Same 100%-or-wipe tripwire class as deliv_failed: the table is nightly-upserted (7d window), so
     # on an evening render the report day's row can be a PARTIAL-day snapshot — its sms_fee_qty would
     # lag the LIVE billed quantity §2 Sent already fetched. >5% qty divergence (or a missing row while
@@ -570,24 +579,58 @@ def _sms_win_inlist():
 
 def get_sms_kpi_to_opp():
     """Per-workspace SMS sent / opps / sent-per-opp / cost / cost-per-opp over the trailing
-    fully-classified window, from the current-native funnel main.v_sms_workspace_funnel (opps = Qwen
-    positive replies attributed to the sub-account by reply number; cost_usd = the funnel's rollup of
-    v_sms_campaign_performance.cost_usd — Sendivo's per-message campaign-feed $, summed over the SAME
-    window dates so Cost/opp is window-consistent with Sent/Opps [backlog A2, 2026-07-01]).
-    sent_per_opp = the KPI-to-opp gate. Ren3 (webform) sends route via the AIM API and are NOT in the
-    campaign feed -> its funnel sent is 0 -> Sent/opp shows '—' (opps still shown).
-    NB: cost basis here is the CAMPAIGN-FEED per-message $ (v_sms_campaign_performance.cost_usd),
-    deliberately DIFFERENT from §2's Cost $ (actual) = the BILLING sms_fee_usd — window vs day AND
-    feed vs billing; both labeled. Do not expect the two to reconcile per-day."""
+    fully-classified window. Sent/Opps = the current-native funnel main.v_sms_workspace_funnel
+    (opps = Qwen positive replies attributed to the sub-account by reply number); sent_per_opp =
+    the KPI-to-opp gate. Ren3 (webform) sends route mostly via the AIM API and are NOT in the
+    campaign feed -> its funnel sent undercounts -> Sent/opp unreliable there (opps still shown).
+    Cost $ (window) [2026-07-01 fix] = warehouse raw_sendivo_billing_daily.total_spend summed over
+    the SAME window dates per sub-account — the ALL-IN Sendivo $ (SMS fees + carrier fees + any
+    setup/renewal/brand/phone fees that day), the SAME basis as §2's Cost $ (actual), just windowed.
+    The previous basis (v_sms_workspace_funnel.cost_usd = campaign-feed per-message $) priced only
+    the CARRIER-FEE component of campaign-feed sends (per-segment rate matches billing
+    carrier_fee_usd/qty to ~2%) — it excluded the SMS fee and every AIM-API send, understating
+    all-in spend ~1.6x (June audit: Ren1 $14,337 feed vs $23,097 billed) — replaced, not kept.
+    Cost gate (100%-or-wipe): every window date must lie inside raw_sendivo_billing_daily's loaded
+    [min,max] range; outside (or on lookup failure) cost is None -> renders '—' + WARN, never a
+    partial sum. Inside the range a missing (date,sub) billing row = a genuine $0 day (Sendivo's
+    billing report only emits rows for subs with activity)."""
     dates, inlist = _sms_win_inlist()
     if not inlist:
         return {"dates": [], "rows": []}
-    rows = wq(f"""SELECT sub_account, sum(sent), sum(opps), sum(cost_usd)
+    rows = wq(f"""SELECT sub_account, sum(sent), sum(opps)
                   FROM main.v_sms_workspace_funnel
                   WHERE metric_date IN ({inlist}) AND sub_account LIKE 'Renaissance%'
                   GROUP BY 1 ORDER BY 1""")
-    return {"dates": dates,
-            "rows": [(r[0], int(r[1] or 0), int(r[2] or 0), float(r[3] or 0.0)) for r in rows]}
+    cost_by_ws = None   # None = cost gate tripped -> every §2b cost cell renders '—'
+    try:
+        rng = wq("""SELECT CAST(min(metric_date) AS VARCHAR), CAST(max(metric_date) AS VARCHAR)
+                    FROM main.raw_sendivo_billing_daily""")
+        lo, hi = (rng[0][0], rng[0][1]) if (rng and rng[0][0]) else (None, None)
+        if not lo or dates[0] < lo or dates[-1] > hi:
+            raise RuntimeError(f"window {dates[0]}..{dates[-1]} outside billing coverage {lo}..{hi}")
+        sub2ws = {SUB_REN1: "Renaissance 1", SUB_REN2: "Renaissance 2", SUB_REN3: "Renaissance 3"}
+        cost_by_ws = {ws: 0.0 for ws in sub2ws.values()}   # in-coverage missing rows = genuine $0
+        for r in wq(f"""SELECT sub_account_id, sum(total_spend)
+                        FROM main.raw_sendivo_billing_daily
+                        WHERE metric_date IN ({inlist}) GROUP BY 1"""):
+            ws = sub2ws.get(int(r[0] or 0))
+            if ws:
+                cost_by_ws[ws] = float(r[1] or 0.0)
+    except Exception as e:
+        print(f"WARN get_sms_kpi_to_opp billing window cost failed: {e}; §2b Cost $ renders '—'",
+              file=sys.stderr)
+        cost_by_ws = None
+    out_rows = []
+    for r in rows:
+        ws = r[0]
+        if cost_by_ws is not None and ws not in cost_by_ws:
+            # name-drift tripwire: the funnel's sub_account label no longer matches the sub2ws map —
+            # cost renders '—' (never a wrong-row $), but say so LOUD instead of failing silently.
+            print(f"WARN get_sms_kpi_to_opp: funnel workspace '{ws}' has no billing cost mapping "
+                  f"(sub2ws name drift?); its §2b Cost $ renders '—'", file=sys.stderr)
+        out_rows.append((ws, int(r[1] or 0), int(r[2] or 0),
+                         (cost_by_ws.get(ws) if cost_by_ws is not None else None)))
+    return {"dates": dates, "rows": out_rows}
 
 # (§2c campaign leaderboard REMOVED from the report 2026-07-01 per the Jun-30 accuracy pass — the
 # underlying warehouse view main.v_sms_campaign_performance stays and now feeds §2 delivered/failed.)
@@ -1254,8 +1297,8 @@ def build_and_write(tab, build_fn):
         # WhatsApp shows DELIVERED + FAIL% (ISKRA "sent" runs ~30-37% failed -> attempted misleads);
         # KPI = delivered/mtg. SMS: failed=None -> Fail% "—", delivered≈sent. (folds in #116)
         # Cost columns [backlog A1/A3/A4, 2026-07-01]: Cost $ (actual) = the day's Sendivo BILLING
-        # sms_fee_usd from warehouse raw_sendivo_billing_daily (actual carrier-billed SMS-fee $;
-        # carrier-surcharge/setup line items excluded); Cost/mtg·form = that cost ÷ the SAME row's
+        # total_spend from warehouse raw_sendivo_billing_daily (ALL-IN $: SMS fees + carrier fees +
+        # any setup/renewal/brand/phone fees that day); Cost/mtg·form = that cost ÷ the SAME row's
         # Meetings/Webform value (Ren1/Ren2: meetings; Ren3: web-form fills) — '—' when the unit
         # count is 0 (never divide-by-zero) or when cost is None (missing/partial billing row, already
         # WARNed loud in get_sms_wa). WhatsApp cost is ALWAYS '—' (no actual feed; $0.07 model gated).
@@ -1279,14 +1322,16 @@ def build_and_write(tab, build_fn):
         tcost = round(sum(sms_costs), 2) if (sms_costs and all(c is not None for c in sms_costs)) else "—"
         ti = add(["TOTAL", ts, td, (f"'{round(100.0*tf/ts)}%" if (any_fail and ts) else "—"), rr(thr, td), tm, kpi(td, tm), tcost, "—"]); tot.append(ti); rrrows.append(ti); row_ncol[ti] = W
         usdcells.append((ti, 7, 9))
-        ni = add(["Cost $ (actual) = Sendivo billing sms_fees actual $ for the day (warehouse raw_sendivo_billing_daily; SMS fee only — carrier surcharges excluded; WhatsApp has no cost feed). Cost/mtg·form = cost ÷ that row's meetings (Ren3: web-form fills). '—' cost = no fully-loaded billing row yet (back-fills after the nightly)."])
+        ni = add(["Cost $ (actual) = ALL-IN Sendivo spend for the day (warehouse raw_sendivo_billing_daily total_spend: SMS fees + carrier fees + any setup/renewal/brand/phone fees that day; carrier fees bill per segment, so carrier-fee qty > message count; WhatsApp has no cost feed). Cost/mtg·form = cost ÷ that row's meetings (Ren3: web-form fills). '—' cost = no fully-loaded billing row yet (back-fills after the nightly)."])
         data.append(ni); row_ncol[ni] = W
     def sms_kpi_table(kpi_d, header_label):
         # §2b — SMS KPI-to-opp (texts per opportunity) per workspace over the trailing fully-classified
         # window. opp = Qwen positive-intent reply (current-native). Same-day opps lag ~2-3d -> shown as a
         # trailing window, NOT the render day (see get_sms_kpi_to_opp / feedback_partial_data_100pct_or_wipe).
-        # Cost $ (window) / Cost/opp [backlog A2]: campaign-feed cost_usd summed over the SAME window
-        # dates ÷ the SAME Opps column — window-consistent by construction. Cost/opp '—' when opps=0.
+        # Cost $ (window) / Cost/opp [backlog A2; basis fixed 2026-07-01]: billing total_spend (all-in
+        # Sendivo $, same basis as §2) summed over the SAME window dates ÷ the SAME Opps column —
+        # window-consistent by construction. cost None (coverage gate tripped) -> '—'; Cost/opp '—'
+        # when opps=0. TOTAL cost only when every row has one (partial sum understates; 100%-or-wipe).
         W = 6
         LBL = {"Renaissance 1": "Renaissance 1 (Funding SMS)", "Renaissance 2": "Renaissance 2 (Pre-IPO SMS)",
                "Renaissance 3": "Renaissance 3 (webform SMS)"}
@@ -1296,23 +1341,27 @@ def build_and_write(tab, build_fn):
         if not kpi_d.get("rows"):
             ni = add(["(pending — no fully-classified SMS-reply day in the trailing window; the Qwen positive-intent classifier lags ~2-3d so same-day opps aren't ready)"]); data.append(ni); row_ncol[ni] = W
             return
-        ts = topp = 0; tcost = 0.0
+        ts = topp = 0; costs = []
         for ws, sent, opps, cost in kpi_d["rows"]:
             spo = round(sent / opps) if (opps and sent) else "—"
-            cpo = round(cost / opps, 2) if opps else "—"
-            ri = add([LBL.get(ws, ws), sent, opps, spo, round(cost, 2), cpo]); data.append(ri); row_ncol[ri] = W
+            ccell = round(cost, 2) if cost is not None else "—"
+            cpo = round(cost / opps, 2) if (cost is not None and opps) else "—"
+            ri = add([LBL.get(ws, ws), sent, opps, spo, ccell, cpo]); data.append(ri); row_ncol[ri] = W
             usdcells.append((ri, 4, 6))
-            ts += sent; topp += opps; tcost += cost
+            ts += sent; topp += opps; costs.append(cost)
+        tcost = round(sum(costs), 2) if (costs and all(c is not None for c in costs)) else None
         tspo = round(ts / topp) if (ts and topp) else "—"
-        tcpo = round(tcost / topp, 2) if topp else "—"
-        ti = add(["TOTAL (SMS)", ts, topp, tspo, round(tcost, 2), tcpo]); tot.append(ti); row_ncol[ti] = W
+        tcpo = round(tcost / topp, 2) if (tcost is not None and topp) else "—"
+        ti = add(["TOTAL (SMS)", ts, topp, tspo, (tcost if tcost is not None else "—"), tcpo]); tot.append(ti); row_ncol[ti] = W
         usdcells.append((ti, 4, 6))
         note = (f"opp = positive-intent inbound reply (Qwen classifier — the current-native SMS opp). "
                 f"Sent/opp = the KPI-to-opp gate (lower = better). Window = {len(d)} fully-classified day(s) "
                 f"{d[0]}..{d[-1]} (≥90% of that day's human replies classified); same-day opps lag ~2-3d so are "
-                f"not shown live. Ren3 webform sends route via the AIM API (not in the campaign feed) -> Sent/opp n/a. "
-                f"Cost = Sendivo campaign-feed per-message $ (v_sms_campaign_performance.cost_usd) over the SAME window — "
-                f"a DIFFERENT basis than §2's billing sms-fee Cost $ (actual); Cost/opp = window cost ÷ window opps.")
+                f"not shown live. Ren3 webform sends route via the AIM API (not in the campaign feed) -> its Sent "
+                f"undercounts, Sent/opp unreliable. Cost $ (window) = ALL-IN Sendivo spend over the SAME window "
+                f"(warehouse raw_sendivo_billing_daily total_spend: SMS fees + carrier fees + any setup/renewal/"
+                f"brand/phone fees; carrier fees bill per segment) — the same basis as §2's Cost $ (actual), "
+                f"windowed; Cost/opp = window cost ÷ window opps.")
         ni = add([note]); data.append(ni); row_ncol[ni] = W
     def truth_table(header_label):
         W = 8
