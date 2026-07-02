@@ -33,6 +33,15 @@ DB="${MIRROR_DB:-/mnt/volume_nyc1_1781398428838/lead-mirror/lead_mirror.duckdb}"
 LOCK="${MIRROR_WRITER_LOCK:-/mnt/volume_nyc1_1781398428838/lead-mirror/.writer.lock}"
 LOCK_WAIT_S="${MIRROR_LOCK_WAIT_S:-600}"
 DUCKDB_BIN="${DUCKDB_BIN:-/usr/local/bin/duckdb}"
+# OOM guard (learned 2026-07-01 first run: the email-join across the 34M-row
+# mirror built its hash table on the big side -> duckdb RSS hit 10GB on the 15GB
+# box while transcribe + the sig-phone extract were resident -> kernel OOM-killed
+# the writer mid-tx; DuckDB rolled back cleanly, but the run died). Cap memory
+# and give DuckDB a disk spill dir so the join goes out-of-core instead of OOM.
+APPLY_MEM="${MIRROR_APPLY_MEMORY:-4GB}"
+DUCK_TMP="${MIRROR_APPLY_TMPDIR:-/mnt/volume_nyc1_1781398428838/duckdb_tmp}"
+mkdir -p "$DUCK_TMP"
+DUCK_PREAMBLE="PRAGMA memory_limit='${APPLY_MEM}'; SET temp_directory='${DUCK_TMP}';"
 
 ts(){ date -u +%FT%TZ; }
 ddw(){ ( exec -a duckdb_cli_writer "$DUCKDB_BIN" "$@" ); }
@@ -48,6 +57,7 @@ flock -w "$LOCK_WAIT_S" 9 || { echo "[$(ts)] ERR: could not acquire writer.lock 
 echo "[$(ts)] lock held"
 
 ddw "$DB" <<SQL
+$DUCK_PREAMBLE
 BEGIN TRANSACTION;
 CREATE TEMP TABLE src_raw AS
   SELECT lower(trim(column0)) AS email,
@@ -92,6 +102,7 @@ SQL
 
 echo "[$(ts)] === post-commit verify ==="
 ddw -readonly "$DB" <<SQL
+$DUCK_PREAMBLE
 CREATE TEMP TABLE src_raw AS
   SELECT lower(trim(column0)) AS email,
          trim(column1)        AS phone,
