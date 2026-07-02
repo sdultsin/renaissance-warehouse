@@ -96,6 +96,12 @@ fi
 if [[ "$SKIP_WAREHOUSE" == "0" && "$MODE" == "relock" ]]; then
     run_phase sheets            --phase sheets
     run_phase im_bookings       --phase im_bookings
+    # billing_daily on the relock too [2026-07-02, PR #161 follow-up]: at 12:30 AM ET the report day
+    # is CLOSED, so this locks §2 'Cost $ (actual)' with the final, stable billing row. Without it the
+    # day's cost cell would stay '—' FOREVER: the 05:30Z heavy nightly (the only other billing_daily
+    # runner) fires AFTER this final relock render, and get_sms_wa's tripwire rightly dashes any
+    # same-day row whose sms_fee_qty lags live billing >5%.
+    run_phase sendivo_billing   --phase sendivo --ingest billing_daily
     run_phase canonical_meeting --phase canonical --ingest meeting
 elif [[ "$SKIP_WAREHOUSE" == "0" ]]; then
     $PY scripts/setup_db.py || log "WARN setup_db failed (continuing)"
@@ -104,6 +110,9 @@ elif [[ "$SKIP_WAREHOUSE" == "0" ]]; then
     run_phase im_bookings       --phase im_bookings
     run_phase sendivo_mirror    --phase sendivo --ingest mirror
     run_phase sendivo_inbound   --phase sendivo --ingest inbound
+    # refresh the day-grain billing rows (§2 'Cost $ (actual)' feed) so the 10PM-ET render's same-day
+    # cost is as-of ~9PM ET (still tripwire-guarded if late sends diverge >5%; the relock locks final $)
+    run_phase sendivo_billing   --phase sendivo --ingest billing_daily
     run_phase iskra             --phase iskra
     run_phase close             --phase close
     run_phase canonical_meeting --phase canonical --ingest meeting
