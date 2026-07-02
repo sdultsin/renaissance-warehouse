@@ -46,6 +46,7 @@ DUCK_PREAMBLE="PRAGMA memory_limit='${APPLY_MEM}'; SET temp_directory='${DUCK_TM
 ts(){ date -u +%FT%TZ; }
 ddw(){ ( exec -a duckdb_cli_writer "$DUCKDB_BIN" "$@" ); }
 
+[[ -f "$TSV" ]] || { echo "[$(ts)] ERR: TSV not found: $TSV"; exit 66; }
 if [[ ! -s "$TSV" ]]; then
   echo "[$(ts)] staged=0 matched=0 will_update=0 committed=0 (empty TSV, nothing to apply)"
   exit 0
@@ -72,7 +73,7 @@ CREATE TEMP TABLE src_raw AS
 -- one winner per email: latest observation wins (defensive even when the caller
 -- already dedupes; UPDATE..FROM with dup keys would be non-deterministic)
 CREATE TEMP TABLE src AS
-  SELECT email, phone, source, coalesce(event_ts, now()) AS event_ts
+  SELECT email, phone, source, coalesce(event_ts, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS event_ts
   FROM (SELECT *, row_number() OVER (PARTITION BY email ORDER BY event_ts DESC NULLS LAST) AS rn
         FROM src_raw)
   WHERE rn = 1;
@@ -84,7 +85,8 @@ SELECT 'will_update=' || count(*)
   FROM mirror.leads_current l JOIN src s ON l.email = s.email
   WHERE (l.enriched_phone_at IS NULL OR s.event_ts > l.enriched_phone_at)
     AND (l.enriched_phone IS DISTINCT FROM s.phone
-         OR l.enriched_phone_source IS DISTINCT FROM s.source);
+         OR l.enriched_phone_source IS DISTINCT FROM s.source
+         OR s.event_ts > l.enriched_phone_at);
 
 UPDATE mirror.leads_current AS l
 SET enriched_phone        = s.phone,
@@ -95,7 +97,10 @@ FROM src s
 WHERE l.email = s.email
   AND (l.enriched_phone_at IS NULL OR s.event_ts > l.enriched_phone_at)   -- never clobber fresher
   AND (l.enriched_phone IS DISTINCT FROM s.phone
-       OR l.enriched_phone_source IS DISTINCT FROM s.source);             -- unchanged rows cost nothing
+       OR l.enriched_phone_source IS DISTINCT FROM s.source
+       -- same value re-observed at a genuinely newer time: refresh _at so the
+       -- freshness race stays exact (bounded: only fires on NEW observations)
+       OR s.event_ts > l.enriched_phone_at);
 
 COMMIT;
 SQL
@@ -113,10 +118,13 @@ CREATE TEMP TABLE src_raw AS
                          'column2':'VARCHAR','column3':'VARCHAR'})
   WHERE column0 IS NOT NULL AND trim(column1) <> '' AND trim(column2) <> '';
 CREATE TEMP TABLE src AS
-  SELECT email, phone, source, coalesce(event_ts, now()) AS event_ts
+  SELECT email, phone, source, coalesce(event_ts, TIMESTAMPTZ '1970-01-01 00:00:00+00') AS event_ts
   FROM (SELECT *, row_number() OVER (PARTITION BY email ORDER BY event_ts DESC NULLS LAST) AS rn
         FROM src_raw)
   WHERE rn = 1;
+-- NOTE committed= is a VERIFIED-EQUAL count (rows now carrying the staged
+-- value), NOT "rows written tonight": it includes pre-existing-equal rows and
+-- excludes freshness-skipped ones. will_update= is the landed-tonight number.
 SELECT 'committed=' || count(*)
   FROM mirror.leads_current l JOIN src s ON l.email = s.email
   WHERE l.enriched_phone = s.phone AND l.enriched_phone_source = s.source;
