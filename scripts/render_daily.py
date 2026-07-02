@@ -16,6 +16,14 @@ Canonical sources (verified 2026-06-30; booking cutover 2026-06-30):
                           channel -> §1 Email / §2 SMS+WhatsApp / §3 Call; workspace -> §1 by-workspace
                           (ws_alias); partner -> §5; lead_type -> §1 cheap/regular split.
  §2 SMS sent           -> sendivo billing_report.sms_fees.quantity (12720=Ren1, 13922=Ren2, 14603=Ren3 webform).
+ §2 SMS Cost $ (actual)-> WAREHOUSE main.raw_sendivo_billing_daily.sms_fee_usd (nightly upsert; the
+                          actual carrier-billed SMS-fee $/day per sub) + Cost/mtg·form = cost ÷ that
+                          row's meetings (Ren3: web-form fills). Partial/missing day-row -> '—' + WARN
+                          (100%-or-wipe), back-fills post-nightly. WhatsApp: no cost feed -> '—'.
+ §2b SMS cost (window) -> v_sms_workspace_funnel.cost_usd (campaign-feed $) over the SAME trailing
+                          fully-classified window as §2b's opps; Cost/opp = cost ÷ opps.
+ §3 warm-caller MTD    -> core.call, 1st-of-month..report-day (ET): dials / distinct people / connects>=60s.
+ §1 Opp→mtg %          -> meetings ÷ opportunities, same same-day frame as §1's columns ('—' when opps=0).
  §2 SMS replies (human)-> raw_sendivo_inbound non-opt-out.
  §2 WhatsApp           -> v_sms_dash_wa_daily (sent/delivered/failed/replies); meetings -> im_bookings.
  §3 Close             -> core.call (dials/leads/connects @>=60s, ET day) — Close API SoR, under-captures.
@@ -214,6 +222,27 @@ def sendivo_sms(date):
         except Exception as e:
             print(f"WARN sendivo_sms {date}: {e}", file=sys.stderr)
     _sendivo_cache[date] = out
+    return out
+
+_billing_cache = {}
+def sendivo_billing_cost(date):
+    """{sub_account_id: (sms_fee_qty, sms_fee_usd)} for `date` from the WAREHOUSE
+    main.raw_sendivo_billing_daily (nightly 'sendivo billing_daily' phase, upsert-keyed
+    (metric_date, sub_account_id)) — the §2 actual-$ SMS cost feed [backlog A1, 2026-07-01].
+    NEW columns read the warehouse (the centralize direction); §2 Sent deliberately STAYS on the
+    live billing API (no existing-metric repoint — that flip is gated). sms_fee_usd is the actual
+    carrier-billed SMS-fee $ (June-30 sanity: sub 12720 = $346.03). Fail-soft -> {} (cost cells
+    render '—' + WARN), never crashes §2."""
+    if date in _billing_cache:
+        return _billing_cache[date]
+    out = {}
+    try:
+        for r in wq(f"""SELECT sub_account_id, sms_fee_qty, sms_fee_usd
+                        FROM main.raw_sendivo_billing_daily WHERE metric_date=DATE '{date}'"""):
+            out[int(r[0])] = (int(r[1] or 0), float(r[2] or 0.0))
+    except Exception as e:
+        print(f"WARN sendivo_billing_cost failed {date}: {e}; §2 Cost $ renders '—'", file=sys.stderr)
+    _billing_cache[date] = out
     return out
 
 # ---------------------------- google sheet reader ----------------------------
@@ -457,17 +486,42 @@ def get_sms_wa():
                   "delivered≈sent, Fail% '—'", file=sys.stderr)
             return billed_sent, None
         return vdeliv, vfail
+    # §2 Cost $ (actual) [backlog A1] = warehouse raw_sendivo_billing_daily.sms_fee_usd for the day.
+    # Same 100%-or-wipe tripwire class as deliv_failed: the table is nightly-upserted (7d window), so
+    # on an evening render the report day's row can be a PARTIAL-day snapshot — its sms_fee_qty would
+    # lag the LIVE billed quantity §2 Sent already fetched. >5% qty divergence (or a missing row while
+    # live billed >0) -> cost renders '—' + loud WARN and back-fills on the post-nightly re-render;
+    # never a silently-understated $.
+    bill = sendivo_billing_cost(DAILY)
+    def cost_usd(sub_id, sub_label, billed_sent):
+        row = bill.get(sub_id)
+        if row is None:
+            if billed_sent:
+                print(f"WARN get_sms_wa: no raw_sendivo_billing_daily row for sub {sub_id} "
+                      f"('{sub_label}') on {DAILY} (live billed {billed_sent}); Cost $ renders '—' "
+                      "(back-fills after the nightly)", file=sys.stderr)
+            return None
+        qty, usd = row
+        if billed_sent and abs(qty - billed_sent) > 0.05 * billed_sent:
+            print(f"WARN get_sms_wa: raw_sendivo_billing_daily sms_fee_qty={qty} diverges >5% from "
+                  f"live billed {billed_sent} for sub {sub_id} ('{sub_label}') on {DAILY} — partial "
+                  "day-load; Cost $ renders '—' (100%-or-wipe) and back-fills after the nightly",
+                  file=sys.stderr)
+            return None
+        return usd
     rows = []
-    s1 = sms.get(SUB_REN1, 0); d1, f1 = deliv_failed("Renaissance 1", s1); rows.append(("Renaissance 1 (SMS)", s1, d1, f1, inb.get("Renaissance 1", (0, 0))[1], sms_mtg))
-    s2 = sms.get(SUB_REN2, 0); d2, f2 = deliv_failed("Renaissance 2", s2); rows.append(("Renaissance 2 (SMS · Pre-IPO)", s2, d2, f2, inb.get("Renaissance 2", (0, 0))[1], preipo_meetings(DAILY)))
-    s3 = sms.get(SUB_REN3, 0); d3, f3 = deliv_failed("Renaissance 3", s3); rows.append(("Renaissance 3 (SMS · webform)", s3, d3, f3, inb.get("Renaissance 3", (0, 0))[1], webform_submissions(DAILY)))
+    s1 = sms.get(SUB_REN1, 0); d1, f1 = deliv_failed("Renaissance 1", s1); rows.append(("Renaissance 1 (SMS)", s1, d1, f1, inb.get("Renaissance 1", (0, 0))[1], sms_mtg, cost_usd(SUB_REN1, "Renaissance 1", s1)))
+    s2 = sms.get(SUB_REN2, 0); d2, f2 = deliv_failed("Renaissance 2", s2); rows.append(("Renaissance 2 (SMS · Pre-IPO)", s2, d2, f2, inb.get("Renaissance 2", (0, 0))[1], preipo_meetings(DAILY), cost_usd(SUB_REN2, "Renaissance 2", s2)))
+    s3 = sms.get(SUB_REN3, 0); d3, f3 = deliv_failed("Renaissance 3", s3); rows.append(("Renaissance 3 (SMS · webform)", s3, d3, f3, inb.get("Renaissance 3", (0, 0))[1], webform_submissions(DAILY), cost_usd(SUB_REN3, "Renaissance 3", s3)))
     wa = wq(f"""SELECT sent, delivered, failed, replies_total FROM main.v_sms_dash_wa_daily
                 WHERE channel='whatsapp' AND metric_date=DATE '{DAILY}'""")
     if wa:
         ws_, wd, wf, wr = (int(wa[0][i] or 0) for i in range(4))
     else:
         ws_, wd, wf, wr = 0, 0, 0, 0
-    rows.append(("WhatsApp (ISKRA)", ws_, wd, wf, wr, wa_mtg))
+    # WhatsApp cost = None ALWAYS: no actual WA cost feed exists (cost_usd 100% NULL) and the $0.07/msg
+    # model is explicitly GATED (no modeled numbers on the report) [backlog B3/A6, Sam 07-01].
+    rows.append(("WhatsApp (ISKRA)", ws_, wd, wf, wr, wa_mtg, None))
     return rows
 
 # ---------------------------- §2b SMS KPI-to-opp ----------------------------
@@ -515,18 +569,25 @@ def _sms_win_inlist():
     return dates, (", ".join("DATE '%s'" % d for d in dates) if dates else "")
 
 def get_sms_kpi_to_opp():
-    """Per-workspace SMS sent / opps / sent-per-opp over the trailing fully-classified window, from the
-    current-native funnel main.v_sms_workspace_funnel (opps = Qwen positive replies attributed to the
-    sub-account by reply number). sent_per_opp = the KPI-to-opp gate. Ren3 (webform) sends route via the
-    AIM API and are NOT in the campaign feed -> its funnel sent is 0 -> Sent/opp shows '—' (opps still shown)."""
+    """Per-workspace SMS sent / opps / sent-per-opp / cost / cost-per-opp over the trailing
+    fully-classified window, from the current-native funnel main.v_sms_workspace_funnel (opps = Qwen
+    positive replies attributed to the sub-account by reply number; cost_usd = the funnel's rollup of
+    v_sms_campaign_performance.cost_usd — Sendivo's per-message campaign-feed $, summed over the SAME
+    window dates so Cost/opp is window-consistent with Sent/Opps [backlog A2, 2026-07-01]).
+    sent_per_opp = the KPI-to-opp gate. Ren3 (webform) sends route via the AIM API and are NOT in the
+    campaign feed -> its funnel sent is 0 -> Sent/opp shows '—' (opps still shown).
+    NB: cost basis here is the CAMPAIGN-FEED per-message $ (v_sms_campaign_performance.cost_usd),
+    deliberately DIFFERENT from §2's Cost $ (actual) = the BILLING sms_fee_usd — window vs day AND
+    feed vs billing; both labeled. Do not expect the two to reconcile per-day."""
     dates, inlist = _sms_win_inlist()
     if not inlist:
         return {"dates": [], "rows": []}
-    rows = wq(f"""SELECT sub_account, sum(sent), sum(opps)
+    rows = wq(f"""SELECT sub_account, sum(sent), sum(opps), sum(cost_usd)
                   FROM main.v_sms_workspace_funnel
                   WHERE metric_date IN ({inlist}) AND sub_account LIKE 'Renaissance%'
                   GROUP BY 1 ORDER BY 1""")
-    return {"dates": dates, "rows": [(r[0], int(r[1] or 0), int(r[2] or 0)) for r in rows]}
+    return {"dates": dates,
+            "rows": [(r[0], int(r[1] or 0), int(r[2] or 0), float(r[3] or 0.0)) for r in rows]}
 
 # (§2c campaign leaderboard REMOVED from the report 2026-07-01 per the Jun-30 accuracy pass — the
 # underlying warehouse view main.v_sms_campaign_performance stays and now feeds §2 delivered/failed.)
@@ -538,7 +599,25 @@ def get_close():
     d, l, cn = (int(c[0][0]), int(c[0][1]), int(c[0][2])) if c else (0, 0, 0)
     book = consolidated_bookings(DAILY)
     m = sum(1 for b in book if b["channel"].lower() == "call")
-    return {"dials": d, "leads": l, "connects": cn, "meetings": m}
+    # §3 warm-caller MTD [backlog A7 / Sam ask #5]: month-to-date (1st of the report month .. report
+    # day, ET) dials / distinct people dialed / connects>=60s from the SAME core.call source + ET-day
+    # frame as the daily rows (June full-month proof: 6,283 / 3,187 / 328 — recomputed live each
+    # render). Isolated try: a failure of the NEW query renders the MTD rows '—' + WARN, and can never
+    # regress the pre-existing daily §3 metrics.
+    mo = _d.replace(day=1).isoformat()
+    mtd_d = mtd_l = mtd_c = None
+    try:
+        r = wq(f"""SELECT COUNT(*), COUNT(DISTINCT close_lead_id),
+                     COUNT(*) FILTER (WHERE duration_seconds >= 60)
+                   FROM core.call
+                   WHERE (occurred_at AT TIME ZONE 'America/New_York')::DATE
+                         BETWEEN DATE '{mo}' AND DATE '{DAILY}'""")
+        if r:
+            mtd_d, mtd_l, mtd_c = int(r[0][0]), int(r[0][1]), int(r[0][2])
+    except Exception as e:
+        print(f"WARN get_close MTD query failed ({e}); §3 MTD rows render '—'", file=sys.stderr)
+    return {"dials": d, "leads": l, "connects": cn, "meetings": m,
+            "mtd_start": mo, "mtd_dials": mtd_d, "mtd_leads": mtd_l, "mtd_connects": mtd_c}
 
 def get_truth():
     """§4 no-lag: Expected = active accounts' configured daily_limit by ws x infra (per-workspace
@@ -1085,8 +1164,9 @@ def _safe(label, fn, default):
         print(f"WARN section '{label}' FAILED ({e}); rendering it empty", file=sys.stderr)
         return default
 _EMAIL_FB = [(name, 0, 0, 0, 0, 0, 0) for _, name in WS]
-_SMS_FB = [("Renaissance 1 (SMS)", 0, 0, None, 0, 0), ("Renaissance 2 (SMS · Pre-IPO)", 0, 0, None, 0, 0), ("Renaissance 3 (SMS · webform)", 0, 0, None, 0, 0), ("WhatsApp (ISKRA)", 0, 0, 0, 0, 0)]
-_CLOSE_FB = {"dials": 0, "leads": 0, "connects": 0, "meetings": 0}
+_SMS_FB = [("Renaissance 1 (SMS)", 0, 0, None, 0, 0, None), ("Renaissance 2 (SMS · Pre-IPO)", 0, 0, None, 0, 0, None), ("Renaissance 3 (SMS · webform)", 0, 0, None, 0, 0, None), ("WhatsApp (ISKRA)", 0, 0, 0, 0, 0, None)]
+_CLOSE_FB = {"dials": 0, "leads": 0, "connects": 0, "meetings": 0,
+             "mtd_start": DAILY, "mtd_dials": None, "mtd_leads": None, "mtd_connects": None}
 _TRUTH_FB = (None, [(name, 0, 0, 0, 0, 0, 0) for _, name in WS])
 _IMREPLY_FB = ((DAILY, DAILY, DAILY), [(name, 0, None, None, 0, None, None, 0, None, None) for _, name in WS])
 
@@ -1150,57 +1230,89 @@ def rgb(r, g, b): return {"red": r, "green": g, "blue": b}
 
 def build_and_write(tab, build_fn):
     rows = []; sec = []; th = []; tot = []; rrrows = []; merges = []; strows = []; data = []; infrows = []
+    usdcells = []   # (row_idx, col_start, col_end) -> CURRENCY "$#,##0.00" (§2 / §2b cost columns)
     th_ncol = {}; row_ncol = {}
     def add(r=None): rows.append(r or []); return len(rows) - 1
-    EMAIL_HDR_TOP = ["Workspace", "Sent", "Opportunities", "Meetings", "KPI (sent/mtg)", "Cheap", "", "Regular", ""]
-    SUB_HDR = ["", "", "", "", "", "#", "%", "#", "%"]
+    # Opp→mtg % [backlog A8 / opp→meeting conversion]: meetings ÷ opportunities in the SAME same-day
+    # frame §1 already uses (Instantly opps × im_bookings email meetings). APPENDED as the 10th column
+    # (col J — the last column inside the A1:J health window) so the Cheap/Regular merge indices
+    # (5-7, 7-9) stay untouched. '—' when opps=0 (never '0%' over an empty denominator).
+    EMAIL_HDR_TOP = ["Workspace", "Sent", "Opportunities", "Meetings", "KPI (sent/mtg)", "Cheap", "", "Regular", "", "Opp→mtg %"]
+    SUB_HDR = ["", "", "", "", "", "#", "%", "#", "%", ""]
     def email_table(data_rows, header_label):
-        W = 9
+        W = 10
+        def o2m(m, opps): return pctstr(m, opps) if opps else "—"
         si = add([header_label]); sec.append(si); row_ncol[si] = W
         hr_top = add(EMAIL_HDR_TOP); th.append(hr_top); hr_sub = add(SUB_HDR); th.append(hr_sub)
         merges.append((hr_top, 5, 7)); merges.append((hr_top, 7, 9)); th_ncol[hr_top] = th_ncol[hr_sub] = W
         ts = topp = tm = tc_ = tr_ = 0
         for ws, sent, hr, opps, m, c, r in data_rows:
-            ri = add([ws, sent, opps, m, kpi(sent, m), c, pctstr(c, m), r, pctstr(r, m)]); data.append(ri); row_ncol[ri] = W
+            ri = add([ws, sent, opps, m, kpi(sent, m), c, pctstr(c, m), r, pctstr(r, m), o2m(m, opps)]); data.append(ri); row_ncol[ri] = W
             ts += sent; topp += opps; tm += m; tc_ += c; tr_ += r
-        ti = add(["TOTAL", ts, topp, tm, kpi(ts, tm), tc_, pctstr(tc_, tm), tr_, pctstr(tr_, tm)]); tot.append(ti); row_ncol[ti] = W
+        ti = add(["TOTAL", ts, topp, tm, kpi(ts, tm), tc_, pctstr(tc_, tm), tr_, pctstr(tr_, tm), o2m(tm, topp)]); tot.append(ti); row_ncol[ti] = W
     def sms_wa_table(rows_data, header_label):
         # WhatsApp shows DELIVERED + FAIL% (ISKRA "sent" runs ~30-37% failed -> attempted misleads);
         # KPI = delivered/mtg. SMS: failed=None -> Fail% "—", delivered≈sent. (folds in #116)
-        W = 7
+        # Cost columns [backlog A1/A3/A4, 2026-07-01]: Cost $ (actual) = the day's Sendivo BILLING
+        # sms_fee_usd from warehouse raw_sendivo_billing_daily (actual carrier-billed SMS-fee $;
+        # carrier-surcharge/setup line items excluded); Cost/mtg·form = that cost ÷ the SAME row's
+        # Meetings/Webform value (Ren1/Ren2: meetings; Ren3: web-form fills) — '—' when the unit
+        # count is 0 (never divide-by-zero) or when cost is None (missing/partial billing row, already
+        # WARNed loud in get_sms_wa). WhatsApp cost is ALWAYS '—' (no actual feed; $0.07 model gated).
+        # TOTAL cost renders ONLY when every SMS row has a cost (partial sum would silently
+        # understate — 100%-or-wipe); TOTAL Cost/mtg·form stays '—' (meetings+webforms don't blend).
+        W = 9
         si = add([header_label]); sec.append(si); row_ncol[si] = W
-        hr = add(["Channel / workspace", "Sent", "Delivered", "Fail %", "Human RR", "Meetings/Webform", "KPI"]); th.append(hr); th_ncol[hr] = W
+        hr = add(["Channel / workspace", "Sent", "Delivered", "Fail %", "Human RR", "Meetings/Webform", "KPI", "Cost $ (actual)", "Cost / mtg·form"]); th.append(hr); th_ncol[hr] = W
         def failpct(failed, sent): return (f"'{round(100.0*failed/sent)}%" if sent else "'0%") if failed is not None else "—"
+        def costcell(c): return round(c, 2) if c is not None else "—"
+        def costper(c, m): return round(c / m, 2) if (c is not None and m) else "—"
         ts = td = tf = thr = tm = 0; any_fail = False
-        for label, sent, deliv, failed, reps, m in rows_data:
-            ri = add([label, sent, deliv, failpct(failed, sent), rr(reps, deliv), m, kpi(deliv, m)]); rrrows.append(ri); data.append(ri); row_ncol[ri] = W
+        sms_costs = []   # cost of every NON-WhatsApp row (None = missing) -> gates the TOTAL
+        for label, sent, deliv, failed, reps, m, cost in rows_data:
+            ri = add([label, sent, deliv, failpct(failed, sent), rr(reps, deliv), m, kpi(deliv, m),
+                      costcell(cost), costper(cost, m)]); rrrows.append(ri); data.append(ri); row_ncol[ri] = W
+            usdcells.append((ri, 7, 9))
             ts += sent; td += deliv; thr += reps; tm += m
             if failed is not None: tf += failed; any_fail = True
-        ti = add(["TOTAL", ts, td, (f"'{round(100.0*tf/ts)}%" if (any_fail and ts) else "—"), rr(thr, td), tm, kpi(td, tm)]); tot.append(ti); rrrows.append(ti); row_ncol[ti] = W
+            if "WhatsApp" not in label: sms_costs.append(cost)
+        tcost = round(sum(sms_costs), 2) if (sms_costs and all(c is not None for c in sms_costs)) else "—"
+        ti = add(["TOTAL", ts, td, (f"'{round(100.0*tf/ts)}%" if (any_fail and ts) else "—"), rr(thr, td), tm, kpi(td, tm), tcost, "—"]); tot.append(ti); rrrows.append(ti); row_ncol[ti] = W
+        usdcells.append((ti, 7, 9))
+        ni = add(["Cost $ (actual) = Sendivo billing sms_fees actual $ for the day (warehouse raw_sendivo_billing_daily; SMS fee only — carrier surcharges excluded; WhatsApp has no cost feed). Cost/mtg·form = cost ÷ that row's meetings (Ren3: web-form fills). '—' cost = no fully-loaded billing row yet (back-fills after the nightly)."])
+        data.append(ni); row_ncol[ni] = W
     def sms_kpi_table(kpi_d, header_label):
         # §2b — SMS KPI-to-opp (texts per opportunity) per workspace over the trailing fully-classified
         # window. opp = Qwen positive-intent reply (current-native). Same-day opps lag ~2-3d -> shown as a
         # trailing window, NOT the render day (see get_sms_kpi_to_opp / feedback_partial_data_100pct_or_wipe).
-        W = 4
+        # Cost $ (window) / Cost/opp [backlog A2]: campaign-feed cost_usd summed over the SAME window
+        # dates ÷ the SAME Opps column — window-consistent by construction. Cost/opp '—' when opps=0.
+        W = 6
         LBL = {"Renaissance 1": "Renaissance 1 (Funding SMS)", "Renaissance 2": "Renaissance 2 (Pre-IPO SMS)",
                "Renaissance 3": "Renaissance 3 (webform SMS)"}
         si = add([header_label]); sec.append(si); row_ncol[si] = W
-        hr = add(["Workspace", "Sent", "Opps", "Sent/opp"]); th.append(hr); th_ncol[hr] = W
+        hr = add(["Workspace", "Sent", "Opps", "Sent/opp", "Cost $ (window)", "Cost/opp"]); th.append(hr); th_ncol[hr] = W
         d = kpi_d.get("dates") or []
         if not kpi_d.get("rows"):
             ni = add(["(pending — no fully-classified SMS-reply day in the trailing window; the Qwen positive-intent classifier lags ~2-3d so same-day opps aren't ready)"]); data.append(ni); row_ncol[ni] = W
             return
-        ts = topp = 0
-        for ws, sent, opps in kpi_d["rows"]:
+        ts = topp = 0; tcost = 0.0
+        for ws, sent, opps, cost in kpi_d["rows"]:
             spo = round(sent / opps) if (opps and sent) else "—"
-            ri = add([LBL.get(ws, ws), sent, opps, spo]); data.append(ri); row_ncol[ri] = W
-            ts += sent; topp += opps
+            cpo = round(cost / opps, 2) if opps else "—"
+            ri = add([LBL.get(ws, ws), sent, opps, spo, round(cost, 2), cpo]); data.append(ri); row_ncol[ri] = W
+            usdcells.append((ri, 4, 6))
+            ts += sent; topp += opps; tcost += cost
         tspo = round(ts / topp) if (ts and topp) else "—"
-        ti = add(["TOTAL (SMS)", ts, topp, tspo]); tot.append(ti); row_ncol[ti] = W
+        tcpo = round(tcost / topp, 2) if topp else "—"
+        ti = add(["TOTAL (SMS)", ts, topp, tspo, round(tcost, 2), tcpo]); tot.append(ti); row_ncol[ti] = W
+        usdcells.append((ti, 4, 6))
         note = (f"opp = positive-intent inbound reply (Qwen classifier — the current-native SMS opp). "
                 f"Sent/opp = the KPI-to-opp gate (lower = better). Window = {len(d)} fully-classified day(s) "
                 f"{d[0]}..{d[-1]} (≥90% of that day's human replies classified); same-day opps lag ~2-3d so are "
-                f"not shown live. Ren3 webform sends route via the AIM API (not in the campaign feed) -> Sent/opp n/a.")
+                f"not shown live. Ren3 webform sends route via the AIM API (not in the campaign feed) -> Sent/opp n/a. "
+                f"Cost = Sendivo campaign-feed per-message $ (v_sms_campaign_performance.cost_usd) over the SAME window — "
+                f"a DIFFERENT basis than §2's billing sms-fee Cost $ (actual); Cost/opp = window cost ÷ window opps.")
         ni = add([note]); data.append(ni); row_ncol[ni] = W
     def truth_table(header_label):
         W = 8
@@ -1221,9 +1333,14 @@ def build_and_write(tab, build_fn):
         si = add([label]); sec.append(si); row_ncol[si] = W
         hr = add(["Close CRM — metric", "Value"]); th.append(hr); th_ncol[hr] = W
         d2m = f"'{(100.0*close['meetings']/close['dials']):.2f}%" if close['dials'] else "—"
+        def mtd(v): return v if v is not None else "—"   # None = MTD query failed (WARNed) -> dash
         for r2 in [["Dials", close["dials"]], ["Distinct leads dialed", close["leads"]],
                    ["Connects (≥60s real convo)", close["connects"]],
-                   ["Meetings booked (call-sourced)", close["meetings"]], ["Dial → meeting %", d2m]]:
+                   ["Meetings booked (call-sourced)", close["meetings"]], ["Dial → meeting %", d2m],
+                   # warm-caller MTD [backlog A7 / Sam ask #5] — same core.call source, ET-day frame
+                   [f"MTD dials (since {close.get('mtd_start', DAILY)})", mtd(close.get("mtd_dials"))],
+                   ["MTD distinct people dialed", mtd(close.get("mtd_leads"))],
+                   ["MTD connects (≥60s)", mtd(close.get("mtd_connects"))]]:
             ri = add(r2); data.append(ri); row_ncol[ri] = W
     def partner_table(rows_data, total, label):
         W = 2
@@ -1325,6 +1442,8 @@ def build_and_write(tab, build_fn):
     for i in infrows:  # §1b RR / Human RR / Positive RR (cols 2,3,4) as percents
         for c in (2, 3, 4):
             reqs.append({"repeatCell": {"range": rng(i, i + 1, c, c + 1), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}}}, "fields": "userEnteredFormat.numberFormat"}})
+    for i, c0, c1 in usdcells:  # §2 / §2b cost columns as USD (strings like '—' are unaffected)
+        reqs.append({"repeatCell": {"range": rng(i, i + 1, c0, c1), "cell": {"userEnteredFormat": {"numberFormat": {"type": "CURRENCY", "pattern": "$#,##0.00"}}}, "fields": "userEnteredFormat.numberFormat"}})
     for i in sorted(set(data) | set(tot) | set(strows)):
         reqs.append({"repeatCell": {"range": rng(i, i + 1, 1, NCOL), "cell": {"userEnteredFormat": {"horizontalAlignment": "RIGHT"}}, "fields": "userEnteredFormat.horizontalAlignment"}})
         reqs.append({"repeatCell": {"range": rng(i, i + 1, 0, 1), "cell": {"userEnteredFormat": {"horizontalAlignment": "LEFT"}}, "fields": "userEnteredFormat.horizontalAlignment"}})
@@ -1353,10 +1472,10 @@ def build_and_write(tab, build_fn):
 def write_summary_block(sid):
     """Cream right-side 'Business / Funding' summary block (cols L-O), GENERATED from section data."""
     def ratio(a, b): return round(a / b) if b else ""
-    # SMS_D rows: (label, sent, delivered, failed, replies, meetings)
-    sms1 = SMS_D[0] if len(SMS_D) > 0 else ("", 0, 0, None, 0, 0)
-    sms2 = SMS_D[1] if len(SMS_D) > 1 else ("", 0, 0, None, 0, 0)
-    wa = next((x for x in SMS_D if "WhatsApp" in x[0]), ("", 0, 0, 0, 0, 0))
+    # SMS_D rows: (label, sent, delivered, failed, replies, meetings, cost_usd|None)
+    sms1 = SMS_D[0] if len(SMS_D) > 0 else ("", 0, 0, None, 0, 0, None)
+    sms2 = SMS_D[1] if len(SMS_D) > 1 else ("", 0, 0, None, 0, 0, None)
+    wa = next((x for x in SMS_D if "WhatsApp" in x[0]), ("", 0, 0, 0, 0, 0, None))
     warm = next((r for r in EMAIL_D if r[0].lower().startswith("warm")), ("Warm leads", 0, 0, 0, 0, 0, 0))
     wsrows = [r for r in EMAIL_D if not r[0].lower().startswith("warm")]
     blk = [[f"{DAILY_TAB} — Business / Funding · {DAILY}", "", "", ""],
