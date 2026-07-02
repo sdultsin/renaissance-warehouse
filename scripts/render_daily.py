@@ -1117,7 +1117,7 @@ def _campaign_day_metrics(client, campaign_id, date):
 
 def get_infra_kpis():
     """Per (infra x workspace) KPIs for the report day, summed over that infra's campaigns (campaign
-    grain). RR/HumanRR/PositiveRR = % of sent; Email->opp / Email->meeting = emails-per-X ratios.
+    grain). RR/HumanRR = % of sent; PositiveRR = % of total replies (opp/(human+auto)); Email->opp / Email->meeting = emails-per-X ratios.
     Sends are reconciled to §1: each workspace's infra rows + an 'Unattributed (subseq/other)' row
     sum to the §1 workspace sent (the §1-vs-Σcampaign gap is subsequence sends, which inherit the
     parent's infra but are not rolled into the per-campaign analytics endpoint; folding them in would
@@ -1429,7 +1429,7 @@ def build_and_write(tab, build_fn):
         data.append(pend); row_ncol[pend] = W
     def infra_table(infra, header_label):
         # §1b — one row PER INFRASTRUCTURE, summed across ALL workspaces (Sam 2026-06-30; Google == reseller).
-        # RR=(human+auto)/sent, HumanRR=human/sent, PositiveRR=opp/sent, Email->opp=sent/opp, Email->meeting=sent/mtg.
+        # RR=(human+auto)/sent, HumanRR=human/sent, PositiveRR=opp/replies [opp/(human+auto)], Email->opp=sent/opp, Email->meeting=sent/mtg.
         # Row set/labels derive from the module-level INFRA_RENDER_ROWS (single sync point — see
         # its comment for the Milkbox wipe rationale).
         INFRA_ROWS = INFRA_RENDER_ROWS
@@ -1451,10 +1451,10 @@ def build_and_write(tab, build_fn):
         gs = gh = ga = go = gm = 0
         for inf in INFRA_ROWS:
             s, o, h, a = agg[inf]; m = mtg[inf]
-            ri = add([INFRA_LABEL[inf], s, pct(h + a, s), pct(h, s), pct(o, s), ratio(s, o), ratio(s, m)])
+            ri = add([INFRA_LABEL[inf], s, pct(h + a, s), pct(h, s), pct(o, h + a), ratio(s, o), ratio(s, m)])
             data.append(ri); infrows.append(ri); row_ncol[ri] = W
             gs += s; gh += h; ga += a; go += o; gm += m
-        gi = add([f"TOTAL ({len(INFRA_ROWS)} infra)", gs, pct(gh + ga, gs), pct(gh, gs), pct(go, gs), ratio(gs, go), ratio(gs, gm)])
+        gi = add([f"TOTAL ({len(INFRA_ROWS)} infra)", gs, pct(gh + ga, gs), pct(gh, gs), pct(go, gh + ga), ratio(gs, go), ratio(gs, gm)])
         tot.append(gi); infrows.append(gi); row_ncol[gi] = W
         um = infra.get("unattr_mtg", 0)
         if um:
