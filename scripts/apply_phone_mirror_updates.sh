@@ -38,7 +38,12 @@ DUCKDB_BIN="${DUCKDB_BIN:-/usr/local/bin/duckdb}"
 # box while transcribe + the sig-phone extract were resident -> kernel OOM-killed
 # the writer mid-tx; DuckDB rolled back cleanly, but the run died). Cap memory
 # and give DuckDB a disk spill dir so the join goes out-of-core instead of OOM.
-APPLY_MEM="${MIRROR_APPLY_MEMORY:-4GB}"
+# 4GB was too tight for a large replay: DuckDB's COMMIT pins updated blocks and
+# CANNOT spill them — a 15k-row backfill commit failed at "failed to pin block
+# (3.7GiB/3.7GiB used)" [2026-07-02]. 6GB clears nightly-scale commits with
+# kernel headroom on the 15GB box; override MIRROR_APPLY_MEMORY=8GB for big
+# replays (the 20k-row backfill passed at 8GB).
+APPLY_MEM="${MIRROR_APPLY_MEMORY:-6GB}"
 DUCK_TMP="${MIRROR_APPLY_TMPDIR:-/mnt/volume_nyc1_1781398428838/duckdb_tmp}"
 mkdir -p "$DUCK_TMP"
 DUCK_PREAMBLE="PRAGMA memory_limit='${APPLY_MEM}'; SET temp_directory='${DUCK_TMP}';"
