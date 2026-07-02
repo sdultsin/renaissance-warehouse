@@ -780,19 +780,107 @@ data["im_bookings"] = safe("im_bookings", lambda: {
 
 # ───────────────────────────── Org + Workspace sends & replies (Instantly-NATIVE) ──
 # Instantly-native counts are the SOLE truth for replies (reference_warehouse_reply_and_
-# tag_truth_20260614). BOTH cuts below now read the SAME native daily fact
-# (raw_pipeline_campaign_daily_metrics) so they reconcile by construction:
+# tag_truth_20260614). BOTH cuts below read the SAME native daily fact family:
 #   • org-wide rollup: human (unique_replies) / auto (unique_replies_automatic) /
 #     total (= human + auto) / positive (unique_opportunities = opps), windowed from
 #     SENDS_REPLIES_WINDOW_START (2026-05-15, where native reply coverage is sound).
 #     positive_rate = positive / human (per Sam's "positive = opps ÷ human").
-#     The org block is the un-grouped aggregate of the SAME query the per-workspace cut
-#     uses (just without the per-workspace GROUP BY) — so it reconciles by construction.
-#   • per-workspace MTD sends + replies + opps (derived.v_workspace_send_mtd, which itself
-#     sums the same native columns).
+#   • per-workspace MTD sends + replies + opps — SENT is mirror-first (see below);
+#     replies/opps stay per-campaign (derived.v_workspace_send_daily).
 # NOTE: the org block is NOT currently rendered by index.html — kept native+correct so it
 # cannot mislead if ever wired. PRIOR BUG: it was built from mv_esp_send_matrix (the
 # DROPPED home-grown classifier), 8-13x wrong on replies.
+#
+# ── by_workspace_mtd SENT = WORKSPACE-level mirror first, per-campaign fallback ──
+# WHY (deleted-campaign send loss): the per-campaign daily fact
+# (raw_pipeline_campaign_daily_metrics, which derived.v_workspace_send_mtd sums)
+# STRUCTURALLY loses the sends of a campaign deleted the same day it sent — once the
+# campaign is deleted, the pipeline sync can no longer list it, so everything it sent
+# after its last sync never lands in any per-campaign row. MEASURED 2026-07-01:
+# Renaissance 1 showed 53,516 on the portal vs 56,954 workspace-level truth; the entire
+# 3,438 gap was ONE campaign ("BOUNCED CX - TRUCKING (SAMUEL)",
+# 93c15f9d-83e7-4266-ac47-7e8ebd024d2f) deleted 07-01 after sending (its last pipeline
+# sync was 01:30Z, before any of its sends that day). Workspace-level Instantly
+# analytics is the volume truth and is mirrored nightly (+ evening re-pull, 3-day
+# restatement window) into raw_instantly_workspace_analytics_daily — one row per
+# (workspace_slug, date); June-30 reconciled digit-for-digit vs the daily report.
+# RULE: per workspace-DAY, sent = mirror value when the mirror carries that
+# workspace-day, else the per-campaign sum (documented fallback: the mirror is
+# backfilled from 2026-06-01 and covers only the report roster, so non-roster
+# workspaces and pre-mirror days keep the old per-campaign numbers EXACTLY — no
+# regression). replies/opps keep the per-campaign source unchanged, and every other
+# per-campaign export in this feed (sb_ratio, monthly, daily, dow, sends_by_cm,
+# org rollup, …) is intentionally untouched.
+_WS_SENT_MIRROR_TABLE = "raw_instantly_workspace_analytics_daily"
+
+# Legacy per-campaign cut — byte-identical to the pre-mirror behavior; used verbatim
+# when the mirror table is absent (e.g. an older snapshot) so the feed never nulls out.
+_BY_WORKSPACE_MTD_LEGACY_SQL = """
+    SELECT COALESCE(workspace_label, workspace_id, '(unknown)') AS workspace,
+           sent_mtd AS sent, replies_mtd AS replies, opps_mtd_trend AS opps
+    FROM derived.v_workspace_send_mtd
+    WHERE COALESCE(workspace_deleted, FALSE) = FALSE
+    ORDER BY sent_mtd DESC"""
+
+_BY_WORKSPACE_MTD_MIRRORED_SQL = f"""
+    WITH mirror AS (        -- workspace-level truth: one row per (workspace_slug, day)
+      SELECT workspace_slug, date, sent
+      FROM {_WS_SENT_MIRROR_TABLE}
+      WHERE date >= date_trunc('month', current_date)
+    ),
+    campaign_sum AS (       -- per-campaign fallback: the same fact v_workspace_send_mtd sums.
+      -- Pre-aggregated to ONE row per (workspace_slug, date) so the FULL OUTER JOIN below is
+      -- structurally 1:1 even if v_workspace_send_daily ever emitted >1 row per slug-day
+      -- (it groups by label too; a label split would otherwise double the mirror sent).
+      SELECT workspace_id AS workspace_slug, date,
+             any_value(workspace_label)     AS workspace_label,
+             SUM(sent)                      AS sent,
+             SUM(unique_replies)            AS unique_replies,
+             SUM(unique_opportunities)      AS unique_opportunities
+      FROM derived.v_workspace_send_daily
+      WHERE date >= date_trunc('month', current_date)
+      GROUP BY 1, 2
+    ),
+    merged AS (             -- day grain: mirror sent wins where present, else campaign sum
+      SELECT COALESCE(mi.workspace_slug, cs.workspace_slug) AS workspace_slug,
+             COALESCE(mi.sent, cs.sent, 0)                  AS sent,
+             COALESCE(cs.unique_replies, 0)                 AS replies,
+             COALESCE(cs.unique_opportunities, 0)           AS opps,
+             cs.workspace_label                             AS campaign_label
+      FROM mirror mi
+      FULL OUTER JOIN campaign_sum cs
+        ON cs.workspace_slug = mi.workspace_slug AND cs.date = mi.date
+    ),
+    agg AS (
+      SELECT workspace_slug, any_value(campaign_label) AS campaign_label,
+             SUM(sent) AS sent, SUM(replies) AS replies, SUM(opps) AS opps
+      FROM merged GROUP BY 1
+    )
+    SELECT COALESCE(a.campaign_label, n.current_name, a.workspace_slug, '(unknown)') AS workspace,
+           a.sent AS sent, a.replies AS replies, a.opps AS opps
+    FROM agg a
+    LEFT JOIN core.v_workspace_norm n ON n.workspace_slug = a.workspace_slug
+    WHERE COALESCE(n.is_active = FALSE, FALSE) = FALSE  -- same deleted-gate as v_workspace_send_*
+    ORDER BY sent DESC"""
+# NOTE: a mirror-only workspace with no campaign rows this month AND no v_workspace_norm row
+# labels as its raw slug (a brand-new roster workspace before its first campaign sync) —
+# intentional: correct sends with a slug label beat hiding the workspace.
+
+
+def _by_workspace_mtd() -> list[dict]:
+    if table_exists(_WS_SENT_MIRROR_TABLE):
+        try:
+            return q(_BY_WORKSPACE_MTD_MIRRORED_SQL)
+        except Exception as e:  # noqa: BLE001 — never let the mirror path null the block
+            print(f"[portal_data] WARN by_workspace_mtd: mirrored query failed ({e}) — "
+                  f"falling back to per-campaign sums", file=sys.stderr)
+    else:
+        print(f"[portal_data] WARN by_workspace_mtd: {_WS_SENT_MIRROR_TABLE} not found — "
+              f"falling back to per-campaign sums (deleted-campaign sends may be missing)",
+              file=sys.stderr)
+    return q(_BY_WORKSPACE_MTD_LEGACY_SQL)
+
+
 data["sends_replies"] = safe("sends_replies", lambda: {
     "org": (lambda r: {
         **r,
@@ -806,18 +894,16 @@ data["sends_replies"] = safe("sends_replies", lambda: {
                SUM(unique_opportunities)     AS positive
         FROM raw_pipeline_campaign_daily_metrics
         WHERE date >= DATE '{SENDS_REPLIES_WINDOW_START}'""")[0]),
-    "by_workspace_mtd": q("""
-        SELECT COALESCE(workspace_label, workspace_id, '(unknown)') AS workspace,
-               sent_mtd AS sent, replies_mtd AS replies, opps_mtd_trend AS opps
-        FROM derived.v_workspace_send_mtd
-        WHERE COALESCE(workspace_deleted, FALSE) = FALSE
-        ORDER BY sent_mtd DESC"""),
+    "by_workspace_mtd": _by_workspace_mtd(),
     "note": (f"Instantly-native (100%, not attribution-dependent). org = "
              f"raw_pipeline_campaign_daily_metrics aggregate windowed from "
              f"{SENDS_REPLIES_WINDOW_START} (human=unique_replies, auto=unique_replies_"
              f"automatic, total=human+auto, positive=unique_opportunities); "
-             f"positive_rate = positive / human. by_workspace_mtd is June MTD from the "
-             f"same native columns (derived.v_workspace_send_mtd)."),
+             f"positive_rate = positive / human. by_workspace_mtd is calendar-MTD; "
+             f"sent = workspace-level Instantly analytics mirror "
+             f"({_WS_SENT_MIRROR_TABLE}) per workspace-day where present (fixes "
+             f"deleted-campaign send loss), else per-campaign sum "
+             f"(derived.v_workspace_send_daily); replies/opps = per-campaign columns."),
 })
 
 # ───────────────────── Advisor + Inbox-Manager leaderboards — WINDOWED (>= Jun 1)
