@@ -90,6 +90,19 @@
       "reconciliation": null
     },
 
+    "sms_cost_daily": {
+      "section": "§2 SMS Cost $ (actual) + Cost/mtg·form",
+      "what": "Actual carrier-billed SMS-fee $ per sub-account per day [backlog A1/A3/A4, added 2026-07-01]. Cost/mtg·form = day cost ÷ that row's Meetings/Webform (Ren1/Ren2: meetings; Ren3: web-form fills); '—' when the unit count is 0 (never divide-by-zero). WhatsApp has NO cost feed (iskra cost_usd 100% NULL; the $0.07/msg model is GATED, no modeled numbers on the report) -> always '—'.",
+      "source_type": "warehouse",
+      "warehouse": {
+        "relation": "main.raw_sendivo_billing_daily",
+        "key_columns": ["metric_date", "sub_account_id", "sms_fee_qty", "sms_fee_usd"],
+        "sanity": "2026-06-30 sub 12720 sms_fee_usd = 346.03 (verified exact vs live billing API)",
+        "freshness_guard": "nightly 'sendivo billing_daily' upsert (7d window) — an evening render's same-day row can be a PARTIAL-day snapshot; sms_fee_qty diverging >5% from the LIVE billed quantity (= §2 Sent) -> cost renders '—' + loud WARN and back-fills post-nightly (100%-or-wipe)."
+      },
+      "reconciliation": null
+    },
+
     "sms_replies_human": {
       "section": "§2 SMS Human RR",
       "what": "Human (non-opt-out) inbound SMS replies per sub-account.",
@@ -105,7 +118,8 @@
       "warehouse": {
         "relation": "main.v_sms_workspace_funnel",
         "opp_definition": "opps = count of Qwen positive-intent replies (derived.sms_reply_is_positive_qwen where is_positive) attributed to the sub-account by reply number; sent from v_sms_campaign_performance; sent_per_opp = sent/opps.",
-        "key_columns": ["metric_date", "sub_account", "sent", "opps"],
+        "key_columns": ["metric_date", "sub_account", "sent", "opps", "cost_usd"],
+        "cost": "Cost $ (window) + Cost/opp [backlog A2, added 2026-07-01] = the funnel's cost_usd (rollup of v_sms_campaign_performance.cost_usd — the Sendivo CAMPAIGN-FEED per-message $) summed over the SAME window dates ÷ the SAME opps — window-consistent by construction. NB deliberately a DIFFERENT cost basis than §2's billing sms_fee_usd (feed vs billing, window vs day); both labeled. NB2 the backlog's June 'proven' $0.79/$1.03/$0.44 divided by v_sms_campaign_performance.positive_replies, which that view defines as ALL non-opt-out replies (a misnomer, NOT positive-intent) — the rendered Cost/opp divides by the Qwen opps in the adjacent column instead, so it reads ~6x higher and is internally consistent.",
         "window": "TRAILING fully-classified window: the most-recent up-to-7 SMS-reply days (<= report date) where >= 90% of that day's human (non-opt-out) inbound carries a Qwen verdict. Same-day/recent opps are NOT shown live.",
         "why_trailing": "The Qwen classifier runs on a ~2-3d lag (cron /root/sms-sentiment-bi/incremental.sh @09:00 UTC -> seed -> loaded next nightly), so the render day's opps are unclassified at 10pm-ET report time. A partial classification massively UNDER-counts opps (06-29 read 4% classified) and would poison the KPI-to-opp gate — hence a fully-classified trailing window + 'pending' for same-day (feedback_partial_data_100pct_or_wipe_20260614). This is why §2 historically carried NO opp column.",
         "ren3_caveat": "Ren3 (webform) sends route via the AIM API and are NOT in the campaign feed -> its funnel sent is 0 -> Sent/opp renders '—' (opps still shown)."
@@ -181,7 +195,7 @@
 
     "close_calls": {
       "section": "§3 Close CRM — warm calling",
-      "what": "Dials / distinct leads / connects (>=60s real convo, ET day). Close is the system of record; it UNDER-captures vs the warm-callers' own EOD tallies — note it, do not 'fix' it.",
+      "what": "Dials / distinct leads / connects (>=60s real convo, ET day). Close is the system of record; it UNDER-captures vs the warm-callers' own EOD tallies — note it, do not 'fix' it. PLUS warm-caller MTD rows [backlog A7 / Sam ask #5, added 2026-07-01]: dials / distinct people dialed / connects>=60s over 1st-of-report-month..report-day (same source + ET-day frame; June full-month proof 6,283/3,187/328).",
       "source_type": "warehouse",
       "warehouse": { "relation": "core.call", "key_columns": ["occurred_at", "duration_seconds", "close_lead_id"], "connect_threshold_seconds": 60 },
       "meetings_source": "main.raw_im_bookings, channel == 'Call' [cutover 2026-06-30; was the Funding-Form sheet]",
