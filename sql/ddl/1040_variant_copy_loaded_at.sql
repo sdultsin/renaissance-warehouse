@@ -1,0 +1,21 @@
+-- variant_copy: add _loaded_at freshness timestamp. Version 1040.
+-- @gate: add
+-- Depends on 1033
+--
+-- WHY: core.variant_copy is accumulate-only -- a nightly run INSERTs only NEW/changed copy
+-- (ON CONFLICT), so on a typical night with no copy changes it adds 0 rows. first_seen_at
+-- therefore looks "stale" even when the table is perfectly healthy and refreshing, which would
+-- FALSE-ALARM any freshness monitor keyed on max(first_seen_at). _loaded_at fixes that: the
+-- entity advances it to the run time for EVERY variant it sees in raw_instantly_campaign
+-- (ON CONFLICT DO UPDATE SET _loaded_at), so:
+--   * max(_loaded_at)  = "the table refreshed on the last nightly" (true freshness signal), and
+--   * per-row _loaded_at = "this exact copy was last seen LIVE in Instantly on this date"
+--     (a row whose copy is later deleted from Instantly stops advancing -> retired-copy signal
+--     for free; first_seen_at still marks when the copy first entered the warehouse).
+--
+-- Idempotent: ADD COLUMN IF NOT EXISTS; the one-time backfill only touches rows still NULL
+-- (rows the first pre-1040 nightly populated before this column existed) and is a no-op
+-- thereafter. Nullable on purpose -- SET NOT NULL is a lock-rewrite the gate flags higher-risk,
+-- and the entity always writes _loaded_at so new rows are never NULL.
+ALTER TABLE core.variant_copy ADD COLUMN IF NOT EXISTS _loaded_at TIMESTAMPTZ;
+UPDATE core.variant_copy SET _loaded_at = first_seen_at WHERE _loaded_at IS NULL;

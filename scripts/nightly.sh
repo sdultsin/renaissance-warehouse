@@ -70,15 +70,25 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
         echo "orchestrator partial (some ingests failed); publishing dashboards anyway" | tee -a "$LOG_FILE"
     fi
 
+    # Compaction failure must ALERT, not just log: it silently no-op'ing for 2 weeks is how
+    # the writer DB ballooned to 171GB (2026-06-16..30). rc=0 covers success AND the healthy
+    # below-threshold skip; every abort path exits nonzero -> Slack (non-fatal to the nightly).
     echo "compacting warehouse (skips unless bloated)" | tee -a "$LOG_FILE"
-    "$SCRIPT_DIR/compact_warehouse.sh" 2>&1 | tee -a "$LOG_FILE" || echo "compaction non-fatal failure/skip" | tee -a "$LOG_FILE"
+    if ! "$SCRIPT_DIR/compact_warehouse.sh" 2>&1 | tee -a "$LOG_FILE"; then
+        echo "compaction non-fatal failure (alerting)" | tee -a "$LOG_FILE"
+        "$PYTHON" "$SCRIPT_DIR/alert_slack.py" ":warning: warehouse compaction FAILED tonight (nightly continues; writer-DB bloat keeps growing until fixed) — grep '[compact' /root/renaissance-warehouse/logs/nightly.log for the ABORT reason" \
+            2>&1 | tee -a "$LOG_FILE" || true
+    fi
 
     # Signature->phone self-enrichment (sig-phone Phase 2): extract US phones from
-    # tonight's new inbound reply signatures -> public.leads enriched_phone sidecar.
+    # tonight's new inbound reply signatures -> LEAD MIRROR enriched_phone sidecar
+    # (mirror.leads_current; repointed from retired Supabase public.leads 2026-07-01,
+    # [[project_phone_truth_lead_mirror_20260701]] — the mirror is THE phone master).
     # Watermarked + restartable; fail-loud to Slack inside the script itself. Runs
-    # AFTER compaction (warehouse lock free; read-only, coexists with publishes).
+    # AFTER compaction (warehouse lock free; the mirror write serializes on the
+    # mirror's own .writer.lock inside apply_phone_mirror_updates.sh).
     # Spec: Renaissance handoffs/2026-06-12-signature-phone-warehouse-native.md
-    echo "signature-phone sync (reply signatures -> leads.enriched_phone)" | tee -a "$LOG_FILE"
+    echo "signature-phone sync (reply signatures -> lead-mirror enriched_phone)" | tee -a "$LOG_FILE"
     "$PYTHON" scripts/signature_phone_sync.py 2>&1 | tee -a "$LOG_FILE" \
         || echo "WARN signature_phone_sync_failed (continuing)" | tee -a "$LOG_FILE"
 
@@ -232,6 +242,58 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     "$PYTHON" scripts/build_deliv_reply_lag.py 2>&1 | tee -a "$LOG_FILE" \
         || echo "WARN deliv_reply_lag_build_failed (continuing)" | tee -a "$LOG_FILE"
 
+    # Email-thread sync (DoD-4) — keep core.email_thread / core.email_message current with new replies
+    # + their IM responses (ue_type=3 capture is owned by THIS entity, not pipeline_mirror which
+    # DO-NOTHINGs). Runs AFTER the orchestrator released the writer lock: `fetch` is lock-free (it opens
+    # only short-lived read conns, closed before each network pull — see entities/email_thread_sync.py),
+    # then `apply` upserts under core/db.py's in-process writer flock (acquire-or-wait, same as the steps
+    # above). Flag-gated (WAREHOUSE_PULL_THREADS=1) + pinned to the 9 canonical workspaces via
+    # WAREHOUSE_THREADS_ORG_ALLOWLIST (both in /root/core/.env.threads, which also carries the per-ws keys).
+    # --local-only: incremental discovery from the synced inbound atom only (NO all_emails live walk),
+    # which would otherwise cross the 1000-page ceiling on the high-volume funding workspaces (~200k
+    # sends/day) and HARD-FAIL them every night. A new replier's FULL thread is re-pulled, so their IM
+    # responses ARE captured; the only uncovered edge is an IM message on a thread with no NEW prospect
+    # reply (rare cold-thread chase) — acceptable vs a nightly that ceilings.
+    THREADS_NIGHTLY_STAGE=/root/core/threads_nightly_stage.jsonl
+    echo "email-thread sync (native reply threads — nightly incremental, local-only)" | tee -a "$LOG_FILE"
+    ( set -a; [ -f /root/core/.env.threads ] && . /root/core/.env.threads; set +a
+      set -o pipefail
+      export WAREHOUSE_PULL_THREADS=1
+      # Clean run artifacts but PRESERVE .failed: the old `stage.*` glob deleted failed.jsonl
+      # before every nightly, silently killing the §4.F one-retry contract on this path — with
+      # the 429-hardened partial commits below, failed leads' ONLY re-pull path is failed.jsonl,
+      # so it must survive across runs. [2026-07-02]
+      rm -f "$THREADS_NIGHTLY_STAGE" "$THREADS_NIGHTLY_STAGE".ceiling \
+            "$THREADS_NIGHTLY_STAGE".progress "$THREADS_NIGHTLY_STAGE".progress.tmp \
+            "$THREADS_NIGHTLY_STAGE".sanitized 2>/dev/null
+      # [2026-07-01] FAIL-SAFE cap on the per-lead /emails fetch (60m so a 429-throttled backlog
+      # can never hang the singleton nightly lock for 10-15h — the build-fan-out incident class).
+      # [2026-07-02] the fetch is now a RESUMABLE ORDERED DRAIN (the durable fix the old comment
+      # named): leads pull ascending by last-reply time with adaptive-exponential 429 backoff;
+      # a timed-out/partial fetch is NO LONGER discarded — the apply commits whatever landed and
+      # advances the explicit per-ws drain watermark (/root/core/threads_watermark.json) ONLY
+      # through the contiguously-drained prefix, so partial progress accrues nightly and NOTHING
+      # is skipped (ceiling-hit workspaces stay quarantined via the .ceiling sidecar; grep
+      # RUN-SUMMARY-FETCH / RUNLOG-APPLY here for fetched/applied/429 counts).
+      if timeout -k 30s "${THREADS_FETCH_TIMEOUT:-60m}" "$PYTHON" -m entities.email_thread_sync fetch --local-only --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE"; then
+          # `|| echo`: apply exits 4 when it QUARANTINED a ceiling-hit ws (rows for the other
+          # ws DID commit) — without the guard, `set -e` would abort the subshell here, mislabel
+          # the run as email_thread_sync_nightly_failed, and skip the trailing cleanup.
+          "$PYTHON" -m entities.email_thread_sync apply --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE" \
+              || echo "WARN email_thread apply rc!=0 (ceiling quarantine or failure — see RUNLOG-APPLY above)" | tee -a "$LOG_FILE"
+      else
+          echo "WARN email_thread fetch incomplete (timeout >${THREADS_FETCH_TIMEOUT:-60m} / ceiling / crash) — applying PARTIAL progress (drain watermark advances only through the completed prefix; the rest re-pulls next run)" | tee -a "$LOG_FILE"
+          "$PYTHON" -m entities.email_thread_sync apply --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE" \
+              || echo "WARN email_thread partial apply failed (stage kept nothing; watermark unchanged — clean re-pull next run)" | tee -a "$LOG_FILE"
+      fi
+      rm -f "$THREADS_NIGHTLY_STAGE" "$THREADS_NIGHTLY_STAGE".ceiling \
+            "$THREADS_NIGHTLY_STAGE".progress "$THREADS_NIGHTLY_STAGE".progress.tmp \
+            "$THREADS_NIGHTLY_STAGE".sanitized 2>/dev/null ) \
+        || echo "WARN email_thread_sync_nightly_failed (continuing)" | tee -a "$LOG_FILE"
+    # keep apply manifests out of the repo working tree (gitignored too, belt + suspenders)
+    mkdir -p /root/core/threads_bf/manifests 2>/dev/null
+    mv /root/renaissance-warehouse/core/email_thread_manifest_*.txt /root/core/threads_bf/manifests/ 2>/dev/null || true
+
     # Instantly credits: pull per-workspace lead-list quota from the Instantly billing
     # API (read-only) and UPSERT a daily snapshot into core.instantly_credit (drops the
     # "The Eagles" free-trial junk row). Self-contained (runs portal_credits.py internally).
@@ -279,8 +341,18 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
         || echo "WARN sync_registry_refresh_failed (continuing)" | tee -a "$LOG_FILE"
 
     echo "running warehouse QA (fail-loud freshness/invariant alert)" | tee -a "$LOG_FILE"
+    # GUARD [2026-07-02]: this was the ONE unguarded pipeline in the success branch. Under the
+    # top-level `set -euo pipefail`, warehouse_qa.py exiting non-zero (any SLA breach — true on
+    # BOTH Jul-1 and Jul-2) made the pipeline fail and ABORTED the whole script right here,
+    # BEFORE QA_RC was even captured: no hardening-DoD check, no promote-at-completion, and no
+    # final `exit=` line — which in turn made daily_report_sync.sh's backfill guard read the
+    # nightly as "died without an exit line" and skip the D-1 re-render. Mirror the orchestrator/
+    # publish steps: disable -e around the pipeline so breaches WARN (the QA already alerted
+    # #cc-sam itself) and the tail always runs.
+    set +e
     "$PYTHON" scripts/warehouse_qa.py 2>&1 | tee -a "$LOG_FILE"
     QA_RC=${PIPESTATUS[0]}
+    set -e
     if [[ "$QA_RC" -ne 0 ]]; then
         echo "WARN warehouse_qa reported breaches (alert posted to #cc-sam)" | tee -a "$LOG_FILE"
     fi

@@ -48,4 +48,8 @@ PHASE_ORDER = [
     # "intent" phase removed — LLM reply-intent classifier uses Anthropic API; needs explicit Sam go-ahead before enabling
     "iam_response_time", # 05:35 — IAM response latency per prospect reply (after canonical)
     "derived",           # 05:40 — materialize derived views (incl. lead_intel)
+    "account_tags_late", # LAST — slow (~3-8h) rate-limited per-inbox Instantly tag pull; isolated at
+                         #        the very end so it can NEVER block/kill the critical phases above.
+                         #        [2026-06-30] moved here from position 6 ('instantly'), where its
+                         #        runtime strangled account_census..derived (nightly never finished).
 ]

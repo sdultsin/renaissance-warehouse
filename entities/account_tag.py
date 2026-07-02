@@ -121,7 +121,14 @@ def run_account_tag_ingest(ctx: RunContext) -> PhaseResult:
                     workspaces_done.append(slug)
                     continue
 
+                # Accumulate the whole workspace in memory, then write it SET-BASED in one
+                # statement. The old per-account single-row INSERT (~250k autocommit
+                # transactions/night) was both the slow half of this 76-minute ingest and a
+                # major writer-DB bloat source (every tiny transaction churns row groups;
+                # compaction was silently dead 06-16..06-30, so it accumulated to 171GB).
                 w_accounts = 0
+                batch: list[list] = []
+                ws_pairs: set[tuple[str, str]] = set()
                 for tag_id, label in workflow_tags:
                     # 2. Members of this tag (server-side tag_ids filter).
                     for acct in client.list_accounts(tag_ids=tag_id, workspace_id=workspace_id):
@@ -130,24 +137,41 @@ def run_account_tag_ingest(ctx: RunContext) -> PhaseResult:
                             continue
                         rows_in += 1
                         w_accounts += 1
-                        ctx.db.execute(
-                            """
-                            INSERT INTO raw_instantly_account_tag
-                              (_loaded_at, _run_id, workspace_uuid, workspace_slug,
-                               email, tag_id, tag_label, provider_code, status, daily_limit)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                            ON CONFLICT DO NOTHING
-                            """,
-                            [
-                                now, ctx.run_id, workspace_id, canon_slug,
-                                email, tag_id, label,
-                                _as_int(acct.get("provider_code")),
-                                _as_int(acct.get("status")),
-                                _as_int(acct.get("daily_limit")),
-                            ],
-                        )
-                        rows_out += 1
-                    scanned_pairs.add((canon_slug, label))
+                        batch.append([
+                            now, ctx.run_id, workspace_id, canon_slug,
+                            email, tag_id, label,
+                            _as_int(acct.get("provider_code")),
+                            _as_int(acct.get("status")),
+                            _as_int(acct.get("daily_limit")),
+                        ])
+                    ws_pairs.add((canon_slug, label))
+
+                if batch:
+                    ctx.db.execute(
+                        "CREATE OR REPLACE TEMP TABLE _acct_tag_batch ("
+                        "_loaded_at TIMESTAMPTZ, _run_id VARCHAR, workspace_uuid VARCHAR, "
+                        "workspace_slug VARCHAR, email VARCHAR, tag_id VARCHAR, tag_label VARCHAR, "
+                        "provider_code INTEGER, status INTEGER, daily_limit INTEGER)"
+                    )
+                    ctx.db.executemany(
+                        "INSERT INTO _acct_tag_batch VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", batch
+                    )
+                    ctx.db.execute(
+                        """
+                        INSERT INTO raw_instantly_account_tag
+                          (_loaded_at, _run_id, workspace_uuid, workspace_slug,
+                           email, tag_id, tag_label, provider_code, status, daily_limit)
+                        SELECT * FROM _acct_tag_batch
+                        ON CONFLICT DO NOTHING
+                        """
+                    )
+                    ctx.db.execute("DROP TABLE IF EXISTS _acct_tag_batch")
+                    rows_out += len(batch)
+
+                # Mark pairs scanned ONLY after the batch landed: an exception mid-workspace
+                # now writes NOTHING for it, so no pair may enter the prune scope with zero
+                # raw rows (that would wipe the pair's last-good membership in the prune).
+                scanned_pairs.update(ws_pairs)
 
                 workspaces_done.append(slug)
                 logger.info("Workspace %s (uuid=%s, slug=%s): %d workflow-tag memberships across %d tags",

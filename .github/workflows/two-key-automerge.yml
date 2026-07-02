@@ -1,0 +1,88 @@
+name: two-key-automerge
+# Server-side TWO-KEY auto-merge (runs the second key in CI so it no longer depends on each
+# writer's laptop having an Anthropic key — that gap left auto-merge non-functional 2026-06-22→23).
+# On a PR touching gated paths it runs `moderator_client.py two-key`: the moderator GATE (re-asked
+# server-side) AND an INDEPENDENT claude-sonnet-4-6 reviewer must BOTH approve AND the change must be
+# non-destructive -> enable auto-merge; otherwise post a plain-English HOLD on the PR. It ACTS only
+# when the repo variable TWO_KEY_AUTOMERGE=on (the single kill switch); with it off/unset it just
+# decides + logs (today's manual behavior). The required check that auto-merge waits on is
+# `moderator-gate` (separate workflow); this job is intentionally NOT a required check.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'sql/ddl/**'
+      - 'entities/**'
+      - 'sources/**'
+      - 'scripts/**'
+      - 'core/**'
+      - 'moderator/**'
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to evaluate (manual run / backfill an already-open PR)'
+        required: true
+
+permissions:
+  contents: write          # squash-merge the PR
+  pull-requests: write      # enable auto-merge + post the plain-English HOLD comment
+
+concurrency:
+  group: two-key-${{ github.event.pull_request.number || github.event.inputs.pr_number }}
+  cancel-in-progress: false
+
+jobs:
+  two-key:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0     # need full history so origin/main...HEAD diffs resolve
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install reviewer SDK
+        run: pip install --quiet anthropic
+
+      - name: Resolve PR, check out its head, list changed gated files
+        id: ctx
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            PR="${{ github.event.inputs.pr_number }}"
+          else
+            PR="${{ github.event.pull_request.number }}"
+          fi
+          echo "pr=$PR" >> "$GITHUB_OUTPUT"
+          gh pr view "$PR" --repo "$GITHUB_REPOSITORY" --json baseRefName,title,body > pr.json
+          BASE="$(jq -r .baseRefName pr.json)"
+          # Fetch the PR head (reliable across event types) + the base, so both the file content
+          # (_payload reads from the working tree) and the reviewer diff (origin/<base>...HEAD) resolve.
+          git fetch origin "+refs/pull/$PR/head:refs/remotes/pr/$PR" "$BASE"
+          git checkout --detach "refs/remotes/pr/$PR"
+          FILES="$(gh pr diff "$PR" --repo "$GITHUB_REPOSITORY" --name-only \
+                    | grep -E '^(sql/ddl|entities|sources|scripts|core|moderator)/.*\.(sql|py)$' | tr '\n' ' ' || true)"
+          echo "files=$FILES" >> "$GITHUB_OUTPUT"
+          jq -r .title pr.json > pr_title.txt
+          jq -r .body  pr.json > pr_body.txt
+          echo "PR #$PR  base=$BASE  changed gated files: ${FILES:-<none>}"
+
+      - name: Two-key decision (auto-merge only when TWO_KEY_AUTOMERGE=on)
+        if: steps.ctx.outputs.files != ''
+        env:
+          MODERATOR_API_URL: ${{ secrets.MODERATOR_API_URL }}
+          MODERATOR_API_TOKEN: ${{ secrets.MODERATOR_API_TOKEN }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          TWO_KEY_AUTOMERGE: ${{ vars.TWO_KEY_AUTOMERGE }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          export TWO_KEY_PR_TITLE="$(cat pr_title.txt)"
+          export TWO_KEY_PR_BODY="$(cat pr_body.txt)"
+          python scripts/moderator_client.py two-key \
+            --files ${{ steps.ctx.outputs.files }} \
+            --pr-number "${{ steps.ctx.outputs.pr }}"

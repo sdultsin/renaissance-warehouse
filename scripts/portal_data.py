@@ -88,10 +88,7 @@ WINDOW_START = os.environ.get("PORTAL_WINDOW_START", "2026-06-01")
 _wm = datetime.strptime(WINDOW_START, "%Y-%m-%d")
 WINDOW_LABEL = f"since {_wm.strftime('%b')} {_wm.day}"  # e.g. "since Jun 1"
 # SQL fragment: meeting m is in the clean window. `m` must be the table alias.
-# Upper-clamp included for symmetry with the MTD queries (QA A5). No future-dated rows
-# exist today (MAX(posted_at::DATE)=2026-06-19, zero future rows), so this is pure
-# symmetry hardening — it changes nothing about the current numbers.
-WINDOW_WHERE = f"COALESCE(m.meeting_date, CAST(m.posted_at AS DATE)) >= DATE '{WINDOW_START}' AND COALESCE(m.meeting_date, CAST(m.posted_at AS DATE)) < current_date + 1"  # WS5 v3: bucket on meeting_date (col A)
+WINDOW_WHERE = f"m.posted_at >= DATE '{WINDOW_START}'"
 
 # ── Org sends/replies WINDOW (Instantly-native reply scorecard) ────────────────────
 # The org-wide sends/replies scorecard is sourced from the SAME Instantly-native daily
@@ -100,13 +97,6 @@ WINDOW_WHERE = f"COALESCE(m.meeting_date, CAST(m.posted_at AS DATE)) >= DATE '{W
 # (reference_warehouse_reply_and_tag_truth_20260614: Instantly NATIVE is the SOLE truth
 # for human/auto/total reply + positive(=opps÷human, >= May-15)). Kept as an env knob.
 SENDS_REPLIES_WINDOW_START = os.environ.get("PORTAL_SENDS_REPLIES_WINDOW_START", "2026-05-15")
-# Self-labelling window for the org sends/replies block. The GLOBAL window
-# (WINDOW_LABEL, "since Jun 1") labels the ATTRIBUTION leaderboards; the org
-# sends/replies block uses its OWN canonical positive-reply window (May-15), so it must
-# NOT inherit the global "since Jun 1" label. This per-block label (QA G5) lets any
-# future renderer self-label the block as "since May 15" rather than mislabel it Jun-1.
-_srm = datetime.strptime(SENDS_REPLIES_WINDOW_START, "%Y-%m-%d")
-SENDS_REPLIES_WINDOW_LABEL = f"since {_srm.strftime('%b')} {_srm.day}"  # e.g. "since May 15"
 
 # ── CM leaderboard logic: FACT-DRIVEN per time-window (not a static allowlist) ─────
 # RULE (Sam, 2026-06-14): a CM appears in a leaderboard window IFF they have meetings
@@ -152,17 +142,10 @@ REAL_CMS_CTE = f"""
 # CM_RESOLVED: the canonical CM of a meeting. core.meeting.cm when present, else the
 # trailing "(TOKEN)" parenthetical in raw_text (where every let-go CM's name actually is).
 # `m` must be the table alias in the surrounding query.
-# WS5 v3 (D6): a CM is credited IFF the meeting's WORKSPACE is that CM's funding workspace.
-# m.cm_workspace (= core.workspace_alias.cm) is non-NULL ONLY for the 5 funding-CM workspaces;
-# warm-leads / SMS / DFY / section-125 rows have cm_workspace=NULL -> drop off the CM leaderboard.
-# Slack-era rows (pre-sheet, no workspace) keep the legacy resolver so all-time history is intact.
 CM_RESOLVED = (
     "COALESCE("
-    "NULLIF(UPPER(TRIM(m.cm_workspace)),''),"
-    "CASE WHEN m.source='slack' THEN COALESCE("
     "NULLIF(UPPER(TRIM(m.cm)),''),"
     r"NULLIF(UPPER(TRIM(regexp_extract(m.raw_text, '\(([^()]*)\)\s*$', 1))),'')"
-    ") END"
     ")"
 )
 
@@ -180,9 +163,18 @@ CM_RESOLVED = (
 # Rationale: status='active' is the tightest defensible "active inbox" — it is what an
 # operator means by "an inbox that can send right now". Kept as an env knob so the
 # definition can be re-pinned against the live inbox count post-swap without a code edit.
-ACTIVE_INBOX_WHERE = os.environ.get("PORTAL_ACTIVE_INBOX_FILTER", "status = 'conn_active'")  # WS3 v105: status relabel active->conn_active
+ACTIVE_INBOX_WHERE = os.environ.get("PORTAL_ACTIVE_INBOX_FILTER", "status = 'active'")
 # In-warmup = active inboxes still in the warming lifecycle phase.
 WARMUP_WHERE = f"({ACTIVE_INBOX_WHERE}) AND lower(COALESCE(lifecycle_state,'')) LIKE '%warm%' AND lower(COALESCE(lifecycle_state,'')) <> 'warmed'"
+
+# ── ONE TRUTH: the phantom-free census (core.account_label, DDL 95) ────────────────
+# core.sending_account status='active' over-counts (it carries ~233k departed/phantom
+# accounts the live Instantly census no longer has — the same 1.1M-Outlook-phantom class
+# the sending-truth dashboard fix removed) AND its daily_limit is partly un-healed. The
+# sending-truth Lens now reads core.account_label (MX-infra, Active|Warmup lifecycle, A's
+# DDL-1003-healed daily_limit). To keep the portal's inbox tiles consistent with that Lens
+# ("one truth"), the Active-Inboxes/warmup/capacity tile below reads the SAME census.
+ACCOUNT_LABEL_LATEST = "(SELECT max(census_date) FROM core.account_label)"
 
 # ── HYBRID email filter (Phase-0 edge case #1 — the +47% over-count fix) ──────────
 # For source='sheet' rows the explicit channel column is the truth (channel='Email').
@@ -269,7 +261,12 @@ data: dict = {
             f"94-100% clean (Funding-Form-sheet era). Pre-window all-time cuts are emitted "
             f"for provenance but HELD/HIDDEN by the portal (partial attribution)."
         ),
-        "active_inbox_filter": ACTIVE_INBOX_WHERE,
+        "active_inbox_filter": (
+            "core.account_label latest census (phantom-free, MX-infra, DDL-1003-healed limits) — "
+            "active_inboxes = live census count, warmup = lifecycle='Warmup'. SAME source as the "
+            "sending-truth Lens (one truth). Replaces core.sending_account status='active' "
+            "(over-counted ~233k departed/phantom accounts, un-healed limits)."
+        ),
         "email_filter": "hybrid: sheet rows -> channel='Email'; slack rows -> SMS-exclusion regex",
         "partner_label_norm": "BTC/Big Think Capital, Qualifi/GoQualifi, GreenBridge/GreenBridge Capital, Llama/Llama Funding merged",
         "cm_leaderboard": (
@@ -300,38 +297,55 @@ data["freshness"] = safe("freshness", lambda: {
 })
 
 # ─────────────────────────────────────────────────── Active Inboxes / warmup tile
-# CANONICAL: core.sending_account, filtered by OUR active-inbox definition (status='active').
-# Tiles: O1 (Overview), Accounts ▸ Overview/Account Status hero tiles, ESP split.
+# ONE TRUTH: core.account_label (latest census) — the SAME phantom-free, MX-infra,
+# DDL-1003-healed surface the sending-truth Lens reads. `active_inboxes` is the live census
+# count (lifecycle Active+Warmup), `warmup` = lifecycle='Warmup', capacity = healed daily_limit.
+# This replaces core.sending_account status='active' (which over-counted ~233k phantom/departed
+# accounts and carried un-healed limits) so the portal hero tiles and the Lens agree exactly.
+# by_status / total_domains keep core.sending_account (no status/domain column on account_label)
+# but INNER-JOIN the census so they reflect only live inboxes. The dead-key shape is preserved.
 data["inboxes"] = safe("inboxes", lambda: {
     "totals": q(f"""
-        SELECT COUNT(*) FILTER (WHERE {ACTIVE_INBOX_WHERE})              AS active_inboxes,
-               COUNT(*)                                                  AS total_ever,
-               SUM(daily_limit) FILTER (WHERE {ACTIVE_INBOX_WHERE})      AS daily_capacity
-        FROM core.sending_account""")[0],
-    "warmup": one(f"SELECT COUNT(*) FROM core.sending_account WHERE {WARMUP_WHERE}"),
-    "by_status": q("""
-        SELECT COALESCE(status,'(unknown)') AS status, COUNT(*) AS inboxes,
-               SUM(daily_limit) AS daily_capacity, COUNT(DISTINCT domain) AS domains
-        FROM core.sending_account GROUP BY 1 ORDER BY inboxes DESC"""),
-    "by_lifecycle": q(f"""
-        SELECT COALESCE(lifecycle_state,'(unknown)') AS state, COUNT(*) AS inboxes
-        FROM core.sending_account WHERE {ACTIVE_INBOX_WHERE} GROUP BY 1 ORDER BY inboxes DESC"""),
-    # ESP / inbox-by-provider split (Accounts ▸ Email Provider). esp at account grain
-    # is the only OTD-splittable surface (campaign infra_type lumps OTD into google).
-    "by_esp": q(f"""
-        SELECT esp, COUNT(*) AS inboxes, SUM(daily_limit) AS daily_capacity,
-               COUNT(DISTINCT domain) AS domains
-        FROM core.sending_account WHERE {ACTIVE_INBOX_WHERE} AND esp IS NOT NULL
-        GROUP BY esp ORDER BY inboxes DESC"""),
-    # Workspace split (Accounts ▸ Workspaces). Volume ≈ daily sending capacity.
-    "by_workspace": q(f"""
-        SELECT COALESCE(n.current_name, sa.workspace_slug, '(unknown)') AS workspace,
-               COUNT(*) AS inboxes, SUM(sa.daily_limit) AS daily_capacity,
+        SELECT COUNT(*)                                                  AS active_inboxes,
+               (SELECT COUNT(*) FROM core.sending_account)               AS total_ever,
+               CAST(SUM(daily_limit) AS BIGINT)                          AS daily_capacity
+        FROM core.account_label WHERE census_date = {ACCOUNT_LABEL_LATEST}""")[0],
+    "warmup": one(f"SELECT COUNT(*) FROM core.account_label WHERE census_date = {ACCOUNT_LABEL_LATEST} AND lifecycle = 'Warmup'"),
+    # Account Status (Accounts hero) — live census joined to sending_account for the status enum.
+    "by_status": q(f"""
+        SELECT COALESCE(sa.status,'(unknown)') AS status, COUNT(*) AS inboxes,
+               CAST(SUM(COALESCE(al.daily_limit,0)) AS BIGINT) AS daily_capacity,
                COUNT(DISTINCT sa.domain) AS domains
-        FROM core.sending_account sa
-        LEFT JOIN core.v_workspace_norm n ON n.workspace_slug = sa.workspace_slug
-        WHERE sa.{ACTIVE_INBOX_WHERE} GROUP BY 1 ORDER BY inboxes DESC"""),
-    "total_domains": one(f"SELECT COUNT(DISTINCT domain) FROM core.sending_account WHERE {ACTIVE_INBOX_WHERE}"),
+        FROM core.account_label al
+        LEFT JOIN core.sending_account sa ON lower(sa.email) = lower(al.email)
+        WHERE al.census_date = {ACCOUNT_LABEL_LATEST}
+        GROUP BY 1 ORDER BY inboxes DESC"""),
+    # Active vs Warmup (the canonical lifecycle from the census — the Lens taxonomy).
+    "by_lifecycle": q(f"""
+        SELECT lifecycle AS state, COUNT(*) AS inboxes
+        FROM core.account_label WHERE census_date = {ACCOUNT_LABEL_LATEST}
+        GROUP BY 1 ORDER BY inboxes DESC"""),
+    # ESP / inbox-by-provider split — infra is the MX-based (OTD-splittable) census axis.
+    "by_esp": q(f"""
+        SELECT infra AS esp, COUNT(*) AS inboxes,
+               CAST(SUM(daily_limit) AS BIGINT) AS daily_capacity,
+               NULL AS domains
+        FROM core.account_label WHERE census_date = {ACCOUNT_LABEL_LATEST}
+        GROUP BY 1 ORDER BY inboxes DESC"""),
+    # Workspace split. Volume = healed daily sending capacity.
+    "by_workspace": q(f"""
+        SELECT COALESCE(w.name, al.workspace_slug, '(unknown)') AS workspace,
+               COUNT(*) AS inboxes, CAST(SUM(al.daily_limit) AS BIGINT) AS daily_capacity,
+               NULL AS domains
+        FROM core.account_label al
+        LEFT JOIN core.workspace w ON w.slug = al.workspace_slug
+        WHERE al.census_date = {ACCOUNT_LABEL_LATEST}
+        GROUP BY 1 ORDER BY inboxes DESC"""),
+    "total_domains": one(f"""
+        SELECT COUNT(DISTINCT sa.domain)
+        FROM core.account_label al
+        LEFT JOIN core.sending_account sa ON lower(sa.email) = lower(al.email)
+        WHERE al.census_date = {ACCOUNT_LABEL_LATEST}"""),
 })
 
 # ───────────────────────────────────────────── Meetings: MTD, all-time, record day
@@ -383,29 +397,8 @@ data["sb_ratio"] = safe("sb_ratio", lambda: (lambda sent, booked: {
 # ───────────────────────────────────────────────────────── Partner summary
 # Partner of a booked meeting from core.meeting.partner, label-NORMALIZED across eras
 # (Phase-0 edge case #2). MTD + all-time per partner. Email-only (hybrid filter).
-# Revenue MODELS (PPA / PPA + 10% / 50/50 Rev Share) are now SOURCED FROM DuckDB
-# (core.funding_partner.commercial_model + rev_share_pct) via models_ref below — the portal
-# cards read that instead of hardcoded labels (Sam's directive: every value from DuckDB).
-def _partner_model_label(commercial_model, rev_share_pct):
-    """Display label for a partner's commercial model, built from the warehouse dim
-    (core.funding_partner). Mirrors the labels the portal previously hardcoded, now sourced
-    from DuckDB. Returns None when no model is on file -> the card renders '—'."""
-    if not commercial_model:
-        return None
-    pct = None
-    if rev_share_pct is not None:
-        try:
-            pct = int(round(float(rev_share_pct)))
-        except (TypeError, ValueError):
-            pct = None
-    if commercial_model == "ppa":
-        return "PPA"
-    if commercial_model == "rev_share":
-        return f"{pct}/{100 - pct} Rev Share" if pct is not None else "Rev Share"
-    if commercial_model == "ppa_plus_rev_share":
-        return f"PPA + {pct}%" if pct is not None else "PPA + Rev Share"
-    return commercial_model.replace("_", " ").title()
-
+# Revenue MODELS (PPA / PPA+10% / 50-50) are business constants kept client-side; the
+# warehouse commercial_model from core.funding_partner is included as a reference.
 data["partners"] = safe("partners", lambda: {
     "all_time": q(f"""
         SELECT {PARTNER_NORM} AS partner, COUNT(*) AS meetings
@@ -431,18 +424,11 @@ data["partners"] = safe("partners", lambda: {
         WHERE {EMAIL_WHERE} AND m.posted_at >= current_date - INTERVAL '14 months'
         GROUP BY date_trunc('month', m.posted_at), 2
         ORDER BY date_trunc('month', m.posted_at), meetings DESC"""),
-    # Commercial model PER PARTNER — the SOURCE OF TRUTH for the portal's rev-model labels
-    # (was hardcoded in index.html). Emits a display-ready `model` (built from commercial_model
-    # + rev_share_pct) plus the raw fields. Partner label normalized to the meeting-side card
-    # key ('Llama Funding' -> 'Llama'). NULL model (no terms on file) -> model=None -> card '—'.
-    "models_ref": safe("partner_models", lambda: [
-        {**r,
-         "partner": ("Llama" if r["partner"] == "Llama Funding" else r["partner"]),
-         "model": _partner_model_label(r.get("commercial_model"), r.get("rev_share_pct"))}
-        for r in q("""
-            SELECT display_name AS partner, commercial_model, rev_share_pct, tier
-            FROM core.funding_partner ORDER BY 1""")
-    ]),
+    # Reference: commercial models / tiers from the warehouse dim (NOT the source of
+    # the portal's rev-model labels — those stay hardcoded — just provenance).
+    "models_ref": safe("partner_models", lambda: q("""
+        SELECT display_name AS partner, commercial_model, tier
+        FROM core.funding_partner ORDER BY 1""")),
 })
 
 # ───────────────────────────────────────────────────── Top CMs (all-time meetings)
@@ -659,69 +645,19 @@ data["trend"] = safe("trend", lambda: q(f"""
 
 # Monthly rollup (the portal's monthlyData replacement: month, booked, sent, ratio).
 # Drives Overview O4 + Business ▸ Overview/Volume/Insights. Period ratio per month.
-# PARTIAL-MONTH / PRE-COVERAGE HARDENING (QA H2/H3/H8):
-#   • sends coverage begins at MIN(date) in raw_pipeline_campaign_daily_metrics (verified
-#     2026-01-26). The FULL OUTER JOIN would otherwise emit every meetings-only month BACK
-#     to ~18mo (Jan'25..Dec'25) with sent=0 — a meetings-era month with NO send coverage.
-#     A client computing an "all-time" sends/volume/ratio over that would mislabel a
-#     2026-only window. -> NULL-OUT sent (and ratio) for any month BEFORE the sends-coverage
-#     start month (cov.start_mo); those months keep `booked` but carry sent=NULL (NOT 0) so
-#     the client can drop them from sends/volume/insight series. (H3)
-#   • `partial:true` is flagged where the month has fewer sent-days than days-in-month
-#     (sent_days < days_in_month), OR the month is the coverage-start month (contains the
-#     global MIN(date) — the partial Jan'26 boundary), OR the month is the current (in-
-#     progress) month. The client skips partial months for "Best Conversion" / growth math. (H2/H8)
-#   • days_elapsed / days_in_month let the client exclude the current partial month from
-#     growth math explicitly. (H8)
 data["monthly"] = safe("monthly", lambda: q(f"""
     WITH mt AS (
       SELECT date_trunc('month', m.posted_at) AS mo, COUNT(*) AS booked
       FROM core.meeting m WHERE {EMAIL_WHERE} GROUP BY 1),
     se AS (
-      SELECT date_trunc('month', date) AS mo, SUM(sent) AS sent,
-             COUNT(DISTINCT date) AS sent_days
-      FROM raw_pipeline_campaign_daily_metrics GROUP BY 1),
-    cov AS (
-      SELECT MIN(date) AS min_date,
-             date_trunc('month', MIN(date)) AS start_mo
-      FROM raw_pipeline_campaign_daily_metrics),
-    j AS (
-      SELECT COALESCE(mt.mo, se.mo) AS mo,
-             COALESCE(mt.booked,0)  AS booked,
-             se.sent      AS sent_raw,
-             se.sent_days AS sent_days
-      FROM mt FULL OUTER JOIN se USING (mo))
-    SELECT strftime(j.mo, '%b ''%y') AS month,
-           j.booked AS booked,
-           -- H3: NULL-out sent for months before sends coverage begins (no 2025 sent=0).
-           CASE WHEN j.mo < cov.start_mo THEN NULL ELSE COALESCE(j.sent_raw,0) END AS sent,
-           CASE WHEN j.mo < cov.start_mo THEN NULL
-                WHEN j.booked>0 AND j.sent_raw IS NOT NULL
-                     THEN round(j.sent_raw::DOUBLE/j.booked) ELSE NULL END AS ratio,
-           COALESCE(j.sent_days,0) AS sent_days,
-           -- last calendar day of the month -> days_in_month
-           CAST(date_part('day', (j.mo + INTERVAL '1 month' - INTERVAL '1 day')) AS INTEGER) AS days_in_month,
-           -- H8: how many days of THIS month have elapsed as of the snapshot (current month only;
-           -- full for any past month = days_in_month).
-           CAST(LEAST(
-                  date_part('day', (j.mo + INTERVAL '1 month' - INTERVAL '1 day')),
-                  GREATEST(0, date_part('day', current_date) +
-                              CASE WHEN j.mo = date_trunc('month', current_date) THEN 0
-                                   WHEN j.mo < date_trunc('month', current_date)
-                                        THEN date_part('day', (j.mo + INTERVAL '1 month' - INTERVAL '1 day'))
-                                   ELSE 0 - date_part('day', current_date) END)
-                ) AS INTEGER) AS days_elapsed,
-           -- H2/H8: partial when sent-days < days-in-month, OR coverage-start (MIN-date) month,
-           -- OR the current in-progress month. Months before coverage are NOT flagged partial
-           -- (they carry sent=NULL instead — see H3); the client drops them by the null sent.
-           ( (j.mo >= cov.start_mo
-              AND COALESCE(j.sent_days,0)
-                  < date_part('day', (j.mo + INTERVAL '1 month' - INTERVAL '1 day')))
-             OR j.mo = cov.start_mo
-             OR j.mo = date_trunc('month', current_date) ) AS partial
-    FROM j CROSS JOIN cov
-    WHERE j.mo >= current_date - INTERVAL '18 months'
-    ORDER BY j.mo"""))
+      SELECT date_trunc('month', date) AS mo, SUM(sent) AS sent
+      FROM raw_pipeline_campaign_daily_metrics GROUP BY 1)
+    SELECT strftime(COALESCE(mt.mo, se.mo), '%b ''%y') AS month,
+           COALESCE(mt.booked,0) AS booked, COALESCE(se.sent,0) AS sent,
+           CASE WHEN COALESCE(mt.booked,0)>0 THEN round(se.sent::DOUBLE/mt.booked) ELSE 0 END AS ratio
+    FROM mt FULL OUTER JOIN se USING (mo)
+    WHERE COALESCE(mt.mo, se.mo) >= current_date - INTERVAL '18 months'
+    ORDER BY COALESCE(mt.mo, se.mo)"""))
 
 # ───────────────────────── C2gen — monthly[] enrichments + day-of-week (dow[]) ─────
 # Reuses the SAME daily booked (email meetings, hybrid filter) + daily sent
@@ -844,26 +780,108 @@ data["im_bookings"] = safe("im_bookings", lambda: {
 
 # ───────────────────────────── Org + Workspace sends & replies (Instantly-NATIVE) ──
 # Instantly-native counts are the SOLE truth for replies (reference_warehouse_reply_and_
-# tag_truth_20260614). BOTH cuts below now read the SAME native daily fact
-# (raw_pipeline_campaign_daily_metrics) so they reconcile by construction:
+# tag_truth_20260614). BOTH cuts below read the SAME native daily fact family:
 #   • org-wide rollup: human (unique_replies) / auto (unique_replies_automatic) /
 #     total (= human + auto) / positive (unique_opportunities = opps), windowed from
 #     SENDS_REPLIES_WINDOW_START (2026-05-15, where native reply coverage is sound).
 #     positive_rate = positive / human (per Sam's "positive = opps ÷ human").
-#     The org block is the un-grouped aggregate of the SAME query the per-workspace cut
-#     uses (just without the per-workspace GROUP BY) — so it reconciles by construction.
-#   • per-workspace MTD sends + replies + opps (derived.v_workspace_send_mtd, which itself
-#     sums the same native columns).
+#   • per-workspace MTD sends + replies + opps — SENT is mirror-first (see below);
+#     replies/opps stay per-campaign (derived.v_workspace_send_daily).
 # NOTE: the org block is NOT currently rendered by index.html — kept native+correct so it
 # cannot mislead if ever wired. PRIOR BUG: it was built from mv_esp_send_matrix (the
 # DROPPED home-grown classifier), 8-13x wrong on replies.
+#
+# ── by_workspace_mtd SENT = WORKSPACE-level mirror first, per-campaign fallback ──
+# WHY (deleted-campaign send loss): the per-campaign daily fact
+# (raw_pipeline_campaign_daily_metrics, which derived.v_workspace_send_mtd sums)
+# STRUCTURALLY loses the sends of a campaign deleted the same day it sent — once the
+# campaign is deleted, the pipeline sync can no longer list it, so everything it sent
+# after its last sync never lands in any per-campaign row. MEASURED 2026-07-01:
+# Renaissance 1 showed 53,516 on the portal vs 56,954 workspace-level truth; the entire
+# 3,438 gap was ONE campaign ("BOUNCED CX - TRUCKING (SAMUEL)",
+# 93c15f9d-83e7-4266-ac47-7e8ebd024d2f) deleted 07-01 after sending (its last pipeline
+# sync was 01:30Z, before any of its sends that day). Workspace-level Instantly
+# analytics is the volume truth and is mirrored nightly (+ evening re-pull, 3-day
+# restatement window) into raw_instantly_workspace_analytics_daily — one row per
+# (workspace_slug, date); June-30 reconciled digit-for-digit vs the daily report.
+# RULE: per workspace-DAY, sent = mirror value when the mirror carries that
+# workspace-day, else the per-campaign sum (documented fallback: the mirror is
+# backfilled from 2026-06-01 and covers only the report roster, so non-roster
+# workspaces and pre-mirror days keep the old per-campaign numbers EXACTLY — no
+# regression). replies/opps keep the per-campaign source unchanged, and every other
+# per-campaign export in this feed (sb_ratio, monthly, daily, dow, sends_by_cm,
+# org rollup, …) is intentionally untouched.
+_WS_SENT_MIRROR_TABLE = "raw_instantly_workspace_analytics_daily"
+
+# Legacy per-campaign cut — byte-identical to the pre-mirror behavior; used verbatim
+# when the mirror table is absent (e.g. an older snapshot) so the feed never nulls out.
+_BY_WORKSPACE_MTD_LEGACY_SQL = """
+    SELECT COALESCE(workspace_label, workspace_id, '(unknown)') AS workspace,
+           sent_mtd AS sent, replies_mtd AS replies, opps_mtd_trend AS opps
+    FROM derived.v_workspace_send_mtd
+    WHERE COALESCE(workspace_deleted, FALSE) = FALSE
+    ORDER BY sent_mtd DESC"""
+
+_BY_WORKSPACE_MTD_MIRRORED_SQL = f"""
+    WITH mirror AS (        -- workspace-level truth: one row per (workspace_slug, day)
+      SELECT workspace_slug, date, sent
+      FROM {_WS_SENT_MIRROR_TABLE}
+      WHERE date >= date_trunc('month', current_date)
+    ),
+    campaign_sum AS (       -- per-campaign fallback: the same fact v_workspace_send_mtd sums.
+      -- Pre-aggregated to ONE row per (workspace_slug, date) so the FULL OUTER JOIN below is
+      -- structurally 1:1 even if v_workspace_send_daily ever emitted >1 row per slug-day
+      -- (it groups by label too; a label split would otherwise double the mirror sent).
+      SELECT workspace_id AS workspace_slug, date,
+             any_value(workspace_label)     AS workspace_label,
+             SUM(sent)                      AS sent,
+             SUM(unique_replies)            AS unique_replies,
+             SUM(unique_opportunities)      AS unique_opportunities
+      FROM derived.v_workspace_send_daily
+      WHERE date >= date_trunc('month', current_date)
+      GROUP BY 1, 2
+    ),
+    merged AS (             -- day grain: mirror sent wins where present, else campaign sum
+      SELECT COALESCE(mi.workspace_slug, cs.workspace_slug) AS workspace_slug,
+             COALESCE(mi.sent, cs.sent, 0)                  AS sent,
+             COALESCE(cs.unique_replies, 0)                 AS replies,
+             COALESCE(cs.unique_opportunities, 0)           AS opps,
+             cs.workspace_label                             AS campaign_label
+      FROM mirror mi
+      FULL OUTER JOIN campaign_sum cs
+        ON cs.workspace_slug = mi.workspace_slug AND cs.date = mi.date
+    ),
+    agg AS (
+      SELECT workspace_slug, any_value(campaign_label) AS campaign_label,
+             SUM(sent) AS sent, SUM(replies) AS replies, SUM(opps) AS opps
+      FROM merged GROUP BY 1
+    )
+    SELECT COALESCE(a.campaign_label, n.current_name, a.workspace_slug, '(unknown)') AS workspace,
+           a.sent AS sent, a.replies AS replies, a.opps AS opps
+    FROM agg a
+    LEFT JOIN core.v_workspace_norm n ON n.workspace_slug = a.workspace_slug
+    WHERE COALESCE(n.is_active = FALSE, FALSE) = FALSE  -- same deleted-gate as v_workspace_send_*
+    ORDER BY sent DESC"""
+# NOTE: a mirror-only workspace with no campaign rows this month AND no v_workspace_norm row
+# labels as its raw slug (a brand-new roster workspace before its first campaign sync) —
+# intentional: correct sends with a slug label beat hiding the workspace.
+
+
+def _by_workspace_mtd() -> list[dict]:
+    if table_exists(_WS_SENT_MIRROR_TABLE):
+        try:
+            return q(_BY_WORKSPACE_MTD_MIRRORED_SQL)
+        except Exception as e:  # noqa: BLE001 — never let the mirror path null the block
+            print(f"[portal_data] WARN by_workspace_mtd: mirrored query failed ({e}) — "
+                  f"falling back to per-campaign sums", file=sys.stderr)
+    else:
+        print(f"[portal_data] WARN by_workspace_mtd: {_WS_SENT_MIRROR_TABLE} not found — "
+              f"falling back to per-campaign sums (deleted-campaign sends may be missing)",
+              file=sys.stderr)
+    return q(_BY_WORKSPACE_MTD_LEGACY_SQL)
+
+
 data["sends_replies"] = safe("sends_replies", lambda: {
-    # G5: per-block window so a renderer self-labels this block with ITS OWN window
-    # (canonical May-15 positive-reply window), NOT the global "since Jun 1" leaderboard
-    # window. NOTE: `by_workspace_mtd` below is a June-MTD cut, not a May-15 cut — this
-    # `window` describes the `org` block specifically.
-    "window": {"start": SENDS_REPLIES_WINDOW_START, "label": SENDS_REPLIES_WINDOW_LABEL,
-               "applies_to": "org"},
     "org": (lambda r: {
         **r,
         "positive_rate": (round(r["positive"] / r["human"], 4)
@@ -876,18 +894,16 @@ data["sends_replies"] = safe("sends_replies", lambda: {
                SUM(unique_opportunities)     AS positive
         FROM raw_pipeline_campaign_daily_metrics
         WHERE date >= DATE '{SENDS_REPLIES_WINDOW_START}'""")[0]),
-    "by_workspace_mtd": q("""
-        SELECT COALESCE(workspace_label, workspace_id, '(unknown)') AS workspace,
-               sent_mtd AS sent, replies_mtd AS replies, opps_mtd_trend AS opps
-        FROM derived.v_workspace_send_mtd
-        WHERE COALESCE(workspace_deleted, FALSE) = FALSE
-        ORDER BY sent_mtd DESC"""),
+    "by_workspace_mtd": _by_workspace_mtd(),
     "note": (f"Instantly-native (100%, not attribution-dependent). org = "
              f"raw_pipeline_campaign_daily_metrics aggregate windowed from "
              f"{SENDS_REPLIES_WINDOW_START} (human=unique_replies, auto=unique_replies_"
              f"automatic, total=human+auto, positive=unique_opportunities); "
-             f"positive_rate = positive / human. by_workspace_mtd is June MTD from the "
-             f"same native columns (derived.v_workspace_send_mtd)."),
+             f"positive_rate = positive / human. by_workspace_mtd is calendar-MTD; "
+             f"sent = workspace-level Instantly analytics mirror "
+             f"({_WS_SENT_MIRROR_TABLE}) per workspace-day where present (fixes "
+             f"deleted-campaign send loss), else per-campaign sum "
+             f"(derived.v_workspace_send_daily); replies/opps = per-campaign columns."),
 })
 
 # ───────────────────── Advisor + Inbox-Manager leaderboards — WINDOWED (>= Jun 1)

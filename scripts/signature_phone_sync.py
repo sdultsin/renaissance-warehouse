@@ -2,34 +2,44 @@
 """Nightly signature->phone self-enrichment sync (sig-phone Phase 2).
 
 Extracts US phone numbers from the signatures of NEW inbound cold-email replies
-landed in the warehouse since the last run, and writes them to the lead DB
-sidecar columns (public.leads enriched_phone / enriched_phone_source /
-enriched_phone_at). Free self-enrichment from data we already own — replaces a
-paid Prospeo->LeadMagic->Findymail lookup wherever a replier signed their email.
+landed in the warehouse since the last run, and writes them to the LEAD MIRROR
+DuckDB sidecar columns (mirror.leads_current enriched_phone /
+enriched_phone_source / enriched_phone_at). Free self-enrichment from data we
+already own — replaces a paid Prospeo->LeadMagic->Findymail lookup wherever a
+replier signed their email.
 Spec: Renaissance handoffs/2026-06-12-signature-phone-warehouse-native.md.
+
+REPOINTED 2026-07-01 ([[project_phone_truth_lead_mirror_20260701]]): the write
+target was the retired Supabase public.leads — its Supabase->DuckDB delta-sync
+was disabled at the 2026-06-24 cutover, so 6+ nights of signature phones (~8.3k)
+landed in a dead-end DB, and the ~4.9M post-cutover mirror-only leads could
+never receive one at all. Writes now go DIRECT to the lead mirror via
+scripts/apply_phone_mirror_updates.sh (.writer.lock held, single transaction,
+freshness-guarded). The stranded 06-23->07-01 gap is replayed by resetting the
+watermarks (--init-watermark '2026-06-23T00:00:00') — the extraction sources
+are append-only in the warehouse, so a replay is loss-free.
 
 SOURCES (warehouse, read-only; new rows by _loaded_at watermark):
   raw_pipeline_conversation_messages  lead-authored rows (sender_email = lead_email)
   raw_instantly_email                 received replies (ue_type = 2)
 
-POLICY (orchestrator-confirmed 2026-06-12):
-  Overwrite enriched_phone, latest reply wins — even over a prior enriched value.
-  NEVER touch the canonical leads.phone column.
+POLICY (orchestrator-confirmed 2026-06-12; freshness-guarded 2026-07-01):
+  Latest observation wins: enriched_phone_at carries the REPLY timestamp (not
+  the write time), and the apply script writes only when the incoming
+  observation is FRESHER than the enrichment already on the lead — a newer paid
+  enrichment is never clobbered by an older signature replay, and vice versa.
+  NEVER touches the bought leads phone / phone10 columns.
   Source tag: 'reply_signature_v2'.
-
-WRITE DISCIPLINE (leads-DB ~100-130 rows/s non-HOT ceiling):
-  Batched commits (5k), value-diff guard (IS DISTINCT FROM) so an unchanged
-  phone costs nothing, and an other-writers preflight that defers the run
-  (watermark NOT advanced -> retried next night) when the delta is large and
-  another bulk writer is active on public.leads.
 
 STATE: /root/sig-phone/sync_state.json (watermarks + shared-phone frequency map).
   Shared-number guard: a phone seen on >= 10 distinct lead emails (cumulative)
   is junk (shared office line / brand number) — blocklisted, never written.
+  Watermarks advance ONLY after a successful mirror apply.
 
 FAIL-LOUD: any exception posts to the Slack alert channel (SLACK_ALERT_CHANNEL)
 and exits non-zero. Designed to be invoked from scripts/nightly.sh AFTER
-compaction (warehouse lock free; coexists with read-only publish steps).
+compaction (warehouse lock free; the mirror write serializes on the mirror's
+own .writer.lock inside the apply script).
 
 USAGE
     python3 scripts/signature_phone_sync.py             # nightly real run
@@ -42,6 +52,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 import traceback
@@ -50,8 +62,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import duckdb
-import psycopg2
-import psycopg2.extras
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from phone_parser import best_signature_phone, html_to_text  # noqa: E402
@@ -61,10 +71,10 @@ ENV_CANDIDATES = [REPO_ROOT / ".env", REPO_ROOT.parent / ".env", Path("/root/cor
 
 WAREHOUSE_DB = os.environ.get("WAREHOUSE_DB", "/root/core/warehouse.duckdb")
 STATE_PATH = Path(os.environ.get("SIG_PHONE_STATE", "/root/sig-phone/sync_state.json"))
+APPLY_SH = REPO_ROOT / "scripts" / "apply_phone_mirror_updates.sh"
+STAGE_TSV = Path(os.environ.get("SIG_PHONE_STAGE_TSV", "/root/sig-phone/staged_mirror.tsv"))
 SOURCE_TAG = "reply_signature_v2"
 FREQ_CAP = 10
-BATCH = 5000
-BIG_DELTA = 20_000  # defer (not force through) if another bulk writer is active
 EPOCH = "1970-01-01T00:00:00"
 
 
@@ -105,20 +115,6 @@ def slack_post(env: dict[str, str], text: str) -> None:
                 print(f"signature_phone_sync: slack error {out.get('error')}", flush=True)
     except Exception as exc:  # noqa: BLE001
         print(f"signature_phone_sync: slack post failed: {exc}", flush=True)
-
-
-def leads_conn(env: dict[str, str]):
-    url = env.get("LEADS_DB_URL")
-    if url:
-        return psycopg2.connect(url)
-    pw = env.get("LEADS_DB_PASSWORD")
-    if not pw:
-        raise RuntimeError("no LEADS_DB_URL / LEADS_DB_PASSWORD in env")
-    return psycopg2.connect(
-        host="aws-1-ap-southeast-1.pooler.supabase.com", port=5432,
-        dbname="postgres", user="postgres.edpyqbiqzduabtjhwfaa",
-        password=pw, connect_timeout=15,
-    )
 
 
 def load_state() -> dict:
@@ -237,57 +233,56 @@ def extract_new(con, state: dict, stats: dict) -> dict[str, tuple[str, str]]:
     return winners
 
 
-def other_bulk_writers(cur) -> list[str]:
-    cur.execute("""
-        SELECT pid || ' ' || left(coalesce(query,''), 80)
-        FROM pg_stat_activity
-        WHERE state <> 'idle' AND pid <> pg_backend_pid()
-          AND query ILIKE '%public.leads%'
-          AND (query ILIKE '%update%' OR query ILIKE '%insert%' OR query ILIKE '%delete%')
-          AND query NOT ILIKE '%pg_stat_activity%'
-    """)
-    return [r[0] for r in cur.fetchall()]
+_FIELD_JUNK = re.compile(r"[\t\r\n]")
 
 
 def write_winners(env, winners, stats, dry_run: bool) -> bool:
-    """Returns True if the write happened (or nothing to write); False = deferred."""
+    """Stage winners to TSV and apply to the LEAD MIRROR via the shared writer-lock
+    apply script (enriched_phone/_source/_at only; freshness-guarded; never touches
+    the bought phone/phone10 columns). Returns True on success (or nothing to
+    write); raises on apply failure so the fail-loud path fires and the watermark
+    is NOT advanced (rows retried next night)."""
     if not winners:
         print("signature_phone_sync: no new phones tonight", flush=True)
         return True
-    rows = sorted((e, p, SOURCE_TAG) for e, (t, p) in winners.items())
-    conn = leads_conn(env)
-    conn.autocommit = True
-    cur = conn.cursor()
-    try:
-        others = other_bulk_writers(cur)
-        if others and len(rows) > BIG_DELTA and not dry_run:
-            print(f"DEFER: {len(rows)} rows but other writers active: {others[:3]}", flush=True)
-            return False
-        written = 0
-        for i in range(0, len(rows), BATCH):
-            chunk = rows[i:i + BATCH]
-            if dry_run:
-                cur.execute("SELECT count(*) FROM public.leads WHERE email = ANY(%s)",
-                            ([c[0] for c in chunk],))
-                stats["would_match"] += cur.fetchone()[0]
-                continue
-            psycopg2.extras.execute_values(cur, """
-                UPDATE public.leads l
-                SET enriched_phone = v.phone,
-                    enriched_phone_source = v.source,
-                    enriched_phone_at = now()
-                FROM (VALUES %s) AS v(email, phone, source)
-                WHERE l.email = v.email
-                  AND (l.enriched_phone IS DISTINCT FROM v.phone
-                       OR l.enriched_phone_source IS DISTINCT FROM v.source)
-                """, chunk, page_size=len(chunk))
-            written += cur.rowcount
-            time.sleep(0.5)
-        stats["written"] = written
-        stats["staged"] = len(rows)
+    # email \t phone \t source \t event_ts (reply timestamp — freshness comparator)
+    rows = sorted(
+        (
+            _FIELD_JUNK.sub(" ", e).strip(),
+            _FIELD_JUNK.sub(" ", p).strip(),
+            SOURCE_TAG,
+            _FIELD_JUNK.sub(" ", t).strip(),
+        )
+        for e, (t, p) in winners.items()
+    )
+    stats["staged"] = len(rows)
+    STAGE_TSV.parent.mkdir(parents=True, exist_ok=True)
+    with STAGE_TSV.open("w") as f:
+        for r in rows:
+            f.write("\t".join(r) + "\n")
+    if dry_run:
+        print(f"signature_phone_sync: dry-run staged {len(rows)} rows -> {STAGE_TSV} (no write)",
+              flush=True)
         return True
-    finally:
-        conn.close()
+    proc = subprocess.run(
+        ["bash", str(APPLY_SH), str(STAGE_TSV)],
+        capture_output=True, text=True, timeout=3600,
+    )
+    sys.stdout.write(proc.stdout)
+    sys.stderr.write(proc.stderr)
+    if proc.returncode != 0:
+        raise RuntimeError(f"apply_phone_mirror_updates.sh exited {proc.returncode}")
+    metrics = dict(
+        m.split("=", 1) for line in proc.stdout.splitlines()
+        for m in line.split() if "=" in m and m.split("=", 1)[0] in
+        ("staged", "matched", "will_update", "committed")
+    )
+    try:
+        stats["written"] = int(metrics.get("will_update", 0))
+        stats["would_match"] = int(metrics.get("matched", 0))
+    except ValueError:
+        pass
+    return True
 
 
 def main() -> int:
@@ -309,26 +304,19 @@ def main() -> int:
     stats = {k: 0 for k in ("cm_rows", "ie_rows", "rows_considered", "phones_found",
                             "freq_guard_rejected", "staged", "written", "would_match")}
     state = load_state()
-    wm_before = (state["wm_conversation_messages"], state["wm_instantly_email"])
     try:
         con = duckdb.connect(WAREHOUSE_DB, read_only=True)
         winners = extract_new(con, state, stats)
         con.close()
-        ok = write_winners(env, winners, stats, args.dry_run)
-        if ok and not args.dry_run:
-            save_state(state)  # advance watermarks only after a successful write
-        elif not ok:
-            # restore watermarks; rows retried next night
-            state["wm_conversation_messages"], state["wm_instantly_email"] = wm_before
-            save_state(state)
+        write_winners(env, winners, stats, args.dry_run)  # raises on apply failure
+        if not args.dry_run:
+            save_state(state)  # advance watermarks only after a successful mirror apply
         summary = (f"signature_phone_sync: ok scanned cm={stats['cm_rows']} "
                    f"ie={stats['ie_rows']} found={stats['phones_found']} "
-                   f"staged={stats['staged']} written={stats['written']} "
-                   f"deferred={'yes' if not ok else 'no'} "
+                   f"staged={stats['staged']} matched={stats['would_match']} "
+                   f"written={stats['written']} target=lead_mirror "
                    f"({time.time() - t0:.0f}s)")
         print(summary, flush=True)
-        if not ok:
-            slack_post(env, f":warning: {summary} — leads-DB busy, retrying tomorrow")
         return 0
     except Exception:
         err = traceback.format_exc()

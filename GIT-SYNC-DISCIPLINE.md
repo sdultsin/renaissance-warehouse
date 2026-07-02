@@ -50,3 +50,47 @@ Cron line (recorded in `/root/backups/crontab-*.txt`):
 ```
 5 * * * * cd /root/renaissance-warehouse && /root/renaissance-warehouse/scripts/warehouse_git_divergence_guard.sh >> /root/renaissance-warehouse/logs/git_drift_guard.log 2>&1
 ```
+
+## The persistence-step guard — `apply-now --pull-first` loud-fails on a drifted box [2026-06-28]
+
+**Why this exists:** on 2026-06-27 the box sat on a writer's **feature branch**, ~21 commits **behind**
+origin/main, with a **dirty tree** carrying several writers' uncommitted DDLs — and *3 separate chats* hit
+the fallout before anyone noticed. The hourly divergence guard above had been alerting, but the failure was
+**silent at the chokepoint that matters**: `apply-now --pull-first` runs `_git_pull_ff()` (a box-side
+`git pull --ff-only origin main` so the nightly rebuild carries the just-merged DDL), and that helper is
+**best-effort and NEVER raises**. On a diverged/dirty tree the ff-only pull just **fails quietly**, the
+apply proceeds, and the **nightly keeps rebuilding from STALE code** — silently dropping merged DDLs (the
+v96 nightly-drop class, fleet-wide). The silent swallow is what hid the divergence for ~a week.
+
+**The guard (in `moderator/bin/moderator_apply.py`, the ONE schema chokepoint every ship goes through):**
+after the `pull_first` pull, it **asserts the box is on clean `origin/main`** (branch == main, ahead == 0,
+behind == 0, no dirty tracked files — runtime noise like `logs/`, `*.duckdb`, `*.bak`, `.env`, `.worktrees/`
+is filtered, same list as the hourly guard). If the box is **not** clean it:
+
+1. **Auto-preserves** the box state — snapshots `git status`/`diff` to `/root/box-drift-rescue/<head>/` and
+   saves the dirty tracked state to a `refs/box-drift-rescue/*` stash-ref. **Non-destructive: it never
+   resets — the working tree is left fully intact on disk**, so no writer's in-flight work is lost.
+2. **Alerts `#cc-sam`** via `scripts/alert_slack.py` (the same durable channel as the hourly guard).
+3. **BLOCKS the apply (fail-closed)** — returns `ok:false` with a clear remediation message and applies
+   **nothing** this run. Applying live while the nightly stays stale is exactly the failure we refuse.
+
+This is **fail-closed**: if git can't be consulted at all, the box is treated as *not* clean (we never apply
+against a box we couldn't verify). Override only for local dev / a sanctioned manual window:
+`MODERATOR_BOX_DRIFT_GUARD=off`. Tests: `moderator/tests/test_box_drift_guard.py` (20 cases, no PG/box).
+
+**If the guard fires (or the hourly guard alerts):** the box has drifted — do **not** force the ship.
+Reconcile the box back to clean `origin/main` first: **preserve-then-reset** per
+`handoffs/2026-06-28-warehouse-box-git-reconcile.md` (commit all dirty+untracked to a pushed rescue branch,
+then `reset --hard origin/main` — nothing is discarded; the reset is git-only and never touches the DuckDB
+data). Then re-run the ship.
+
+## Two more standing rules (the landmines this round surfaced)
+
+- **The box stays on `origin/main`, clean — always.** Never edit DDLs directly on the box, never leave it on
+  a feature branch, never leave an unpushed commit or a dirty tree. Ship is **edit → PR → merge to
+  origin/main → the box pulls main** (`git pull --ff-only`, never push from the box). Worktrees for in-flight
+  ship branches live **outside** the main checkout (`/root/wt-*`), never inside it.
+- **Index renames use expand/contract — DROP the old index in the SAME diff.** Never
+  `CREATE UNIQUE INDEX IF NOT EXISTS` to "rename": it leaves the old index in place, so you end with **two**
+  unique indexes on the same key — the 24-day landmine that caused the 2026-06-26 nightly FATAL. (Already
+  enforced by the ship-gate moderator, but stated here so writers author it right the first time.)

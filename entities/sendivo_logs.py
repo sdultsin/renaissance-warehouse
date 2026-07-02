@@ -27,6 +27,35 @@ from sources.sendivo import SendivoClient
 
 logger = logging.getLogger("entities.sendivo_logs")
 
+
+def _blast(x):
+    """(blast_id, blast_name) from a /sms/logs row, robust to Sendivo's shape.
+
+    Larry added blast_id to the message-logs API [2026-06-26] so each outbound
+    record carries which blast/script it came from. We don't pin the exact key
+    name: accept a nested `blast{id,name}`, top-level `blast_id`/`blast_name`, or
+    a scalar `blast`. Absent -> (None, None) so this is a clean no-op on any row
+    (or any historical day) where Sendivo doesn't populate it.
+    """
+    bid = x.get("blast_id")
+    bname = x.get("blast_name")
+    b = x.get("blast")
+    if isinstance(b, dict):
+        if bid is None:
+            bid = b.get("id")
+        if bname is None:
+            bname = b.get("name")
+    elif bid is None and b is not None and not isinstance(b, (list, tuple)):
+        bid = b  # scalar blast id
+    try:
+        bid = int(bid) if bid is not None and str(bid).strip() != "" else None
+    except (TypeError, ValueError):
+        bid = None
+    if bname is not None:
+        bname = str(bname) or None
+    return bid, bname
+
+
 BACKFILL_DAYS = int(os.environ.get("SENDIVO_LOGS_BACKFILL_DAYS", "1"))
 PER_PAGE = int(os.environ.get("SENDIVO_LOGS_PER_PAGE", "1000"))
 PAGE_PACE_S = float(os.environ.get("SENDIVO_LOGS_PACE", "1.2"))
@@ -57,6 +86,19 @@ CREATE TABLE IF NOT EXISTS raw_sendivo_hourly (
     metric_date DATE, hour_utc INTEGER, sub_account_id BIGINT, sub_account_name VARCHAR,
     campaign_id BIGINT, campaign_name VARCHAR,
     n_messages BIGINT, delivered_messages BIGINT, segments BIGINT,
+    _loaded_at TIMESTAMPTZ NOT NULL, _run_id VARCHAR);
+
+-- G4 (2026-06-26): per-BLAST send breakdown — the finer-than-campaign granularity Larry
+-- added to /sms/logs (blast_id/blast_name). One row per (day, sub, campaign, blast, status).
+-- Kept SEPARATE from raw_sendivo_campaign_daily (same lean-rollup discipline as G1/G3) so the
+-- main campaign rollup + v_sms_campaign_performance grain are UNTOUCHED — the blast view layers
+-- on top. This is what answers "which scripts/blasts are landing" on the SEND side; reply-side
+-- blast attribution comes from comms.sendivo_outbound_recovered.blast_id joined to the reply.
+CREATE TABLE IF NOT EXISTS raw_sendivo_blast_daily (
+    metric_date DATE, sub_account_id BIGINT, sub_account_name VARCHAR,
+    campaign_id BIGINT, campaign_name VARCHAR,
+    blast_id BIGINT, blast_name VARCHAR, status_group VARCHAR,
+    n_messages BIGINT, segments BIGINT, cost_usd DOUBLE,
     _loaded_at TIMESTAMPTZ NOT NULL, _run_id VARCHAR);
 """
 
@@ -93,6 +135,7 @@ class _BodyCapture:
         self.targets: set | None = None
         self.buf: list = []
         self.inserted = 0
+        self.blast_seen = 0  # captured rows carrying a non-null blast_id (field-live signal)
         if not self.enabled:
             return
         try:
@@ -125,10 +168,13 @@ class _BodyCapture:
                 p10 = "".join(c for c in (r.get("to_number") or "") if c.isdigit())[-10:]
                 if len(p10) != 10 or p10 not in self.targets:
                     continue
+                bid, bname = _blast(r)
+                if bid is not None:
+                    self.blast_seen += 1
                 self.buf.append((
                     str(r.get("id")), p10, r.get("to_number"), r.get("from_number"), body,
                     r.get("created_at"), (r.get("campaign") or {}).get("name"),
-                    r.get("sub_account_name"),
+                    r.get("sub_account_name"), bid, bname,
                 ))
         except Exception as exc:  # noqa: BLE001
             logger.warning("body-capture collect failed (disabling, rollup unaffected): %s", exc)
@@ -146,8 +192,12 @@ class _BodyCapture:
                     cur,
                     "insert into comms.sendivo_outbound_recovered "
                     "(sendivo_log_id, phone10, to_number, from_number, message_content, "
-                    "sent_at, campaign_name, sub_account_name) "
-                    "values %s on conflict (sendivo_log_id) do nothing",
+                    "sent_at, campaign_name, sub_account_name, blast_id, blast_name) "
+                    "values %s on conflict (sendivo_log_id) do update set "
+                    "  blast_id = coalesce(comms.sendivo_outbound_recovered.blast_id, excluded.blast_id), "
+                    "  blast_name = coalesce(comms.sendivo_outbound_recovered.blast_name, excluded.blast_name) "
+                    "where comms.sendivo_outbound_recovered.blast_id is null "
+                    "  and excluded.blast_id is not null",
                     self.buf,
                 )
                 n = cur.rowcount
@@ -200,6 +250,7 @@ def run_sms_logs(ctx: RunContext) -> PhaseResult:
             agg: dict[tuple, list] = defaultdict(lambda: [0, 0, 0.0])       # main daily rollup
             fail_agg: dict[tuple, list] = defaultdict(lambda: [0, 0, 0.0])  # G1 status/error detail
             hour_agg: dict[tuple, list] = defaultdict(lambda: [0, 0, 0])    # G3 [n, delivered, seg]
+            blast_agg: dict[tuple, list] = defaultdict(lambda: [0, 0, 0.0]) # G4 per-blast [n, seg, cost]
 
             def fold(logs):
                 for x in logs:
@@ -231,6 +282,12 @@ def run_sms_logs(ctx: RunContext) -> PhaseResult:
                     if sg == "DELIVERED":
                         h[1] += 1
                     h[2] += seg
+                    # 4) G4 per-blast send breakdown (blast_id added to /sms/logs 2026-06-26).
+                    #    Folds in the SAME pass; absent blast -> (None, None) bucket = a harmless
+                    #    no-op until Sendivo populates it (then it self-fills going forward).
+                    bid, bname = _blast(x)
+                    ba = blast_agg[(day_s, said, saname, cid, cname, bid, bname, sg)]
+                    ba[0] += 1; ba[1] += seg; ba[2] += price
 
             d = cli.sms_logs_page(day, 1, PER_PAGE)
             pg = d.get("pagination") or {}
@@ -296,6 +353,24 @@ def run_sms_logs(ctx: RunContext) -> PhaseResult:
                     hrecs,
                 )
 
+            # G4 — per-blast send breakdown
+            conn.execute(
+                "DELETE FROM raw_sendivo_blast_daily WHERE metric_date = ? AND _run_id = ?",
+                [day, run_id],
+            )
+            brecs = [
+                (md, said, saname, cid, cname, bid, bname, sg, n, seg, round(cost, 6), run_id)
+                for (md, said, saname, cid, cname, bid, bname, sg), (n, seg, cost) in blast_agg.items()
+            ]
+            if brecs:
+                conn.executemany(
+                    "INSERT INTO raw_sendivo_blast_daily (metric_date, sub_account_id, sub_account_name, "
+                    "campaign_id, campaign_name, blast_id, blast_name, status_group, "
+                    "n_messages, segments, cost_usd, _loaded_at, _run_id) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, now(), ?)",
+                    brecs,
+                )
+
             msgs = sum(r[6] for r in recs)
             # E1/E2 reconciliation: committed vs the API's full-table count. delta!=0 => silent
             # drop (a mid-run page failure under-counted). The watchdog reads these notes + the
@@ -315,4 +390,5 @@ def run_sms_logs(ctx: RunContext) -> PhaseResult:
         notes["_failed_days"] = failures
     if capture.was_enabled:
         notes["_body_capture_inserted"] = capture.inserted
+        notes["_blast_id_seen"] = capture.blast_seen  # >0 confirms Larry's blast_id is live
     return PhaseResult(rows_in=rows_out, rows_out=rows_out, notes=notes)

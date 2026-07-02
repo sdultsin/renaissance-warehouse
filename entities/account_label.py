@@ -8,11 +8,14 @@ so core.account_census for today's census_date is already populated). No PHASE_O
 Idempotent: rebuilds the LATEST census_date partition of core.account_label each nightly run from tables
 that already exist. DELETE-by-partition + INSERT (same pattern as entities/account_census.py).
 
-LIFECYCLE (D1, BINARY): Active = EVER sent cold (a core.sending_account_daily row with actual_sends>0,
-looked back as far as the cold history allows) | Warmup. lifecycle_confidence ∈ {confident, uncertain}.
-This is the SQL equivalent of gen_account_label_and_uncertain_v2.py (validated 220,427/0/92,559 offline;
-re-simulated live this session = 220,328/0/94,559 over the 2026-06-21 census of 314,887 — drift is the
-documented B' census-advance behavior, NOT a bug).
+LIFECYCLE (D1, BINARY): Active = ever-cold-sent (a core.sending_account_daily row with actual_sends>0)
+AND a live cold daily_limit>0 | else Warmup. lifecycle_confidence ∈ {confident, uncertain}.
+The daily_limit>0 capacity gate was added 2026-06-24: a one-time warmup-ramp blip used to record a cold
+send and permanently flip a still-warming inbox to "Active" — that is why ~44.7k MilkBox Outlook accounts
+(daily_limit=0, warming) showed as Active on the Sending-Volume-Truth dashboard. Gating on live capacity
+removes that brittleness with zero capacity impact (validated: OTD/Google Active counts+capacity unchanged;
+the cap=0 warmers move to Warmup). MilkBox is additionally held in Warmup for a 2-week warmup window
+(warmup_start + 14d; Darcy/Sam 2026-06-24) via the core.account_registry vendor='MilkBox' guard.
 
 SOFT DEP — core.account_mx_resolution: VERIFIED ABSENT live this session AND absent from the droplet repo.
 The provider_code=1 MX waterfall is therefore conditionally joined ONLY when the table exists; absent, pc=1
@@ -61,10 +64,28 @@ def run_account_label(ctx: RunContext) -> PhaseResult:
     )
     mx_infra = "mx.infra" if has_mx else "CAST(NULL AS VARCHAR)"
 
+    # MilkBox 2-week warmup guard (Darcy/Sam 2026-06-24): MilkBox inboxes warm for 2 weeks; hold them in
+    # Warmup until warmup_start + 14d even if a warmup-ramp blip logged a cold send. Identified via the
+    # batch sheet (core.account_registry vendor='MilkBox'). Guarded join so absence is a no-op — the
+    # daily_limit>0 capacity gate in LIFECYCLE already keeps cap=0 warmers (incl. all current MilkBox) out
+    # of Active; the date guard only adds protection should a MilkBox inbox ever carry a cold limit mid-warmup.
+    has_reg = _table_exists(conn, "core", "account_registry")
+    reg_cte = (
+        "reg AS (SELECT DISTINCT lower(email) AS email "
+        "FROM core.account_registry WHERE vendor = 'MilkBox' AND email IS NOT NULL),\n    "
+        if has_reg else ""
+    )
+    reg_join = "LEFT JOIN reg ON reg.email = cen.email" if has_reg else ""
+    is_milkbox = "reg.email IS NOT NULL" if has_reg else "FALSE"
+    mb_warming = (
+        f"({is_milkbox} AND cen.timestamp_warmup_start IS NOT NULL "
+        f"AND cen.census_date < CAST(cen.timestamp_warmup_start AS DATE) + 14)"
+    )
+
     # COLD-ever producer (independent of the census poll). lower(account_id)=account_id verified, but keep
     # lower() explicit for safety.
     select_sql = f"""
-    WITH cen AS (
+    WITH {reg_cte}cen AS (
         SELECT census_date,
                lower(email)            AS email,
                workspace_slug,
@@ -108,12 +129,21 @@ def run_account_label(ctx: RunContext) -> PhaseResult:
         COALESCE(vnd.vendor_category, '(pending)')                        AS vendor,
         CASE WHEN vnd.vendor_category IS NOT NULL THEN 'sending_account_vendor'
              ELSE '(pending)' END                                         AS vendor_source,
-        CASE WHEN cold.email IS NOT NULL THEN 'Active' ELSE 'Warmup' END  AS lifecycle,
-        -- BINARY D1: cold-ever => confident Active; else uncertain (the strict-D1 outcome:
-        -- confident-Warmup=0; every non-cold account is genuinely ambiguous within the cold window).
-        CASE WHEN cold.email IS NOT NULL THEN 'confident' ELSE 'uncertain' END
-                                                                          AS lifecycle_confidence,
-        CASE WHEN cold.email IS NOT NULL THEN 'cold_send_history'
+        -- BINARY D1 lifecycle, capacity-gated (2026-06-24): Active requires BOTH ever-cold-sent AND a live
+        -- cold daily_limit>0, so a one-time warmup-ramp blip (cap=0) can no longer flip a warming inbox to
+        -- Active (the ~44.7k MilkBox Outlook mislabel). MilkBox is additionally held in Warmup for its
+        -- 2-week warmup window. Net effect validated: OTD/Google Active unchanged; cap=0 warmers -> Warmup.
+        CASE WHEN {mb_warming} THEN 'Warmup'
+             WHEN cold.email IS NOT NULL AND COALESCE(cen.daily_limit, 0) > 0 THEN 'Active'
+             ELSE 'Warmup' END                                            AS lifecycle,
+        -- Confident: proven-cold WITH live capacity (Active) or a MilkBox account inside its warmup window;
+        -- everything else is genuinely ambiguous within the cold window.
+        CASE WHEN {mb_warming} THEN 'confident'
+             WHEN cold.email IS NOT NULL AND COALESCE(cen.daily_limit, 0) > 0 THEN 'confident'
+             ELSE 'uncertain' END                                         AS lifecycle_confidence,
+        CASE WHEN {mb_warming} THEN 'milkbox_2wk_warmup'
+             WHEN cold.email IS NOT NULL AND COALESCE(cen.daily_limit, 0) > 0 THEN 'cold_send_history'
+             WHEN cold.email IS NOT NULL THEN 'cold_history_no_live_capacity'
              WHEN cen.daily_limit > 0 AND cen.warmup_status IN (1,0) THEN 'capacity_only_no_cold'
              WHEN cen.warmup_status = -1 AND cen.daily_limit > 0 THEN 'warmup_banned_dl_pos_no_cold'
              WHEN cen.timestamp_warmup_start IS NULL THEN 'no_warmup_start_no_cold'
@@ -128,7 +158,9 @@ def run_account_label(ctx: RunContext) -> PhaseResult:
         cen.daily_limit,
         cen.timestamp_created,
         cen.timestamp_warmup_start,
-        CASE WHEN cold.email IS NOT NULL THEN NULL
+        CASE WHEN {mb_warming} THEN NULL
+             WHEN cold.email IS NOT NULL AND COALESCE(cen.daily_limit, 0) > 0 THEN NULL
+             WHEN cold.email IS NOT NULL THEN 'cold_history_but_no_live_daily_limit'
              WHEN cen.daily_limit > 0 AND cen.warmup_status IN (1,0)
                   THEN 'capacity_assigned_no_cold_send_in_window'
                        || CASE WHEN cen.timestamp_created IS NOT NULL
@@ -148,6 +180,7 @@ def run_account_label(ctx: RunContext) -> PhaseResult:
     FROM cen
     LEFT JOIN cold ON cold.email = cen.email
     LEFT JOIN vnd  ON vnd.email  = cen.email
+    {reg_join}
     {mx_join}
     """
 

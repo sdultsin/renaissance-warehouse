@@ -207,6 +207,8 @@ def _op_facts(lib, op, aliases, canonical, allcols, con) -> dict:
             "type_narrowing": op.op == "alter_type",
             "set_not_null_without_default": op.op == "set_not_null",
             "add_not_null_without_default": op.op == "add_column" and "not null" in extra and "default" not in extra,
+            "creates_unique_index": op.op == "create_unique_index",
+            "creates_index": op.op in ("create_index", "create_unique_index"),
         },
         "_dupe_canonical": (dupe.column_name and aliases.get((col or "").lower())) if dupe else None,
     }
@@ -235,6 +237,228 @@ def _render(template: str, ctx: dict) -> str:
         return template.format_map(defaultdict(str, ctx))
     except Exception:
         return template
+
+
+# ── W2 floor index rule (expand/contract for CREATE [UNIQUE] INDEX) ───────────────────────────────
+# The 2026-06-26 landmine: a bare `CREATE UNIQUE INDEX IF NOT EXISTS <new> ON <tbl>(<col>)` shipped
+# as a "rename" without DROPping the old index leaves TWO unique indexes on the same column, FATALing
+# the nightly upsert. This mirrors R1 (column rename/drop must be expand/contract): a new index on a
+# column that ALREADY has a same-uniqueness index under a DIFFERENT name is REFUSED (tier=block)
+# unless the SAME diff also DROPs the old index. A 2nd UNIQUE index on a column always WARNs.
+# Normalized index-expression match for `_existing_indexes_on_column` — case-insensitive AND
+# quote-stripped, mirroring W1's _KEY_INDEX_EXPR_NORM so a `_KEY`-cased existing index (Bypass 2) is
+# matched as an existing enforcement on the column.
+_EXPR_NORM = "replace(lower(trim(expressions, '[]')), '\"', '')"
+
+
+def _existing_indexes_on_column(con, table: str | None, column: str | None) -> tuple[list[dict], bool]:
+    """Return ([{index_name, is_unique, kind}], catalog_readable) for the unique/non-unique ENFORCEMENTS
+    whose SOLE expression/column is `column` on `table`, from the live serving snapshot.
+
+    Fuses two catalogs (mirroring W1): duckdb_indexes() (kind='index') + duckdb_constraints()
+    (kind='constraint' for a single-column UNIQUE / PRIMARY KEY on `column`; constraints are always
+    treated as is_unique=True). Column casing is normalized so a `_KEY`-cased index (Bypass 2) and a
+    constraint-backed enforcement (Bypass 1) both register as an EXISTING enforcement.
+
+    `catalog_readable` is False when the serving snapshot could not be positively read (con is None, or
+    the index probe raised) — the floor must then FAIL-CLOSED (WARN/BLOCK) on a NEW unique enforcement
+    rather than silently pass, because it cannot prove the column has no pre-existing enforcement
+    (snapshot lags the authoritative warehouse in the promote-lag window). A genuinely-empty result
+    from a readable catalog returns ([], True)."""
+    if con is None or not table or not column:
+        return [], False
+    out: list[dict] = []
+    # (1) indexes (normalized casing). A probe failure => catalog NOT readable => fail-closed.
+    try:
+        rows = con.execute(
+            "SELECT index_name, is_unique FROM duckdb_indexes() "
+            f"WHERE lower(table_name)=lower(?) AND {_EXPR_NORM}=lower(?)",
+            [table, column]).fetchall()
+    except Exception:
+        return [], False
+    for r in rows:
+        out.append({"index_name": r[0], "is_unique": bool(r[1]), "kind": "index"})
+    # (2) UNIQUE / PRIMARY KEY constraints whose sole column is `column` (Bypass-1 enforcement). Best-
+    # effort: if duckdb_constraints() is unavailable we keep the index result (still a readable catalog).
+    try:
+        crows = con.execute(
+            "SELECT constraint_type FROM duckdb_constraints() "
+            "WHERE lower(table_name)=lower(?) AND constraint_type IN ('UNIQUE','PRIMARY KEY') "
+            "  AND list_transform(constraint_column_names, x -> lower(x)) = [lower(?)]",
+            [table, column]).fetchall()
+        for (ctype,) in crows:
+            out.append({"index_name": f"{ctype} constraint", "is_unique": True, "kind": "constraint"})
+    except Exception:
+        pass
+    return out, True
+
+
+def _is_constraint_op(op) -> bool:
+    """True if this synthetic create_unique_index op came from an inline UNIQUE / PRIMARY KEY
+    constraint (Bypass 1) rather than a CREATE UNIQUE INDEX — marked by classify_ddl with a
+    `constraint:` prefix in new_name. A constraint has no index name and thus no DROP-INDEX to pair."""
+    return (op.new_name or "").lower().startswith("constraint:")
+
+
+def _index_findings(lib, ddl_files, op_rules, con) -> list[dict]:
+    """Deterministic dup-unique-enforcement findings across the submitted diff (the W2 floor for the
+    2026-06-26 dup-unique-_key landmine). Covers BOTH a CREATE [UNIQUE] INDEX and a Bypass-1 inline
+    UNIQUE / PRIMARY KEY constraint (CREATE TABLE column/table constraint or ALTER TABLE ADD CONSTRAINT
+    — surfaced by classify_ddl as synthetic create_unique_index ops with new_name='constraint:<kind>').
+
+    A new unique enforcement on a column is REFUSED (block) when the column ALREADY carries a
+    same-uniqueness enforcement (index OR constraint, casing-normalized) under a different name, unless
+    the SAME diff DROPs the old INDEX (expand/contract — constraints have no DROP-INDEX pairing).
+    Additionally:
+      * BYPASS 1 same-diff: when THIS diff itself introduces >1 unique enforcement on the SAME
+        (table, column) — e.g. an inline `_key ... UNIQUE` constraint AND a `CREATE UNIQUE INDEX`
+        on _key in the same submission — that is the dup landmine being CREATED in one shot; BLOCK
+        even if the catalog shows nothing.
+      * FAIL-CLOSED: when the serving-snapshot catalog cannot be positively read (con is None / probe
+        raised — the promote-lag window where the snapshot lags the authoritative warehouse), a NEW
+        unique enforcement WARNs (cannot prove the column has no existing same-column enforcement).
+
+    Built in-floor (like the CONTRACT check) so it works without a published rule row; a matching rule
+    row (match.op create_unique_index) supplies tier/code if the operator seeded one."""
+    findings: list[dict] = []
+    # the whole submitted diff's DROP INDEX set (expand/contract is satisfied if the old index is
+    # dropped ANYWHERE in the same change, not necessarily the same file).
+    dropped: set = set()
+    for f in ddl_files:
+        try:
+            dropped |= lib.parse_dropped_indexes(f["content"])
+        except Exception:
+            pass
+    # a pre-published rule row to honour (tier/detail), if the operator seeded one.
+    idx_rule = next((r for r in op_rules
+                     if "create_unique_index" in ((r["spec"] or {}).get("match") or {}).get("op", [])
+                     or "create_index" in ((r["spec"] or {}).get("match") or {}).get("op", [])), None)
+    block_tier = (idx_rule or {}).get("tier", "block")
+    rule_code = (idx_rule or {}).get("code", "W2-INDEX")
+
+    # PASS 1: count how many NEW unique enforcements THIS diff introduces per (table, column), so a
+    # same-diff index+constraint pair on the same column (the Bypass-1 shape) is caught even against an
+    # empty/lagging catalog. Key on (schema.table.lower, column.lower).
+    intra: dict[tuple, int] = {}
+    for f in ddl_files:
+        try:
+            ops = lib.classify_ddl(f["content"])
+        except Exception:
+            ops = []
+        for op in ops:
+            if op.op != "create_unique_index" or not op.column:
+                continue
+            _, t = lib.split_table_ref(op.table)
+            intra[((t or "").lower(), op.column.lower())] = \
+                intra.get(((t or "").lower(), op.column.lower()), 0) + 1
+
+    seen_intra_block: set = set()  # emit the same-diff dup block once per (table,col)
+    for f in ddl_files:
+        path = f["path"]
+        for op in lib.classify_ddl(f["content"]):
+            if op.op not in ("create_unique_index", "create_index"):
+                continue
+            schema, tbl = lib.split_table_ref(op.table)
+            is_constraint = _is_constraint_op(op)
+            new_name = (op.new_name or "").split(".")[-1].lower()
+            col = op.column  # single indexed/constrained column (composite -> None, skipped below)
+            is_unique = op.op == "create_unique_index"
+            disp = ("inline UNIQUE/PRIMARY KEY constraint" if is_constraint
+                    else f"{'CREATE UNIQUE INDEX' if is_unique else 'CREATE INDEX'} {op.new_name}")
+            cols_disp = op.extra or (col or "?")
+            key = ((tbl or "").lower(), (col or "").lower())
+
+            # BYPASS-1 SAME-DIFF: this diff itself adds >1 unique enforcement on the same column.
+            if is_unique and col and intra.get(key, 0) > 1 and key not in seen_intra_block:
+                seen_intra_block.add(key)
+                detail = (f"This change introduces {intra[key]} unique enforcements on "
+                          f"{schema}.{tbl}(`{col}`) in the SAME diff (e.g. an inline UNIQUE/PRIMARY "
+                          f"KEY constraint AND a CREATE UNIQUE INDEX on the same column). Two unique "
+                          f"enforcements on one column FATAL the nightly upsert ('Failed to delete all "
+                          f"rows from index'). Keep exactly ONE unique enforcement on `{col}`.")
+                findings.append({
+                    "rule": rule_code, "tier": block_tier,
+                    "severity": _TIER_SEVERITY.get(block_tier, "Error"),
+                    "classification": "UNIQUE-ENFORCEMENT-DUP-SAMEDIFF",
+                    "table_schema": schema, "table_name": tbl, "column_name": col,
+                    "ddl_file": path, "detail": detail, "consumers": [],
+                    "fix": {"kind": "single_enforcement"}, "source": "floor"})
+                # fall through: still evaluate against the catalog below (additive, but de-duped by key)
+
+            if not col:
+                continue  # composite enforcement: not the single-col _key dup-FATAL class
+
+            existing, catalog_readable = _existing_indexes_on_column(con, tbl, col)
+            same_uniqueness = [e for e in existing
+                               if e["is_unique"] == is_unique
+                               and e["index_name"].lower() != new_name]
+
+            if not same_uniqueness:
+                # No pre-existing same-uniqueness enforcement VISIBLE on this column under another name.
+                # FAIL-CLOSED: if the catalog could not be positively read (promote-lag / snapshot
+                # unreadable), a NEW unique enforcement WARNs — we cannot prove there is no existing
+                # same-column enforcement, and W1's catalog-delta over the AUTHORITATIVE warehouse is
+                # the hard backstop. (A non-unique index does not FATAL the upsert -> no fail-closed.)
+                if is_unique and not catalog_readable and key not in seen_intra_block:
+                    detail = (f"{disp} adds a NEW unique enforcement on {schema}.{tbl}(`{col}`), but "
+                              f"the serving-snapshot catalog could not be positively read (con "
+                              f"unavailable or lagging the authoritative warehouse in the promote-lag "
+                              f"window), so the floor CANNOT confirm `{col}` has no existing unique "
+                              f"enforcement. Failing closed: confirm there is exactly ONE unique "
+                              f"enforcement on `{col}` after apply (W1's post-apply catalog-delta gate "
+                              f"is the authoritative backstop).")
+                    findings.append({
+                        "rule": rule_code, "tier": "warn", "severity": "Warn",
+                        "classification": "UNIQUE-ENFORCEMENT-UNVERIFIED",
+                        "table_schema": schema, "table_name": tbl, "column_name": col,
+                        "ddl_file": path, "detail": detail, "consumers": [],
+                        "fix": {"kind": "verify_single_enforcement"}, "source": "floor"})
+                continue
+
+            old_names = [e["index_name"] for e in same_uniqueness]
+            # only an INDEX can be dropped to satisfy expand/contract; a pre-existing CONSTRAINT must be
+            # dropped via ALTER ... DROP CONSTRAINT, which the floor does not auto-pair -> stays a block.
+            droppable = [e for e in same_uniqueness if e["kind"] == "index"]
+            old_dropped = bool(droppable) and all(
+                e["index_name"].split(".")[-1].lower() in dropped for e in droppable) \
+                and len(droppable) == len(same_uniqueness)
+
+            if is_unique and not old_dropped:
+                fix = {"kind": "expand_contract"}
+                if droppable:
+                    fix["drop"] = f"DROP INDEX IF EXISTS {droppable[0]['index_name']};"
+                detail = (f"{disp} on {schema}.{tbl}({cols_disp}) adds a SECOND unique enforcement on "
+                          f"`{col}`, which already has unique enforcement(s) [{', '.join(old_names)}]. "
+                          f"Two unique enforcements on the same column FATAL the nightly upsert "
+                          f"('Failed to delete all rows from index'). If this is a rename, make it "
+                          f"expand/contract: DROP the old enforcement in the SAME diff"
+                          + (f" (e.g. `DROP INDEX IF EXISTS {droppable[0]['index_name']};`)" if droppable else "")
+                          + ". (IF NOT EXISTS does NOT make this safe — it keys off the new name and "
+                          f"leaves the old enforcement in place.)")
+                findings.append({
+                    "rule": rule_code, "tier": block_tier,
+                    "severity": _TIER_SEVERITY.get(block_tier, "Error"),
+                    "classification": "UNIQUE-INDEX-DUP", "table_schema": schema, "table_name": tbl,
+                    "column_name": col, "ddl_file": path, "detail": detail,
+                    "consumers": [], "fix": fix, "source": "floor"})
+            elif is_unique and old_dropped:
+                findings.append({
+                    "rule": "W2-INDEX", "tier": "info", "severity": "Info",
+                    "classification": "UNIQUE-INDEX-RENAME", "table_schema": schema, "table_name": tbl,
+                    "column_name": col, "ddl_file": path,
+                    "detail": (f"{disp} on `{col}` pairs a DROP of the prior unique index "
+                               f"({', '.join(old_names)}) in the same diff — expand/contract OK."),
+                    "consumers": [], "fix": {"kind": "none"}, "source": "floor"})
+            else:
+                findings.append({
+                    "rule": "W2-INDEX", "tier": "warn", "severity": "Warn",
+                    "classification": "INDEX-DUP", "table_schema": schema, "table_name": tbl,
+                    "column_name": col, "ddl_file": path,
+                    "detail": (f"{disp} on `{col}` adds a 2nd index on a column that already has "
+                               f"index(es) [{', '.join(old_names)}] — likely redundant; drop the old "
+                               f"one if this is a rename."),
+                    "consumers": [], "fix": {"kind": "expand_contract"}, "source": "floor"})
+    return findings
 
 
 # ── the deterministic floor ───────────────────────────────────────────────────────────────────
@@ -297,6 +521,16 @@ def floor_review(ddl_files: list[dict], py_files: list[dict]) -> dict:
                            "consumers": ", ".join(of["consumers"][:8]) or "none statically known",
                            "reason": reason, "canonical": of["_dupe_canonical"] or "", "ddl_file": path}
                     findings.append(_finding(r, ctx, ddl_file=path, op=of))
+        # W2 index expand/contract rule (deterministic, in-floor): a new UNIQUE index on a column that
+        # already has a same-uniqueness index under a different name is REFUSED unless the same diff
+        # DROPs the old one (the 2026-06-26 dup-unique-_key landmine). Runs once over the whole diff.
+        try:
+            findings.extend(_index_findings(lib, ddl_files, op_rules, con))
+            if any(o.op in ("create_index", "create_unique_index")
+                   for fdl in ddl_files for o in lib.classify_ddl(fdl["content"])):
+                had_ddl_ops = True  # an index-only diff is still schema-relevant (-> deep review)
+        except Exception:
+            pass  # the index rule must never break the floor
         # py contract check (fail-loud): an INSERT column list referencing a column not in the live
         # catalog is drift. Needs the catalog (degrades to py_has_sql detection pre-P7).
         kw = {"select", "insert", "update", "delete", "from", "where", "into", "values", "table",
@@ -339,6 +573,14 @@ def floor_review(ddl_files: list[dict], py_files: list[dict]) -> dict:
     return {"rules_version": rv, "catalog_snapshot_id": snap, "findings": findings,
             "floor_verdict": floor_verdict, "catalog_built": bool(allcols),
             "schema_relevant": schema_relevant}
+
+
+def floor_review_sql(sql: str, path: str = "qa.sql", py_files=None) -> dict:
+    """QA convenience: run the deterministic floor over a single synthetic DDL STRING. Point the
+    catalog at a scratch snapshot with `MODERATOR_DUCKDB_CURRENT=/tmp/gate-qa/<x>.duckdb` so the
+    index expand/contract rule can see (or not see) an existing unique index. Equivalent to
+    floor_review([{path, content: sql}], py_files)."""
+    return floor_review([{"path": path, "content": sql}], py_files or [])
 
 
 def _reason_for(code: str, of: dict) -> str:
@@ -434,7 +676,13 @@ _DEEP_SYSTEM = (
     "involved (which is MOST of the time: which canonical name, whether a change is a rename vs a new "
     "column, what the down-migration should preserve). You MUST NOT choose between materially-different "
     "options — the SUBMITTING human owns that judgement. Never defer to Sam; ambiguity goes to the person "
-    "doing the work."
+    "doing the work.\n\n"
+    "INDEX INTEGRITY (a known landmine — see the live schema snapshot's dup_unique_key_flag and the "
+    "reviewer learnings): a 2nd UNIQUE index on a column that already has one (classically `_key` on a "
+    "raw_pipeline_* table) FATALs the nightly upsert ('Failed to delete all rows from index'). A "
+    "`CREATE UNIQUE INDEX IF NOT EXISTS <new>` is NOT safe as a 'rename' — IF NOT EXISTS keys off the "
+    "new name and leaves the old index in place. BLOCK an index change that would leave two unique "
+    "indexes on the same column unless the same diff DROPs the old one (expand/contract)."
 )
 
 
@@ -482,6 +730,106 @@ def llm_deep_review(ddl_files, py_files, floor_result) -> dict:
                 "reasoning": f"{type(e).__name__}: {e}", "model": mc.LLM_MODEL}
 
 
+# ── W3 self-updating context: live-schema snapshot (incl. dup-unique flag) + reviewer learnings ──
+def _live_schema_snapshot(con, touched_tables) -> str:
+    """Live-schema snapshot the LLM sees at review time: the dup-unique-_key flag per raw_pipeline_*
+    table (the 2026-06-26 guard), the per-table column list, and sync_registry status for the touched
+    objects. Read-only over the serving snapshot. Returns a markdown block (best-effort; '' on miss)."""
+    if con is None:
+        return ""
+    tbls = sorted({t for t in (touched_tables or []) if t})
+    in_clause = ", ".join("?" for _ in tbls) if tbls else None
+    lines: list[str] = []
+    # (a.1) DUPLICATE-UNIQUE-INDEX FLAG — the headline guard.
+    try:
+        rows = con.execute(
+            "SELECT table_name, count(*) AS n, (count(*) > 1) AS dup_flag, "
+            "       string_agg(index_name, ', ' ORDER BY index_name) AS idxs "
+            "FROM duckdb_indexes() "
+            "WHERE table_name LIKE 'raw_pipeline%' AND is_unique "
+            "  AND trim(expressions, '[]') = '_key' "
+            "GROUP BY table_name ORDER BY dup_flag DESC, table_name").fetchall()
+        if rows:
+            lines.append("## Unique-index-on-_key per raw_pipeline_* table "
+                         "(dup_unique_key_flag=TRUE => a 2nd unique _key index would FATAL the upsert):")
+            for tn, n, dup, idxs in rows:
+                lines.append(f"- {tn}: {n} unique _key index(es) [{idxs}]"
+                             + ("  <-- DUPLICATE (already at risk)" if dup else ""))
+    except Exception:
+        pass
+    # (a.2) PER-TABLE COLUMN LIST for the touched tables (+ raw_pipeline family).
+    try:
+        if in_clause:
+            q = ("SELECT table_schema, table_name, "
+                 "string_agg(column_name, ', ' ORDER BY ordinal_position) AS cols "
+                 "FROM information_schema.columns "
+                 f"WHERE table_name IN ({in_clause}) OR table_name LIKE 'raw_pipeline%' "
+                 "GROUP BY table_schema, table_name ORDER BY table_schema, table_name")
+            rows = con.execute(q, tbls).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT table_schema, table_name, "
+                "string_agg(column_name, ', ' ORDER BY ordinal_position) AS cols "
+                "FROM information_schema.columns WHERE table_name LIKE 'raw_pipeline%' "
+                "GROUP BY table_schema, table_name ORDER BY table_schema, table_name").fetchall()
+        if rows:
+            lines.append("## Columns of touched tables (ordinal order):")
+            for sch, tn, cols in rows:
+                lines.append(f"- {sch}.{tn}: {cols}")
+    except Exception:
+        pass
+    # (a.3) SYNC_REGISTRY status for the touched objects (send-sensitivity / cadence / freshness).
+    try:
+        if in_clause:
+            q = ("SELECT name, table_schema, status, expected_cadence, sla_hours, is_send_sensitive, "
+                 "last_synced_at, last_biz_date, last_row_delta, row_count FROM core.sync_registry "
+                 f"WHERE replace(name, table_schema || '.', '') IN ({in_clause}) "
+                 f"OR name IN ({in_clause}) OR name LIKE 'raw_pipeline%' "
+                 "ORDER BY is_send_sensitive DESC, table_schema, name")
+            rows = con.execute(q, tbls + tbls).fetchall()
+        else:
+            rows = con.execute(
+                "SELECT name, table_schema, status, expected_cadence, sla_hours, is_send_sensitive, "
+                "last_synced_at, last_biz_date, last_row_delta, row_count FROM core.sync_registry "
+                "WHERE name LIKE 'raw_pipeline%' ORDER BY is_send_sensitive DESC, table_schema, name").fetchall()
+        if rows:
+            lines.append("## sync_registry status for touched objects:")
+            for r in rows:
+                lines.append(f"- {r[0]} [{r[2]}] cadence={r[3]} sla_h={r[4]} send_sensitive={r[5]} "
+                             f"last_synced={r[6]} last_biz={r[7]} last_delta={r[8]} rows={r[9]}")
+    except Exception:
+        pass
+    return ("# Live schema snapshot (read at review time)\n" + "\n".join(lines) + "\n") if lines else ""
+
+
+def _recent_learnings(con, limit: int = 25) -> str:
+    """Recent active reviewer learnings (block-level first, then most recent) rendered for the prompt.
+    Reads core.review_learnings on the same RO connection. '' if the table isn't present yet."""
+    if con is None:
+        return ""
+    try:
+        # cast created_at to VARCHAR: fetching a TIMESTAMPTZ via py-duckdb requires pytz (not always
+        # installed in the moderator venv) and would raise; the prompt doesn't render the timestamp.
+        rows = con.execute(
+            "SELECT id, CAST(created_at AS VARCHAR), category, severity, outcome, rule_text, lesson, "
+            "       example_ddl, source_incident FROM core.review_learnings "
+            "WHERE NOT superseded ORDER BY (severity = 'block') DESC, created_at DESC LIMIT ?",
+            [limit]).fetchall()
+    except Exception:
+        return ""  # table not created yet (W3 DDL staged, not applied) — degrade silently
+    if not rows:
+        return ""
+    out = ["# Reviewer learnings (recent — apply these; highest-priority first)"]
+    for r in rows:
+        rid, created, cat, sev, outcome, rule_text, lesson, example, incident = r
+        out.append(f"- [{sev}/{cat}/{outcome}] RULE: {rule_text}")
+        if lesson:
+            out.append(f"    why: {lesson}")
+        if incident:
+            out.append(f"    incident: {incident}")
+    return "\n".join(out) + "\n"
+
+
 def _deep_prompt(ddl_files, py_files, floor_result) -> str:
     lib = mc.engine()
     parts = ["# Proposed warehouse schema change\n"]
@@ -497,11 +845,16 @@ def _deep_prompt(ddl_files, py_files, floor_result) -> str:
         con = mc.duckdb_ro_open()
     except Exception:
         con = None
+    touched_tables: set = set()
+    live_snapshot = ""
+    learnings_block = ""
     try:
         seen = set()
         for f in ddl_files:
             for op in lib.classify_ddl(f["content"]):
                 schema, tbl = lib.split_table_ref(op.table)
+                if tbl:
+                    touched_tables.add(tbl)
                 key = (tbl, op.column)
                 if key in seen:
                     continue
@@ -519,12 +872,27 @@ def _deep_prompt(ddl_files, py_files, floor_result) -> str:
                                              + ", ".join(c[0] for c in cols[:60]))
                     except Exception:
                         pass
+        # W3: fetch the live-schema snapshot (with the dup-unique flag) + recent reviewer learnings on
+        # the SAME read-only connection, at review time, so the LLM sees the live duplicate-index state
+        # and the lessons the gate has learned.
+        try:
+            live_snapshot = _live_schema_snapshot(con, touched_tables)
+        except Exception:
+            live_snapshot = ""
+        try:
+            learnings_block = _recent_learnings(con)
+        except Exception:
+            learnings_block = ""
     finally:
         if con is not None:
             try:
                 con.close()
             except Exception:
                 pass
+    if learnings_block:
+        parts.append(learnings_block)
+    if live_snapshot:
+        parts.append(live_snapshot)
     parts.append("# Catalog / lineage context\n" + ("\n".join(ctx_lines) or "(catalog not yet built)") + "\n")
     fl = floor_result.get("findings", [])
     parts.append("# Deterministic floor findings (already covered — do NOT just repeat these)\n"
@@ -1021,3 +1389,25 @@ def record_pass(ddl_files, py_files, actor, branch, request_id, reason=None) -> 
             except Exception as e:
                 mc.log_event("ledger_write_error", error=f"{type(e).__name__}: {e}", file=f["path"])
     return {"recorded": recorded, "rejected": False, **common}
+
+
+# ── QA CLI: run the deterministic floor over a synthetic DDL string/file ───────────────────────────
+# `python moderator_engine.py --floor-sql <file.sql>`  (or  --floor-inline "<ddl>")
+# Point the catalog at a scratch snapshot:  MODERATOR_DUCKDB_CURRENT=/tmp/gate-qa/x.duckdb
+# Exits nonzero when floor_verdict == 'block' so QA can assert the W2 index rule blocks.
+if __name__ == "__main__":
+    import argparse as _argparse
+    _ap = _argparse.ArgumentParser(description="QA: run the deterministic floor over a DDL string.")
+    _g = _ap.add_mutually_exclusive_group(required=True)
+    _g.add_argument("--floor-sql", help="path to a .sql file to floor-review")
+    _g.add_argument("--floor-inline", help="inline DDL string to floor-review")
+    _ap.add_argument("--path", default="qa.sql", help="logical path/name for the DDL")
+    _args = _ap.parse_args()
+    _sql = open(_args.floor_sql).read() if _args.floor_sql else _args.floor_inline
+    _res = floor_review_sql(_sql, path=_args.path)
+    print(json.dumps({"floor_verdict": _res["floor_verdict"],
+                      "rules_version": _res["rules_version"],
+                      "catalog_built": _res["catalog_built"],
+                      "catalog_snapshot_id": _res["catalog_snapshot_id"],
+                      "findings": _res["findings"]}, indent=2, default=str))
+    raise SystemExit(1 if _res["floor_verdict"] == "block" else 0)

@@ -87,6 +87,38 @@ def run_account_census(ctx: RunContext) -> PhaseResult:
         conn.execute("BEGIN")
         conn.execute("DELETE FROM core.account_census WHERE census_date = ?", [target_date])
         conn.execute(f"INSERT INTO core.account_census BY NAME ({select_sql})")
+        # LAST-GOOD CARRY-FORWARD [2026-07-01]: if the hourly poller could not fetch a workspace's
+        # /accounts (Instantly 500s — e.g. Funding 1 / renaissance-4, whose /accounts 500s on a
+        # specific page even at limit=10), it is ABSENT from today's parquet. Rather than let the
+        # fleet silently shrink (propagating to core.inbox / v_inbox_overview / the portal), carry its
+        # most-recent prior census rows forward so the census stays complete — fresh where Instantly
+        # serves it, last-good where it can't. Fires ONLY for still-active workspaces that are
+        # essentially absent today (<10% of their prior count), so a genuine retirement or a real
+        # shrink is never resurrected.
+        prior_date = conn.execute(
+            "SELECT max(census_date) FROM core.account_census WHERE census_date < ?", [target_date]
+        ).fetchone()[0]
+        if prior_date is not None:
+            gaps = conn.execute("""
+                WITH cur AS (SELECT workspace_uuid, count(*) AS n FROM core.account_census
+                             WHERE census_date = ? GROUP BY 1),
+                     pri AS (SELECT workspace_uuid, count(*) AS n FROM core.account_census
+                             WHERE census_date = ? GROUP BY 1)
+                SELECT pri.workspace_uuid, pri.n
+                FROM pri
+                LEFT JOIN cur USING (workspace_uuid)
+                JOIN core.workspace w ON w.workspace_id = pri.workspace_uuid AND w.is_active
+                WHERE COALESCE(cur.n, 0) < pri.n * 0.10
+            """, [target_date, prior_date]).fetchall()
+            for wsid, prior_n in gaps:
+                conn.execute("DELETE FROM core.account_census WHERE census_date = ? AND workspace_uuid = ?",
+                             [target_date, wsid])
+                conn.execute("INSERT INTO core.account_census BY NAME "
+                             "SELECT * REPLACE (CAST(? AS DATE) AS census_date) FROM core.account_census "
+                             "WHERE census_date = ? AND workspace_uuid = ?", [target_date, prior_date, wsid])
+                logger.warning("account_census CARRY-FORWARD: active workspace %s absent from today's "
+                               "poll (<10%% of prior %d) — reused last-good rows from %s",
+                               wsid, prior_n, prior_date)
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")

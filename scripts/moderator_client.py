@@ -46,6 +46,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import ssl
 import subprocess
 import sys
@@ -57,7 +58,14 @@ RENAISSANCE_ENV = os.environ.get(
 WAREHOUSE_HOST = os.environ.get("WAREHOUSE_HOST", "renaissance-worker")
 # The ONLY repo Renaissance ships to. Overridable for tests/forks; defaults to the canonical slug.
 REPO_SLUG = os.environ.get("WAREHOUSE_REPO_SLUG", "sdultsin/renaissance-warehouse")
-PY_CONSUMER_DIRS = ("entities", "sources", "scripts")
+# Python paths the gate reviews: schema-consumer code (entities/sources/scripts), the warehouse
+# control plane (core/ — orchestrator.py, db.py, sync_run.py, registry.py, config.py), AND the gate's
+# own engine (moderator/ — moderator_engine/apply/server/integrity_gate). core/ + moderator/ were added
+# 2026-06-29 so a core-only (or gate-engine-only) PR flows through the gate the same as the others
+# (PR #87 hit the gap: a core-only change got ZERO automated review and was unmergeable except by admin
+# bypass, because the required `moderator-gate` check never triggered/reported on that path). The two
+# workflows' path triggers + file-selection regexes were widened to match this list.
+PY_CONSUMER_DIRS = ("entities", "sources", "scripts", "core", "moderator")
 MAX_LOOP = 6
 
 
@@ -686,6 +694,52 @@ def _post_pr_comment(pr_number, text: str) -> bool:
     return False
 
 
+# A human "do not merge" marker in a PR title or label: HOLD / HELD / DO-NOT-MERGE (case-
+# insensitive, word-bounded so "shareholder"/"withheld"/"household" never false-positive).
+_HOLD_MARKER = re.compile(r"\b(hold|held|do[\s_\-\u2013\u2014]{0,3}not[\s_\-\u2013\u2014]{0,3}merge)\b", re.IGNORECASE)
+
+
+def _pr_live_state(pr_number) -> dict | None:
+    """LIVE PR state read immediately before we ACT on the PR (enable auto-merge / post a comment).
+
+    A two-key run is minutes old by the time it acts (two LLM calls; the workflow fires on
+    `synchronize`), so the triggering event payload is STALE — that staleness produced both
+    2026-07-02 defects: PR #151 got a "🛑 Held — NOT merged" comment 43s AFTER it was merged, and
+    PR #166 (title "… — DEPLOY HELD") was auto-merged at 04:54Z. Returns
+    {state, title, labels} or None on any gh failure (callers fail SAFE: no merge, and
+    best-effort comment behavior unchanged)."""
+    if not pr_number:
+        return None
+    rc, out, _err = _gh("pr", "view", str(pr_number), "--repo", REPO_SLUG,
+                        "--json", "state,title,labels")
+    if rc != 0 or not out:
+        return None
+    try:
+        data = json.loads(out)
+    except ValueError:
+        return None
+    return {"state": (data.get("state") or "").upper(),
+            "title": data.get("title") or "",
+            "labels": [lb.get("name", "") for lb in (data.get("labels") or [])]}
+
+
+def _hold_marker(live: dict | None, fallback_title: str = "") -> str | None:
+    """Where (if anywhere) this PR carries a hold marker. Prefers the LIVE title + labels; falls
+    back to the caller-supplied title when the live state is unreadable. Returns a human-readable
+    'title contains ...' / 'label ... contains ...' string, or None when clean."""
+    candidates: list[tuple[str, str]] = []
+    if live is not None:
+        candidates.append(("title", live.get("title") or ""))
+        candidates.extend((f"label {name!r}", name) for name in (live.get("labels") or []))
+    elif fallback_title:
+        candidates.append(("title", fallback_title))
+    for where, text in candidates:
+        m = _HOLD_MARKER.search(text or "")
+        if m:
+            return f"{where} contains {m.group(0)!r}"
+    return None
+
+
 def cmd_two_key(args) -> int:
     """Two-key auto-merge for a PR (DECISION 2026-06-22). Re-asks the GATE (/review, claude-opus-4-8),
     runs the INDEPENDENT adversarial reviewer (independent_reviewer.py, claude-sonnet-4-6 — different
@@ -735,19 +789,46 @@ def cmd_two_key(args) -> int:
         elif not args.pr_number:
             print("\n  merge-eligible + automerge ON, but no --pr-number → cannot enable auto-merge here.")
         else:
-            rc, _o, err = _gh("pr", "merge", str(args.pr_number), "--repo", REPO_SLUG,
-                              "--auto", "--squash", "--delete-branch")
-            if rc == 0:
-                print(f"\n  AUTO-MERGE ENABLED on PR #{args.pr_number} — merges when required checks are green.")
+            # RESPECT A HUMAN HOLD [2026-07-02]: a HOLD/HELD/DO-NOT-MERGE marker in the live title
+            # or a label means "do not auto-merge" no matter what the two keys say (PR #166,
+            # titled "… — DEPLOY HELD", was auto-merged at 04:54Z — the defect this closes).
+            # Fail-safe: if the live state is unreadable we do NOT merge (degrade to manual).
+            live = _pr_live_state(args.pr_number)
+            hold = _hold_marker(live, args.pr_title or os.environ.get("TWO_KEY_PR_TITLE", ""))
+            if live is None:
+                print(f"\n  merge-eligible, but the live state of PR #{args.pr_number} is unreadable "
+                      "(gh failed) — NOT enabling auto-merge (fail-safe: cannot verify there is no "
+                      "HOLD marker). A human merges, or re-run two-key.")
+            elif live["state"] != "OPEN":
+                print(f"\n  merge-eligible, but PR #{args.pr_number} is already {live['state']} — "
+                      "nothing to do.")
+            elif hold:
+                print(f"\n  merge-eligible, but PR #{args.pr_number} carries a HOLD marker "
+                      f"({hold}) — RESPECTING it: auto-merge NOT enabled. Lift the hold "
+                      "(retitle / remove the label) and re-run two-key, or merge manually.")
             else:
-                print(f"\n  WARNING: `gh pr merge --auto` failed on PR #{args.pr_number}: {err}")
+                rc, _o, err = _gh("pr", "merge", str(args.pr_number), "--repo", REPO_SLUG,
+                                  "--auto", "--squash", "--delete-branch")
+                if rc == 0:
+                    print(f"\n  AUTO-MERGE ENABLED on PR #{args.pr_number} — merges when required checks are green.")
+                else:
+                    print(f"\n  WARNING: `gh pr merge --auto` failed on PR #{args.pr_number}: {err}")
         return 0
 
     # escalate: ON THE PR so the AUTHOR is notified (destructive=author-intent HOLD, disagreement=BLOCK).
     print("\n--- PLAIN-ENGLISH ESCALATION (posted ON THE PR — NEVER a raw diff) ---\n")
     print(out["escalation_text"])
     if enabled:
-        _post_pr_comment(args.pr_number, out["escalation_text"])
+        # NEVER post "Held — NOT merged" on a PR that IS merged [2026-07-02]: the run is stale by
+        # the time it comments (PR #151 got the Held comment 43s after its merge). Check the merge
+        # state immediately before commenting; an unreadable state keeps today's best-effort post.
+        live = _pr_live_state(args.pr_number)
+        if live and live["state"] == "MERGED":
+            print(f"\n  PR #{args.pr_number} is ALREADY MERGED — suppressing the escalation comment "
+                  "(a '🛑 Held — NOT merged' comment on a merged PR is false and confusing; this "
+                  "two-key run raced the merge).")
+        else:
+            _post_pr_comment(args.pr_number, out["escalation_text"])
     else:
         print("\n  (TWO_KEY_AUTOMERGE off → not posting to the PR automatically; route the text above.)")
     return 10

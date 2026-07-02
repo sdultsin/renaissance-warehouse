@@ -33,7 +33,11 @@ logger = logging.getLogger("entities.iam_response_time")
 
 _DDL = REPO_ROOT / "sql" / "ddl" / "50_iam_response_time.sql"
 
-_CONV = "main.raw_pipeline_conversation_messages"
+# Repointed 2026-06-30 from the retiring main.raw_pipeline_conversation_messages (which froze the
+# whole SLA chain at 2026-06-23) to the native, current core.email_message. Same shape
+# (ue_type 2=prospect reply, 3=our manual reply; thread_id; per-message timestamp), so only the
+# table + two column names (id->message_id, message_timestamp->message_at) change.
+_CONV = "core.email_message"
 
 _RESPONSE_BUCKET_SQL = """\
 CASE
@@ -79,16 +83,16 @@ def run(ctx: RunContext) -> PhaseResult:
         -- Distinct inbound prospect replies (dedupe exact dup rows from raw sync)
         inbound_src AS (
             SELECT DISTINCT
-                id                          AS email_id,
+                message_id                  AS email_id,
                 campaign_id,
                 lower(trim(lead_email))     AS lead_email,
                 thread_id,
-                message_timestamp           AS prospect_replied_at
+                message_at                  AS prospect_replied_at
             FROM {_CONV}
             WHERE ue_type = 2
               AND thread_id IS NOT NULL
               AND lead_email IS NOT NULL
-              AND message_timestamp IS NOT NULL
+              AND message_at IS NOT NULL
         ),
         inbound AS (
             SELECT
@@ -105,11 +109,11 @@ def run(ctx: RunContext) -> PhaseResult:
         ),
         -- IM manual outbound replies (ue_type=3)
         outbound AS (
-            SELECT thread_id, message_timestamp AS resp_ts
+            SELECT thread_id, message_at AS resp_ts
             FROM {_CONV}
             WHERE ue_type = 3
               AND thread_id IS NOT NULL
-              AND message_timestamp IS NOT NULL
+              AND message_at IS NOT NULL
         ),
         -- Next IM manual reply after each prospect reply in the same thread
         with_iam AS (

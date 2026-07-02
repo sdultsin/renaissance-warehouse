@@ -1,5 +1,15 @@
 #!/usr/bin/env python3
-"""WS-D — Phone backfill: enriched mobiles (comms Supabase) -> lead DB sidecar.
+"""DEPRECATED [2026-07-01] — do NOT run. Superseded by scripts/comms_phone_mirror_sync.py.
+
+This one-off backfilled comms.phone_enrichment hits into the RETIRED Supabase
+public.leads (frozen at the 2026-06-24 DuckDB cutover; its delta-sync to the
+mirror is disabled). Writing here is writing into a dead-end DB. The standing
+nightly comms->mirror sync (comms_phone_mirror_sync.py -> apply_phone_mirror_updates.sh,
+cron 23:05Z) now lands every paid-enrichment hit directly in the lead-mirror
+DuckDB — the master phone store ([[project_phone_truth_lead_mirror_20260701]]).
+Kept for provenance only.
+
+WS-D — Phone backfill: enriched mobiles (comms Supabase) -> lead DB sidecar.
 
 Today, enriched mobile numbers for Instantly/Sendivo opportunities live ONLY in the
 comms Supabase (``comms.phone_enrichment.mobile_e164``, pushed to Close) and are NEVER

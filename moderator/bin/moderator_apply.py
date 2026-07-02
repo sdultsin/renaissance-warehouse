@@ -39,6 +39,7 @@ import fcntl
 import hashlib
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,7 @@ import threading
 import time
 
 import moderator_common as mc
+import moderator_integrity_gate as _integrity_gate  # W1 post-apply integrity gate (dup unique _key)
 
 # Process-level serialization of apply-now. The service runs route handlers in a threadpool, so two
 # concurrent /apply-now calls (two editors, or the standing retry-every-minute rule) would share the
@@ -63,9 +65,12 @@ _APPLY_NOW_LOCK_WAIT_S = int(os.environ.get("MODERATOR_APPLY_NOW_LOCK_WAIT_S", "
 # the test profile / a relocation. Default = the prod droplet layout.
 PUBLISHER_PY = os.environ.get("MODERATOR_PUBLISHER_PY", "/opt/duckdb/bin/publisher.py")
 PUBLISHER_PYTHON = os.environ.get("MODERATOR_PUBLISHER_PYTHON", "/opt/duckdb/venv/bin/python")
-# Max seconds to let the promote run before we stop waiting on it (a full ~50GB copy is ~10 min;
-# give generous headroom). The apply has already committed by then — promote can be retried.
-PROMOTE_TIMEOUT_S = int(os.environ.get("MODERATOR_PROMOTE_TIMEOUT_S", "1200"))
+# Max seconds to let the promote run before we stop waiting on it. subprocess.run(timeout=) KILLS
+# the publisher child at this ceiling, so it must comfortably exceed the REAL copy time: the serving
+# snapshot is a full byte-copy of the warehouse — ~183GB ≈ 22 min as of 2026-07-01, and it grows —
+# so the old 1200s default killed every apply-now promote. The apply has already committed by then —
+# a killed promote can be retried.
+PROMOTE_TIMEOUT_S = int(os.environ.get("MODERATOR_PROMOTE_TIMEOUT_S", "3600"))
 # The warehouse repo checkout co-located on the box — its core/ package owns the apply tooth.
 WAREHOUSE_ROOT = mc.WAREHOUSE_ROOT
 
@@ -99,6 +104,27 @@ WRITE_LOCK_WAIT_S = int(os.environ.get("MODERATOR_WRITE_LOCK_WAIT_S", "1800"))
 # Requeue an apply_queue row stuck in 'applying' longer than this (an apply-now that died mid-run /
 # lost its PG conn before _finish). Reaped on the next apply-now entry so rows are never stranded.
 STALE_APPLYING_MIN = int(os.environ.get("MODERATOR_STALE_APPLYING_MIN", "30"))
+
+# ── box-sync drift guard (the silent-swallow fix) ────────────────────────────────────────────────
+# pull_first runs _git_pull_ff() to sync the box checkout to origin/main BEFORE the nightly rebuilds
+# from it. That helper is best-effort + NEVER raises — so when the box sits on a feature branch / dirty
+# / diverged tree (the 2026-06-27 fleet-wide divergence), the ff-only pull silently FAILS, apply-now
+# proceeds anyway, and the nightly keeps rebuilding from STALE code, silently dropping merged DDLs.
+# Nobody notices for days (it hid this exact failure for ~a week). This guard turns that silent swallow
+# into a LOUD, BLOCKING failure: after pull_first, ASSERT the box is on clean origin/main; if not,
+# auto-preserve the box state, alert #cc-sam, and BLOCK the apply (fail-closed) — never apply live while
+# the nightly stays stale. Override (advanced / local dev): MODERATOR_BOX_DRIFT_GUARD=off.
+_BOX_DRIFT_GUARD = os.environ.get("MODERATOR_BOX_DRIFT_GUARD", "enforce").strip().lower() \
+    not in ("off", "0", "false", "no", "")
+# Where to drop a human-readable snapshot of a drifted tree (best-effort recovery convenience).
+_BOX_DRIFT_RESCUE_DIR = os.environ.get("MODERATOR_BOX_DRIFT_RESCUE_DIR", "/root/box-drift-rescue")
+# Slack alert helper — the SAME durable channel + script the hourly divergence guard uses.
+_ALERT_SLACK_PY = os.environ.get("MODERATOR_ALERT_SLACK_PY",
+                                 os.path.join(WAREHOUSE_ROOT or "", "scripts", "alert_slack.py"))
+# Runtime-generated paths that are NOT real writer drift (mirrors warehouse_git_divergence_guard.sh's
+# noise filter) so the guard never false-blocks on logs / snapshots / backups / env / parquet / wt dir.
+_BOX_NOISE_RE = re.compile(
+    r'(^|/)(logs/|data/|\.worktrees/)|\.duckdb(\.wal)?$|\.bak[-.]|(^|/)\.env($|\.)|\.log$|\.parquet$|\.tmp$|\.beat$')
 
 
 # ── repo-commit binding helpers (apply==commit) ──────────────────────────────────────────────────
@@ -190,6 +216,91 @@ def _git_pull_ff() -> dict:
     except Exception:
         out["head_after"] = None
     return out
+
+
+def _box_is_noise(path: str) -> bool:
+    """True for a runtime-generated box path that is NOT real writer drift (logs/snapshots/backups/env)."""
+    return bool(_BOX_NOISE_RE.search(path.strip().strip('"')))
+
+
+def _box_sync_status() -> dict:
+    """Read-only: is the box checkout on CLEAN origin/main — the ONLY sanctioned runtime state? Returns
+    {clean, branch, head, ahead, behind, dirty, dirty_files, detail}. origin/main was just fetched by
+    _git_pull_ff(); we compare against it. FAIL-CLOSED: if git can't be consulted we return clean=False
+    (never declare a box we couldn't verify 'clean'). Never raises."""
+    st = {"clean": False, "branch": None, "head": None, "ahead": None, "behind": None,
+          "dirty": None, "dirty_files": [], "detail": None}
+    want_branch = _GIT_REF.split("/", 1)[1] if "/" in _GIT_REF else _GIT_REF  # origin/main -> main
+    try:
+        st["branch"] = _git(["rev-parse", "--abbrev-ref", "HEAD"]).stdout.decode("utf-8", "replace").strip()
+        st["head"] = _git(["rev-parse", "--short", "HEAD"]).stdout.decode("utf-8", "replace").strip()
+        st["ahead"] = int(_git(["rev-list", "--count", f"{_GIT_REF}..HEAD"]).stdout.decode().strip() or "0")
+        st["behind"] = int(_git(["rev-list", "--count", f"HEAD..{_GIT_REF}"]).stdout.decode().strip() or "0")
+        porc = _git(["status", "--porcelain"]).stdout.decode("utf-8", "replace").splitlines()
+        dirty = [ln for ln in porc if ln.strip() and not _box_is_noise(ln[3:] if len(ln) > 3 else ln)]
+        st["dirty"] = len(dirty)
+        st["dirty_files"] = [(ln[3:] if len(ln) > 3 else ln) for ln in dirty][:20]
+        st["clean"] = (st["branch"] == want_branch and st["ahead"] == 0
+                       and st["behind"] == 0 and st["dirty"] == 0)
+        st["detail"] = (f"branch={st['branch']}(want {want_branch}) head={st['head']} "
+                        f"ahead={st['ahead']} behind={st['behind']} dirty={st['dirty']}")
+    except Exception as e:  # noqa: BLE001 — git missing / timeout / repo error -> fail-closed
+        st["detail"] = f"box-sync check failed ({type(e).__name__}: {e}) — treating as NOT clean"
+        st["clean"] = False
+    return st
+
+
+def _auto_preserve_box_drift(drift: dict) -> dict:
+    """Best-effort, NON-DESTRUCTIVE preservation of a drifted box. The guard BLOCKS (it never resets),
+    so the working tree is left fully intact on disk — this only captures a recoverable snapshot so a
+    later human reconcile loses nothing and has an easy restore point: status + diff written to a
+    timestamped dir, and the dirty tracked state saved as a git stash-commit under a named ref. Never
+    raises, never mutates the working tree."""
+    out = {"snapshot_dir": None, "stash_ref": None, "detail": None}
+    try:
+        head = drift.get("head") or "unknown"
+        base = os.path.join(_BOX_DRIFT_RESCUE_DIR, head)
+        snap, n = base, 1
+        while os.path.exists(snap):
+            n += 1
+            snap = f"{base}-{n}"
+        os.makedirs(snap, exist_ok=True)
+        for name, args in (("status.txt", ["status", "-sb"]),
+                           ("branches.txt", ["branch", "-vv"]),
+                           ("working_tree.diff", ["diff", "HEAD"])):
+            try:
+                with open(os.path.join(snap, name), "wb") as fh:
+                    fh.write(_git(args, timeout=60).stdout)
+            except Exception:
+                pass
+        out["snapshot_dir"] = snap
+        try:  # capture tracked dirty changes into a stash commit object (no working-tree mutation) + ref it
+            sha = _git(["stash", "create", "moderator box-drift auto-preserve"],
+                       timeout=60).stdout.decode("utf-8", "replace").strip()
+            if sha:
+                ref = f"refs/box-drift-rescue/{head}-{n}"
+                _git(["update-ref", ref, sha], timeout=30)
+                out["stash_ref"] = f"{ref} ({sha[:12]})"
+        except Exception:
+            pass
+        out["detail"] = "box state preserved (working tree left intact; recover via snapshot_dir / stash_ref)"
+    except Exception as e:  # noqa: BLE001
+        out["detail"] = f"auto-preserve best-effort failed ({type(e).__name__}: {e}) — tree still intact on box"
+    return out
+
+
+def _alert_cc_sam(text: str) -> bool:
+    """Fire a Slack alert to the warehouse alert channel (#cc-sam) via the SAME scripts/alert_slack.py
+    the hourly divergence guard uses. alert_slack reads SLACK_TOKEN/SLACK_ALERT_CHANNEL from the env,
+    then falls back to the repo .env — so it works from the service even though the unit env omits them.
+    Never raises."""
+    try:
+        if not _ALERT_SLACK_PY or not os.path.exists(_ALERT_SLACK_PY):
+            return False
+        return subprocess.run([sys.executable, _ALERT_SLACK_PY, text],
+                              capture_output=True, timeout=30).returncode == 0
+    except Exception:
+        return False
 
 
 # ── the apply tooth (reuses core.db — the SAME path the nightly uses, under the writer flock) ─────
@@ -404,6 +515,19 @@ def _apply_one(core_db, db_path, conn, row) -> dict:
     safe_name = sql_file or f"{ddl_version}_apply_now.sql"
     if not safe_name.startswith(f"{ddl_version}_"):
         safe_name = f"{ddl_version}_{safe_name}"
+    # PRE-APPLY catalog snapshot for the W1 CATALOG-DELTA gate (FIX 1). apply_ddl_file COMMITs
+    # internally, so we MUST capture the per-table unique-on-_key index counts on THIS open writer conn
+    # BEFORE the apply call; the post-check then fails only on a table whose count INCREASED (a NEWLY
+    # introduced duplicate), regardless of how the index DDL was written (USING art, comments — the
+    # QA-D bypass), because the snapshot reads the live catalog (duckdb_indexes()), not the SQL text.
+    # Best-effort: a snapshot failure degrades to {} which the post-check treats as all-zero BEFORE,
+    # i.e. it falls back to the absolute "any dup is newly-introduced" stance (fail-closed, never a
+    # false-pass). Captured only when something will actually be applied is not knowable yet (apply is
+    # idempotent-by-version), so we always snapshot here — it is a cheap catalog read.
+    try:
+        pre_key_index_snapshot = _integrity_gate.snapshot_key_index_counts(conn)
+    except Exception:
+        pre_key_index_snapshot = {}
     with tempfile.TemporaryDirectory(prefix="moderator_apply_") as td:
         from pathlib import Path
         fpath = Path(td) / safe_name
@@ -415,6 +539,45 @@ def _apply_one(core_db, db_path, conn, row) -> dict:
                                "already-applied (version present in core.schema_version) — no-op"))
         except Exception as e:  # noqa: BLE001 — record the failure, keep other rows going.
             out.update(applied=False, status="failed", detail=f"{type(e).__name__}: {e}")
+            return out
+
+    # 4) POST-APPLY INTEGRITY GATE (W1): apply_ddl_file already COMMITted (db.py), so a failed
+    # post-check cannot auto-rollback the same BEGIN/ROLLBACK — instead we BLOCK the row (status
+    # 'failed', which gates the batch -> 207) and record+alert. We only run this when something was
+    # NEWLY applied (an already-applied no-op didn't change the schema). The check is SCOPED to the
+    # tables this DDL touched (raw_pipeline_* expands to the whole upsert blast-radius family) so the
+    # 9 PRE-EXISTING duplicate-index tables can't false-block an unrelated apply. conn is still the
+    # open writer (flock held), so the gate's core.schema_issue / review_learnings writes land in the
+    # SAME live DB + critical section. The gate never raises (returns a structured dict).
+    if out.get("status") == "committed" and out.get("applied"):
+        try:
+            scope = _integrity_gate.tables_touched_by_sql(content or "")
+            # CATALOG-DELTA mode: pass the pre-apply snapshot so the gate fails ONLY on a NEWLY
+            # introduced duplicate unique _key index (regex-independent — kills the QA-D USING/comment
+            # bypass on the apply path) and a pre-existing dup can't false-block. `tables=scope` is kept
+            # for the smoke-test/back-compat, but in delta mode the snapshot watches the whole upsert
+            # blast radius and the BEFORE/AFTER delta is what isolates this apply's effect.
+            gate = _integrity_gate.run_post_apply_integrity(
+                conn, tables=scope or None, ddl_file=safe_name, record=True, smoke_test=True,
+                pre_snapshot=pre_key_index_snapshot)
+            out["integrity_gate"] = {"ok": gate["ok"], "detail": gate["detail"],
+                                     "offenders": gate.get("offenders"),
+                                     "recorded_issues": gate.get("recorded_issues"),
+                                     "learning_appended": gate.get("learning_appended"),
+                                     "alerted": gate.get("alerted")}
+            if not gate["ok"]:
+                # The DDL is committed but it left the warehouse in the dup-unique-_key landmine state.
+                # Mark the row failed (blocks the batch -> 207) and surface the offending tables so a
+                # writer fixes it with a follow-up DROP INDEX (expand/contract) immediately.
+                out.update(applied=False, status="failed",
+                           detail="POST-APPLY INTEGRITY GATE BLOCKED this apply — " + gate["detail"]
+                                  + " — ship a follow-up DROP INDEX (expand/contract) so exactly one "
+                                    "unique index on (_key) remains, then re-gate.")
+        except Exception as e:  # noqa: BLE001 — a gate fault must not strand the row; fail CLOSED.
+            out.update(applied=False, status="failed",
+                       detail=f"post-apply integrity gate fault ({type(e).__name__}: {e}) — failing "
+                              f"closed; the DDL committed but could not be integrity-verified. Inspect "
+                              f"core.schema_issue / duckdb_indexes() for duplicate unique _key indexes.")
     return out
 
 
@@ -538,6 +701,36 @@ def _apply_now_impl(actor: str, max_items: int = 25, promote: bool = True,
 
     if pull_first:
         result["pull"] = _git_pull_ff()  # sync the box checkout to origin/main so the nightly keeps it
+        # GUARD (silent-swallow fix): _git_pull_ff never raises, so a diverged / dirty / feature-branch
+        # box would silently leave the nightly rebuilding from STALE code (the 2026-06-27 fleet-wide
+        # divergence that broke every ship). After the pull, ASSERT the box is on clean origin/main; if
+        # not, preserve the box state, alert #cc-sam, and BLOCK this apply (fail-closed) — never apply
+        # live while the nightly stays stale. Override (advanced): MODERATOR_BOX_DRIFT_GUARD=off.
+        if _BOX_DRIFT_GUARD:
+            drift = _box_sync_status()
+            result["box_sync"] = drift
+            if not drift.get("clean"):
+                result["box_sync"]["preserved"] = _auto_preserve_box_drift(drift)
+                snap_dir = (result["box_sync"]["preserved"] or {}).get("snapshot_dir")
+                msg = (":rotating_light: Warehouse SHIP BLOCKED — box NOT on clean origin/main after "
+                       f"pull-first ({drift.get('detail')}). The nightly would rebuild from STALE code "
+                       "(silent merged-DDL drop). apply-now HALTED (nothing applied this run); the box "
+                       f"working tree is left intact + snapshotted ({snap_dir}). FIX: reconcile the box "
+                       "to origin/main (handoffs/2026-06-28-warehouse-box-git-reconcile.md / "
+                       "GIT-SYNC-DISCIPLINE.md), then re-run. Override: MODERATOR_BOX_DRIFT_GUARD=off.")
+                result["box_sync"]["alerted_cc_sam"] = _alert_cc_sam(msg)
+                mc.log_event("apply_now_box_drift_blocked", actor=actor,
+                             drift=drift.get("detail"),
+                             preserved=result["box_sync"]["preserved"],
+                             alerted=result["box_sync"]["alerted_cc_sam"])
+                result["ok"] = False
+                result["error"] = ("BOX NOT ON CLEAN origin/main after pull-first — apply BLOCKED so the "
+                                   "nightly can't silently rebuild from stale code "
+                                   f"({drift.get('detail')}). Box state preserved + #cc-sam alerted; "
+                                   "reconcile the box to origin/main, then re-run.")
+                result["freshness"] = _snapshot_freshness()
+                result["elapsed_s"] = round(time.time() - t0, 1)
+                return result
 
     reaped = _reap_stale_applying()
     if reaped:

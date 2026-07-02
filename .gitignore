@@ -56,3 +56,16 @@ backups/
 
 # Drift-guard machine state (warehouse_drift_guard.sh). Not source.
 .drift_baseline
+
+# email-thread-sync per-run rollback manifests (entities/email_thread_sync.py writes these into
+# core/ for G7). Generated artifacts, not source — keep them from dirtying the box working tree
+# (an untracked file there blocks moderator apply-now's clean-check + trips the drift guard).
+core/email_thread_manifest_*.txt
+
+# Scratch/test copies of the daily-report renderer used during dev (render_daily.py is the source).
+# An untracked copy in scripts/ blocks moderator apply-now's clean-check + trips the drift guard
+# (same reason as the email_thread_manifest entries above).
+scripts/_render_daily_test.py
+scripts/_render_daily_v2.py
+scripts/_*_probe*.py
+scripts/_probe*.py

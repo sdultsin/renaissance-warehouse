@@ -16,9 +16,12 @@ SEMANTICS (table now holds exactly two snapshot generations):
     each run deletes any prior live snapshot(s) and inserts a fresh full pull (~40k rows).
 Consumers wanting current state read WHERE _snapshot_date = (SELECT max(_snapshot_date) …).
 
-SOURCE: PostgREST on the bookings-portal Supabase project, table im_bookings, paged by id
-(publishable / anon-role key — RLS-gated read). Credentials from .env:
-  IM_BOOKINGS_SUPABASE_URL / IM_BOOKINGS_SUPABASE_ANON_KEY
+SOURCE: PostgREST on the bookings-portal Supabase project, table im_bookings, paged by id.
+Credentials from .env: IM_BOOKINGS_SUPABASE_URL + a key. The portal's `anon` role lost its
+SELECT GRANT on im_bookings ~2026-06-29 (direct reads now 401 "permission denied for table
+im_bookings"), so we prefer the project SERVICE-ROLE key (IM_BOOKINGS_SUPABASE_SERVICE_ROLE_KEY)
+and fall back to the legacy anon key (IM_BOOKINGS_SUPABASE_ANON_KEY) only if it is restored.
+Service-role bypasses RLS — used read-only here.
 
 SAFETY: the portal table only ever grows (~40.7k rows on 2026-06-09). If a pull returns
 fewer than MIN_EXPECTED_ROWS (key rotated? RLS changed? portal truncated?) we raise WITHOUT
@@ -44,12 +47,24 @@ FROZEN_SNAPSHOT_DATE = "2026-05-31"      # the one-time analysis freeze — neve
 SOURCE_TAG = "portal_im_bookings_nightly"
 MIN_EXPECTED_ROWS = 36_000               # portal is append-mostly; below this = broken pull
 
-# Column order must match sql/ddl/27_raw_im_bookings.sql (the 22 source cols, in table order).
+# Source columns mirrored verbatim. The INSERT lists columns explicitly, so this is the set of
+# im_bookings keys to pull (order need only match the payload build below, not the table). The
+# original 22 cols are in sql/ddl/27_raw_im_bookings.sql; the booking-SLOT + lifecycle cols
+# (meeting_date/time/tz, created_at, deleted_at, lead_type, subject_line) are added in DDL 1048 and
+# feed core.v_meeting_reminders.meeting_slot_at; the channel + provenance cols (channel, source,
+# booking_id, industry, inbox_manager_email) are added in DDL 1054 and feed the core.meeting Funding
+# rewire (>=2026-06-29 sources from im_bookings; the Funding-Form Sheet is retired). Unknown-to-source
+# keys come back as NULL (.get) — harmless on historical rows that predate a column.
 SOURCE_COLUMNS = [
     "id", "type", "date", "offer", "partner", "advisor", "owner_name", "company",
     "first_name", "last_name", "email", "phone", "job_title", "num_employees",
     "annual_revenue", "workspace", "our_email", "campaign", "status", "inbox_manager",
     "campaign_manager", "interested_in",
+    # booking-slot + lifecycle (DDL 1048) — the reminder-time source:
+    "meeting_date", "meeting_time", "meeting_tz", "created_at", "deleted_at",
+    "lead_type", "subject_line",
+    # channel + provenance (DDL 1054) — the core.meeting Funding-rewire source:
+    "channel", "source", "booking_id", "industry", "inbox_manager_email",
 ]
 
 
@@ -83,9 +98,11 @@ def _fetch_all(base_url: str, anon_key: str) -> list[dict]:
 def run(ctx: RunContext) -> PhaseResult:
     db = ctx.db
     base_url = ctx.credentials.require("IM_BOOKINGS_SUPABASE_URL").rstrip("/")
-    anon_key = ctx.credentials.require("IM_BOOKINGS_SUPABASE_ANON_KEY")
+    # Prefer the service-role key (anon SELECT was revoked ~2026-06-29); fall back to anon if restored.
+    api_key = (ctx.credentials.optional("IM_BOOKINGS_SUPABASE_SERVICE_ROLE_KEY")
+               or ctx.credentials.require("IM_BOOKINGS_SUPABASE_ANON_KEY"))
 
-    rows = _fetch_all(base_url, anon_key)
+    rows = _fetch_all(base_url, api_key)
     logger.info("fetched %d im_bookings rows from portal", len(rows))
     if len(rows) < MIN_EXPECTED_ROWS:
         # Fail LOUD, write nothing — keep last-known-good live snapshot.
@@ -93,6 +110,50 @@ def run(ctx: RunContext) -> PhaseResult:
             f"im_bookings pull returned {len(rows)} rows (< floor {MIN_EXPECTED_ROWS}) — "
             "key/RLS/portal problem? Refusing to replace the live snapshot."
         )
+
+    # --- Regression guard (2026-06-30) -------------------------------------------------
+    # The MIN_EXPECTED_ROWS floor above only catches a near-empty pull. On 2026-06-30 the
+    # portal was transiently reseeded from a stale ~2026-06-02 export mid-migration: rowcount
+    # stayed ~40.7k (ABOVE the floor) but the newest booking date rolled back ~4 weeks, so the
+    # floor missed it and the nightly mirror would have clobbered the good snapshot. Refuse to
+    # replace the live snapshot when the incoming pull REGRESSES versus the current one — either
+    # the newest booking date goes backwards, or rowcount drops materially. Fail LOUD, write
+    # nothing, keep last-known-good (same contract as the floor guard above).
+    def _max_date(rs):
+        best = None
+        for r in rs:
+            v = r.get("date")
+            if not v:
+                continue
+            s = str(v)[:10]
+            if s > "2027-01-01":          # ignore far-future typos so they can't mask a regress
+                continue
+            if best is None or s > best:
+                best = s
+        return best
+
+    prev_rows, prev_max = db.execute(
+        "SELECT count(*), max(try_cast(date AS DATE)) "
+        "FILTER (WHERE try_cast(date AS DATE) < DATE '2027-01-01') "
+        "FROM raw_im_bookings WHERE _source = ?",
+        [SOURCE_TAG],
+    ).fetchone()
+    prev_rows = prev_rows or 0
+    prev_max = prev_max.isoformat() if prev_max else None
+    new_max = _max_date(rows)
+    if prev_rows:  # only guard once a live baseline exists
+        if prev_max and (new_max is None or new_max < prev_max):
+            raise RuntimeError(
+                f"im_bookings pull REGRESSED newest booking date {prev_max} -> {new_max} "
+                f"(rows {prev_rows} -> {len(rows)}) while above the row floor — likely a stale "
+                "or partial portal reseed (cf. 2026-06-30 mid-migration). Refusing to replace "
+                "the live snapshot."
+            )
+        if len(rows) < prev_rows * 0.97:
+            raise RuntimeError(
+                f"im_bookings pull rowcount collapsed {prev_rows} -> {len(rows)} (>3% drop) "
+                "while above the absolute floor. Refusing to replace the live snapshot."
+            )
 
     snapshot_date = datetime.now(timezone.utc).date().isoformat()
     loaded_at = datetime.now(timezone.utc)

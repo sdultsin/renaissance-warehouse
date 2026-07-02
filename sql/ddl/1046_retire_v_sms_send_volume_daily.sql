@@ -1,0 +1,15 @@
+-- Retire main.v_sms_send_volume_daily — redundant SMS-volume view. Version 1046.
+-- @gate: drop
+-- Depends on 1042
+--
+-- WHY: shipped 2026-06-29 (DDL 1042) as "the canonical SMS volume", but main.v_sms_campaign_performance
+-- ALREADY provides the same (metric_date x campaign x sub_account) daily volume via its `sent` column
+-- (latest-run-deduped) PLUS delivered/failed/replies/opt_outs/rates, and it reconciles to Grace
+-- identically (06-24=687,481 / 06-25=748,364 / 06-26=1,183,122 / 06-27=758,454). Two "canonical" volume
+-- views is exactly the fragmentation the warehouse tickets flag, so we retire the redundant one.
+-- v_sms_send_volume_daily has NO consumers (verified: only its own DDL referenced it). The accompanying
+-- sendivo_sms_logs_watchdog fix (PR #96) stays — that was the real B1 fix.
+--
+-- CANONICAL SMS VOLUME GOING FORWARD = main.v_sms_campaign_performance (.sent), with
+-- main.v_sms_sends_by_offer for the Funding-vs-IPO split.
+DROP VIEW IF EXISTS main.v_sms_send_volume_daily;

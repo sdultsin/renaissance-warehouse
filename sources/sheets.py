@@ -46,6 +46,8 @@ DOMAIN_TECH_SHEET_ID = "1bGj5bPyyGHg6eY6nRrkfXzTed44L0qHWhf8-4-gLlqM"
 BLACKLIST_SHEET_ID = "1fKqwQkEy4vRDYIrj7bq13aUZdTxBhjvKVRXbU1bXf6o"
 OTD_SHEET_ID = "1lRbIk1TvQyBkU9W-aTmI9iKIvY4IcnfWqOPxz4pVTm4"  # OTD account statement (billing)
 FUNDING_FORM_SHEET_ID = "1vaExhxu319o2CSoQtjWRV49lq5GowOeJzo1_GHXIIqM"  # Funding-Form: meetings source >= 2026-06-01
+SUMMIT_VENTURES_SHEET_ID = "1oKlY_2qI-p0oH4d8UAOE3GpceiFU4OIWx1aDAM5RzRY"   # Summit Ventures - Leads (SMS Pre-IPO bookings)
+COLLINS_PREIPO_SHEET_ID  = "1IZzmCXtbtrpZYbxuU1qkxoOkITL4zmP2In6glpffmYw"   # Collins Investment Partners - Leads (Pre-IPO bookings)
 
 # (table_name, spreadsheet_id, tab_name, csv_filename)
 #
@@ -73,6 +75,12 @@ SHEET_TABS = [
     # Funding-Form meetings source (added 2026-06-13, WS-E meetings re-platform). Canonical source
     # for core.meeting >= 2026-06-01. Producer: scripts/stage_funding_form.py (Mac; google-sheets token).
     ("raw_sheets_funding_form_data",    FUNDING_FORM_SHEET_ID, "Data", "funding_form__Data.csv"),
+    # Pre-IPO partner booking desks (added 2026-06-25). Project into core.meeting as offer='Pre-IPO'
+    # partner-sheet rows (entities/meeting.py). Producer: scripts/stage_partner_booking_sheets.py (Mac).
+    # Collins Sheet2 ("Email more info") is a name->email enrichment supplement, NOT a booking source,
+    # and is intentionally not registered.
+    ("raw_sheets_summit_ventures_leads", SUMMIT_VENTURES_SHEET_ID, "Sheet1",  "summit_ventures__Sheet1.csv"),
+    ("raw_sheets_collins_preipo_leads",  COLLINS_PREIPO_SHEET_ID,  "Collins", "collins_preipo__Collins.csv"),
 ]
 
 

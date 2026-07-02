@@ -29,26 +29,74 @@ logger = logging.getLogger("entities.reply_canonical")
 
 _DDL = REPO_ROOT / "sql" / "ddl" / "43_reply_intent.sql"
 
-# Heuristic auto-reply detector (raw_instantly_email has no native auto flag; ue_type is
-# constant 2 = "received"). Mirrors the kind of signal the dead pipeline classifier's
-# `label_auto`/`body_auto` produced. Lower-cased LIKE match over subject || ' ' || reply_text.
+# Row-level non-human / non-positive classifiers (raw_instantly_email has no clean native auto
+# flag; ue_type is constant 2 = "received", and Instantly's per-message i_status sentinels
+# correlate only ~33-45% with auto text so they're too noisy to trust as a blanket flag — see
+# the 2026-06-28 reply-pipe remediation calibration). We match HTML-STRIPPED text, because
+# reply_text is frequently raw HTML and ~87% of replies carry quoted prior-email history.
+#
+#  * is_auto_reply  — OOO / autoresponder / bounce. Matched over subject + the first ~1500 chars
+#                     of the stripped body (these signatures sit at the top of the message). The
+#                     quoted footer does NOT pollute this (calibration: raw 4.57% == de-quoted
+#                     4.56%). ~4.6% of the reply store, up from the old ~2.6% bare-LIKE heuristic.
+#  * is_unsubscribe — the LEAD asking to be removed ("unsubscribe me", "stop emailing me", "take
+#                     me off your list"). A human action but NOT a positive reply, so it must be
+#                     netted out of human-reply / positive KPIs separately from auto. Matched over
+#                     subject + only the lead's OPENER (first ~200 chars of stripped body): the
+#                     lead's actual words are at the top, while OUR outbound unsubscribe-link
+#                     footer is below the quote — matching the full body would over-fire on that
+#                     footer (~16-22% of all replies contain the word). ~15% of the reply store.
+#
+# NOTE the old QA "~60% auto" figure counts BOUNCES that Instantly tracks but never returns from
+# /emails (they are not in this store at all), and its "≥10.6% false-human via unsubscribe" was
+# itself inflated by the quoted footer — see calibration. The honest in-store rates are the above.
 _AUTO_PATTERNS = [
     "out of office", "out of the office", "automatic reply", "auto-reply", "autoreply",
-    "auto reply", "on vacation", "annual leave", "away from my desk", "currently away",
-    "away from the office", "i am currently out", "i'm currently out", "will be out of",
-    "delivery has failed", "undeliverable", "mail delivery", "address not found",
-    "could not be delivered", "message blocked", "no longer with", "no longer employed",
-    "has left the company", "thank you for your email and i will",
+    "auto reply", "on vacation", "annual leave", "parental leave", "maternity leave",
+    "medical leave", "sick leave", "on leave", "away from my desk", "currently away",
+    "away from the office", "i am currently out", "i'm currently out", "i am out of the office",
+    "i will be out", "will be out of", "delivery has failed", "undeliverable", "mail delivery",
+    "address not found", "could not be delivered", "message blocked", "message undelivered",
+    "mailer-daemon", "mailer daemon", "delivery status notification", "failure notice",
+    "returned mail", "mailbox full", "quota exceeded", "no longer with", "no longer employed",
+    "has left the company", "this is an automated", "automated response", "automated message",
+    "do not reply", "do-not-reply", "donotreply", "vacation responder",
+    "thank you for your email and i will",
+]
+
+# Lead-initiated removal requests. Tight imperatives a human types; matched on the opener only.
+_UNSUB_PATTERNS = [
+    "unsubscribe", "please remove me", "remove me from", "take me off", "opt me out",
+    "stop emailing", "do not contact me", "do not email me", "remove from your list",
+    "remove from this list",
 ]
 
 
-def _auto_reply_sql(subj: str, body: str) -> str:
-    """SQL boolean expression: true if the subject/body looks like an autoresponder/bounce."""
-    blob = f"lower(coalesce({subj},'') || ' ' || coalesce({body},''))"
+def _clean_blob(subj: str, body: str, limit: int) -> str:
+    """lower( ws-collapsed( html-stripped( subject + ' ' + first `limit` chars of body ) ) ).
+    Bounds the regexp cost per row (some bodies are 100KB+ of HTML) while keeping the signal,
+    which lives near the top of the message."""
+    raw = f"coalesce({subj},'') || ' ' || substr(coalesce({body},''), 1, {limit})"
+    stripped = f"regexp_replace({raw}, '<[^>]+>', ' ', 'g')"
+    collapsed = f"regexp_replace({stripped}, '\\s+', ' ', 'g')"
+    return f"lower({collapsed})"
+
+
+def _like_any(blob: str, patterns: list[str]) -> str:
     likes = " OR ".join(
-        f"{blob} LIKE '%{p.replace(chr(39), chr(39) * 2)}%'" for p in _AUTO_PATTERNS
+        f"{blob} LIKE '%{p.replace(chr(39), chr(39) * 2)}%'" for p in patterns
     )
     return f"({likes})"
+
+
+def _auto_reply_sql(subj: str, body: str) -> str:
+    """SQL bool: looks like an autoresponder / OOO / bounce (subject + first 1500 chars)."""
+    return _like_any(_clean_blob(subj, body, 1500), _AUTO_PATTERNS)
+
+
+def _unsubscribe_sql(subj: str, body: str) -> str:
+    """SQL bool: the lead is asking to be removed (subject + opener only — avoids our footer)."""
+    return _like_any(_clean_blob(subj, body, 200), _UNSUB_PATTERNS)
 
 
 def _has_view(db, name: str) -> bool:
@@ -98,8 +146,8 @@ def run(ctx: RunContext) -> PhaseResult:
 
     logger.info("variant recovery: %s", variant_note)
 
-    auto_instantly = _auto_reply_sql("subject", "reply_text")
-    auto_pipeline = _auto_reply_sql("subject", "reply_text")
+    auto_sql = _auto_reply_sql("subject", "reply_text")
+    unsub_sql = _unsubscribe_sql("subject", "reply_text")
 
     # --- rebuild ---
     # NOTE: the `eaccount` column is added by sql/ddl/48_reply_eaccount.sql (a SEPARATE
@@ -119,7 +167,8 @@ def run(ctx: RunContext) -> PhaseResult:
         f"""
         INSERT INTO core.reply
             (reply_id, lead_email, campaign_id, workspace_id, step, variant, eaccount,
-             subject, reply_text, reply_timestamp, is_auto_reply, source, _loaded_at, _run_id)
+             subject, reply_text, reply_timestamp, is_auto_reply, is_unsubscribe, source,
+             _loaded_at, _run_id)
         WITH inst AS (
             SELECT
                 i.email_id,
@@ -135,7 +184,8 @@ def run(ctx: RunContext) -> PhaseResult:
                 END                                             AS variant,
                 i.eaccount,
                 i.subject, i.reply_text, i.reply_timestamp,
-                {auto_instantly}                                AS is_auto_reply
+                {auto_sql}                                      AS is_auto_reply,
+                {unsub_sql}                                     AS is_unsubscribe
             FROM raw_instantly_email i
             WHERE i.lead_email IS NOT NULL AND trim(i.lead_email) <> ''
             QUALIFY row_number() OVER (
@@ -144,7 +194,7 @@ def run(ctx: RunContext) -> PhaseResult:
         )
         SELECT
             email_id, lead_email, campaign_id, workspace_id, step, variant, eaccount,
-            subject, reply_text, reply_timestamp, is_auto_reply,
+            subject, reply_text, reply_timestamp, is_auto_reply, is_unsubscribe,
             'instantly', now(), ?
         FROM inst
         """,
@@ -159,14 +209,16 @@ def run(ctx: RunContext) -> PhaseResult:
         f"""
         INSERT INTO core.reply
             (reply_id, lead_email, campaign_id, workspace_id, step, variant, eaccount,
-             subject, reply_text, reply_timestamp, is_auto_reply, source, _loaded_at, _run_id)
+             subject, reply_text, reply_timestamp, is_auto_reply, is_unsubscribe, source,
+             _loaded_at, _run_id)
         WITH pipe AS (
             SELECT
                 lower(trim(p.lead_email))                       AS lead_email,
                 p.campaign_id, p.workspace_id, p.step,
                 CAST(p.variant AS VARCHAR)                      AS variant,
                 p.subject, p.reply_text, p.reply_timestamp,
-                {auto_pipeline}                                 AS is_auto_reply
+                {auto_sql}                                      AS is_auto_reply,
+                {unsub_sql}                                     AS is_unsubscribe
             FROM raw_pipeline_reply_data p
             WHERE p.lead_email IS NOT NULL AND trim(p.lead_email) <> ''
               AND NOT EXISTS (
@@ -182,7 +234,7 @@ def run(ctx: RunContext) -> PhaseResult:
         SELECT
             md5(lead_email || '|' || coalesce(CAST(reply_timestamp AS VARCHAR), '')) AS reply_id,
             lead_email, campaign_id, workspace_id, step, variant, NULL AS eaccount,
-            subject, reply_text, reply_timestamp, is_auto_reply,
+            subject, reply_text, reply_timestamp, is_auto_reply, is_unsubscribe,
             'pipeline', now(), ?
         FROM pipe
         """,
@@ -196,6 +248,9 @@ def run(ctx: RunContext) -> PhaseResult:
     auto_n = db.execute(
         "SELECT count(*) FROM core.reply WHERE is_auto_reply"
     ).fetchone()[0]
+    unsub_n = db.execute(
+        "SELECT count(*) FROM core.reply WHERE is_unsubscribe"
+    ).fetchone()[0]
     # exact-dup guard (must be 0)
     dups = db.execute(
         "SELECT count(*) FROM (SELECT lead_email, reply_timestamp, count(*) c "
@@ -203,8 +258,8 @@ def run(ctx: RunContext) -> PhaseResult:
     ).fetchone()[0]
 
     logger.info(
-        "core.reply rebuilt: %d total (%s), auto=%d, cross-source dup groups=%d",
-        total, by_source, auto_n, dups,
+        "core.reply rebuilt: %d total (%s), auto=%d, unsubscribe=%d, cross-source dup groups=%d",
+        total, by_source, auto_n, unsub_n, dups,
     )
 
     return PhaseResult(
@@ -213,6 +268,7 @@ def run(ctx: RunContext) -> PhaseResult:
         notes={
             "by_source": by_source,
             "auto_reply": auto_n,
+            "unsubscribe": unsub_n,
             "variant_recovery": variant_note,
             "dup_groups": dups,
         },

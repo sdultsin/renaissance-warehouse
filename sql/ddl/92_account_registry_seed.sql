@@ -1,21 +1,21 @@
--- Version 92 (2026-06-20) — core.account_registry: formalize and fully seed from
--- FINAL DATA - ALL.csv (2,656,099 rows, one row per sending account email address).
+-- Version 92 (2026-06-20; SEED NEUTRALIZED 2026-06-24) — core.account_registry schema.
 --
--- History: the table was created ad-hoc before DDL tracking; it existed in the
--- warehouse with 158,772 rows (MailIn + MilkBox only, no DDL record). This file
--- formalizes the schema and upserts the full fleet from seed_data/final_data_registry.csv.
+-- History: the table was created ad-hoc before DDL tracking (158,772 MailIn+MilkBox rows). This file
+-- formalized the schema and, originally, one-time-seeded the full fleet from
+-- seed_data/final_data_registry.csv (2.65M rows).
 --
--- Columns sourced from FINAL DATA: email, domain, rg_tag (RG# Tag), vendor (Provider Tag),
--- batch_tag, workspace_label. The remaining columns (first_name, last_name, gender,
--- inbox_type, panel, offer, cohort, source_tab, email_tag, rg_range, status) are
--- preserved from existing rows via COALESCE — they are populated by other pipelines
--- and must not be overwritten with NULL.
+-- WHY THE SEED IS REMOVED (2026-06-24, box owner): `seed_data/final_data_registry.csv` is GONE — not
+-- in the repo, not on the box, not in any archive — and the seed never landed (account_registry has
+-- only the 158,772 ad-hoc rows, never 2.65M). The original `read_csv_auto('…final_data_registry.csv')`
+-- with a `WHERE glob(...) > 0` guard does NOT work: DuckDB binds/opens the read_csv in the FROM clause
+-- BEFORE the WHERE is evaluated, so a missing file throws `IO Error: No files found …` and the whole
+-- statement fails. That failure killed `setup_db` here every nightly since 2026-06-20, blocking every
+-- DDL that sorts after it from applying via the nightly. The table is maintained by
+-- scripts/load_account_registry.py (DDL 79) + downstream pipelines, so the one-time CSV seed is dead
+-- weight. If the 2.65M seed is ever needed again, restore the CSV and add it as a NEW versioned DDL
+-- (a working "seed if present" needs conditional logic plain SQL DDL can't express in one statement).
 --
--- Conflict strategy: ON CONFLICT (email) DO UPDATE with COALESCE so that:
---   - warehouse value always wins: existing non-null values are never overwritten.
---   - FINAL DATA fills in only when the warehouse column is NULL.
---   - All other columns are untouched (excluded.* is NULL for those).
---   - _staged_at is always refreshed.
+-- This DDL is now purely the idempotent table definition — always succeeds, applies cleanly.
 --
 -- @gate: add
 
@@ -42,22 +42,3 @@ CREATE TABLE IF NOT EXISTS core.account_registry (
     _staged_at       TIMESTAMPTZ,
     PRIMARY KEY (email)
 );
-
-INSERT INTO core.account_registry (email, domain, rg_tag, vendor, batch_tag, workspace_label, _staged_at)
-SELECT
-    email,
-    NULLIF(domain, '')          AS domain,
-    NULLIF(rg_tag, '')          AS rg_tag,
-    NULLIF(vendor, '')          AS vendor,
-    NULLIF(batch_tag, '')       AS batch_tag,
-    NULLIF(workspace_label, '') AS workspace_label,
-    now()                       AS _staged_at
-FROM read_csv_auto('seed_data/final_data_registry.csv', header=true, nullstr='')
-WHERE (SELECT count(*) FROM glob('seed_data/final_data_registry.csv')) > 0
-ON CONFLICT (email) DO UPDATE SET
-    domain          = COALESCE(core.account_registry.domain,          NULLIF(excluded.domain, '')),
-    rg_tag          = COALESCE(core.account_registry.rg_tag,          NULLIF(excluded.rg_tag, '')),
-    vendor          = COALESCE(core.account_registry.vendor,          NULLIF(excluded.vendor, '')),
-    batch_tag       = COALESCE(core.account_registry.batch_tag,       NULLIF(excluded.batch_tag, '')),
-    workspace_label = COALESCE(core.account_registry.workspace_label, NULLIF(excluded.workspace_label, '')),
-    _staged_at      = excluded._staged_at;

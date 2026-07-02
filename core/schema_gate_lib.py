@@ -96,17 +96,193 @@ _RE_ADD_COL = re.compile(
     r"(?P<col>[\w\"]+)\s+(?P<rest>[^,;)]*)",
     re.IGNORECASE,
 )
+# CREATE [UNIQUE] INDEX [IF NOT EXISTS] <name> ON [schema.]<tbl> [USING <method>] (<cols>). Captures
+# uniqueness + IF-NOT-EXISTS + index name + table + the parenthesised column list, so the floor can
+# apply the expand/contract rule to an index "rename" (a new UNIQUE index on a column that already
+# has one).
+#
+# QA-D BYPASS HARDENING (2026-06-26): DuckDB 1.5.3 accepts an optional `USING <method>` clause AND
+# SQL comments BETWEEN the table name and the "(cols)" column list — e.g.
+#   `CREATE UNIQUE INDEX uxk ON raw_pipeline_scratch USING art (_key);`
+#   `CREATE UNIQUE INDEX uxk ON raw_pipeline_scratch /*c*/ (_key);`
+# The old regex required "(" to be adjacent to <tbl> (only \s* between), so BOTH forms slipped past
+# the floor and created a 2nd unique index on _key undetected. We now (1) strip SQL comments before
+# classifying index DDL (see _strip_sql_comments / classify_ddl), and (2) allow an optional
+# `USING <method>` clause and arbitrary whitespace/newlines between <tbl> and "(". The table name is
+# matched with the explicit-newline-safe whitespace class so a column list on a following line is
+# still captured. (\s already spans newlines in Python re; no re.DOTALL is needed because the cols
+# body uses [^)]* which also spans lines.)
+_RE_CREATE_INDEX = re.compile(
+    r"\bCREATE\s+(?P<unique>UNIQUE\s+)?INDEX\s+(?P<ine>IF\s+NOT\s+EXISTS\s+)?"
+    r"(?P<name>[\w.\"]+)\s+ON\s+(?P<tbl>[\w.\"]+)"
+    r"(?:\s+USING\s+(?P<method>[\w\"]+))?"   # optional access method (USING art / USING hnsw / ...)
+    r"\s*\((?P<cols>[^)]*)\)",
+    re.IGNORECASE,
+)
+# DROP INDEX [IF EXISTS] <name> — so the floor can see whether an index "rename" pairs its new
+# CREATE with a DROP of the old index in the SAME diff (expand/contract) or leaves a duplicate.
+_RE_DROP_INDEX = re.compile(
+    r"\bDROP\s+INDEX\s+(?:IF\s+EXISTS\s+)?(?P<name>[\w.\"]+)",
+    re.IGNORECASE,
+)
+
+# ── BYPASS-1 HARDENING (2026-06-26): inline / ALTER UNIQUE & PRIMARY KEY constraints ─────────────
+# A unique enforcement on `_key` does NOT have to be a CREATE UNIQUE INDEX. DuckDB also enforces it
+# via a UNIQUE / PRIMARY KEY *constraint* — and a constraint-backed enforcement is INVISIBLE to a
+# duckdb_indexes()-only check (it lives in duckdb_constraints()). So:
+#   CREATE TABLE raw_pipeline_x (_key VARCHAR NOT NULL UNIQUE, ...);
+#   CREATE UNIQUE INDEX uxk_x ON raw_pipeline_x(_key);
+# yields TWO enforcements on _key (Bypass 1). The floor must SEE the inline UNIQUE/PRIMARY KEY so it
+# can apply the same dup-enforcement rule. We surface two shapes:
+#   (1) an inline column constraint inside CREATE TABLE: `<col> <type> ... UNIQUE`/`PRIMARY KEY`
+#   (2) a table-level constraint (inline in CREATE TABLE or via ALTER ... ADD [CONSTRAINT n] ...):
+#         `UNIQUE (<col>)` / `PRIMARY KEY (<col>)`
+# Each is emitted as a synthetic create_unique_index DDLOp (column = the single constrained column),
+# carrying a "constraint:" marker in `new_name` so the floor knows there is no DROP-INDEX rename to
+# pair and so W1 (catalog-delta) is the authoritative backstop. Composite constraints (>1 column) do
+# NOT enforce single-column uniqueness on _key and are intentionally skipped.
+_RE_CREATE_TABLE_HEAD = re.compile(
+    r"\bCREATE\s+(?:OR\s+REPLACE\s+)?TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?P<tbl>[\w.\"]+)\s*\(",
+    re.IGNORECASE,
+)
+# table-level `UNIQUE (cols)` / `PRIMARY KEY (cols)` (optionally `CONSTRAINT name` prefixed).
+_RE_TABLE_CONSTRAINT = re.compile(
+    r"(?:\bCONSTRAINT\s+[\w\"]+\s+)?\b(?P<kind>UNIQUE|PRIMARY\s+KEY)\s*\((?P<cols>[^)]*)\)",
+    re.IGNORECASE,
+)
+# inline column-level constraint: `<col> <rest-up-to-comma> UNIQUE|PRIMARY KEY` (single column).
+# We scan each top-level column definition; an inline UNIQUE / PRIMARY KEY keyword (NOT followed by
+# "(", which would make it a table-level constraint) marks the column as uniquely enforced.
+_RE_INLINE_COL_DEF = re.compile(r"^\s*(?P<col>[\w\"]+)\s+(?P<rest>.*)$", re.IGNORECASE | re.DOTALL)
+_RE_INLINE_UNIQUE_KW = re.compile(r"\b(?:UNIQUE|PRIMARY\s+KEY)\b(?!\s*\()", re.IGNORECASE)
+# ALTER TABLE <tbl> ADD [CONSTRAINT n] UNIQUE|PRIMARY KEY (cols)
+_RE_ALTER_ADD_CONSTRAINT = re.compile(
+    r"\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?P<tbl>[\w.\"]+)\s+ADD\s+"
+    r"(?:CONSTRAINT\s+[\w\"]+\s+)?(?P<kind>UNIQUE|PRIMARY\s+KEY)\s*\((?P<cols>[^)]*)\)",
+    re.IGNORECASE,
+)
+
+
+def _split_top_level_commas(body: str) -> list[str]:
+    """Split a CREATE TABLE body on top-level commas (ignoring commas inside parentheses), so each
+    element is one column-definition or table-level constraint clause."""
+    parts: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for ch in body:
+        if ch == "(":
+            depth += 1
+            cur.append(ch)
+        elif ch == ")":
+            depth -= 1
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(cur))
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        parts.append("".join(cur))
+    return parts
+
+
+def _matched_paren_body(sql: str, open_idx: int) -> tuple[str, int]:
+    """Given the index of an opening '(' in `sql`, return (body_without_outer_parens, index_after_close).
+    Returns ('', open_idx) if unbalanced."""
+    depth = 0
+    for i in range(open_idx, len(sql)):
+        if sql[i] == "(":
+            depth += 1
+        elif sql[i] == ")":
+            depth -= 1
+            if depth == 0:
+                return sql[open_idx + 1:i], i + 1
+    return "", open_idx
+
+
+_CONSTRAINT_KEYWORDS = ("primary", "foreign", "unique", "check", "constraint", "key", "references")
+
+
+def _constraint_unique_ops(sql: str) -> list["DDLOp"]:
+    """Extract synthetic create_unique_index DDLOps for single-column UNIQUE / PRIMARY KEY enforcement
+    introduced by an inline CREATE TABLE constraint OR an ALTER TABLE ADD CONSTRAINT (Bypass 1). Each
+    op's `new_name` is a `constraint:<kind>` marker (there is no index name / DROP-able old index to
+    pair), `column` is the single constrained column, `extra` is the column name, classification is
+    `UNIQUE-CONSTRAINT`. Comments are stripped length-preservingly so reported lines stay exact."""
+    ops: list["DDLOp"] = []
+    cleaned = _strip_sql_comments(sql)
+
+    # (A) CREATE TABLE ( ... ) — inline column constraints + table-level constraints.
+    for m in _RE_CREATE_TABLE_HEAD.finditer(cleaned):
+        tbl = _unquote(m.group("tbl"))
+        open_idx = m.end() - 1  # the '(' captured at the end of the head regex
+        body, _ = _matched_paren_body(cleaned, open_idx)
+        if not body:
+            continue
+        head_line = _line_of(cleaned, m.start())
+        for clause in _split_top_level_commas(body):
+            cl = clause.strip()
+            if not cl:
+                continue
+            first_word = re.match(r"\s*([\w\"]+)", cl)
+            lead = _unquote(first_word.group(1)).lower() if first_word else ""
+            # table-level constraint clause (starts with UNIQUE / PRIMARY KEY / CONSTRAINT)
+            if lead in ("unique", "primary", "constraint"):
+                tcm = _RE_TABLE_CONSTRAINT.search(cl)
+                if tcm:
+                    cols = [c.strip().strip('"') for c in (tcm.group("cols") or "").split(",") if c.strip()]
+                    if len(cols) == 1:
+                        kind = re.sub(r"\s+", " ", tcm.group("kind").upper())
+                        ops.append(DDLOp("create_unique_index", "UNIQUE-CONSTRAINT", tbl,
+                                         column=cols[0], new_name=f"constraint:{kind.lower().replace(' ', '_')}",
+                                         extra=cols[0], line=head_line))
+                continue
+            # inline column definition: `<col> <type...> [UNIQUE|PRIMARY KEY]` (no table-level "(")
+            cdef = _RE_INLINE_COL_DEF.match(cl)
+            if not cdef:
+                continue
+            col = _unquote(cdef.group("col"))
+            if not col or col.lower() in _CONSTRAINT_KEYWORDS:
+                continue
+            rest = cdef.group("rest") or ""
+            if _RE_INLINE_UNIQUE_KW.search(rest):
+                kind = "primary_key" if re.search(r"\bPRIMARY\s+KEY\b", rest, re.IGNORECASE) else "unique"
+                ops.append(DDLOp("create_unique_index", "UNIQUE-CONSTRAINT", tbl,
+                                 column=col, new_name=f"constraint:{kind}", extra=col, line=head_line))
+
+    # (B) ALTER TABLE ... ADD [CONSTRAINT n] UNIQUE|PRIMARY KEY (col)
+    for m in _RE_ALTER_ADD_CONSTRAINT.finditer(cleaned):
+        cols = [c.strip().strip('"') for c in (m.group("cols") or "").split(",") if c.strip()]
+        if len(cols) != 1:
+            continue
+        kind = re.sub(r"\s+", " ", m.group("kind").upper()).lower().replace(" ", "_")
+        ops.append(DDLOp("create_unique_index", "UNIQUE-CONSTRAINT", _unquote(m.group("tbl")),
+                         column=cols[0], new_name=f"constraint:{kind}", extra=cols[0],
+                         line=_line_of(cleaned, m.start())))
+    return ops
+
+
+def parse_dropped_indexes(sql: str) -> set[str]:
+    """Bare index names dropped by `sql` (DROP INDEX ...), lowercased + unquoted, schema stripped.
+    Used by the floor's index expand/contract rule to confirm a same-diff DROP of the old index."""
+    out: set[str] = set()
+    for m in _RE_DROP_INDEX.finditer(_strip_sql_comments(sql)):
+        n = _unquote(m.group("name")) or ""
+        out.add(n.split(".")[-1].lower())
+    return out
 
 
 @dataclass
 class DDLOp:
     op: str                         # drop_column | drop_table | rename_column | rename_table
                                     # | alter_type | set_not_null | add_column
-    classification: str             # DESTRUCTIVE | BREAKING-RENAME | DATA-DEPENDENT | LOCK-REWRITE | ADD
+                                    # | create_index | create_unique_index
+    classification: str             # DESTRUCTIVE | BREAKING-RENAME | DATA-DEPENDENT | LOCK-REWRITE
+                                    # | ADD | INDEX[-IF-NOT-EXISTS] | UNIQUE-INDEX[-IF-NOT-EXISTS]
     table: str | None
-    column: str | None = None
-    new_name: str | None = None
-    extra: str | None = None
+    column: str | None = None       # for create_*index: the single indexed column (None if composite)
+    new_name: str | None = None     # for create_*index: the index NAME
+    extra: str | None = None        # for create_*index: the raw parenthesised column list
     line: int | None = None
 
 
@@ -114,6 +290,35 @@ def _unquote(tok: str | None) -> str | None:
     if tok is None:
         return None
     return tok.strip().strip('"').strip()
+
+
+# Comment bodies are replaced with EQUAL-LENGTH blanks (newlines preserved) so that character offsets
+# — and therefore _line_of() line numbers and the start indexes of every OTHER op's match — are left
+# byte-for-byte identical. We only need this for the index pass (the QA-D bypass hid the column list
+# behind a comment), but stripping length-preservingly means we can safely reuse the cleaned text for
+# any regex without shifting reported lines. String/quoted-identifier contents are NOT comment-aware
+# here (a `--`/`/*` inside a string literal would be blanked), which is acceptable for DDL index
+# statements; the floor over-blanking can only ever make a comment-disguised bypass MORE visible, and
+# the absolute apply-path guard (W1 catalog delta) is the regex-independent backstop regardless.
+_RE_BLOCK_COMMENT = re.compile(r"/\*.*?\*/", re.DOTALL)
+_RE_LINE_COMMENT = re.compile(r"--[^\n]*")
+
+
+def _blank_keep_newlines(m: "re.Match") -> str:
+    """Replace a matched comment with the same number of chars, keeping any embedded newlines so line
+    numbers and downstream match offsets are preserved exactly."""
+    return "".join("\n" if ch == "\n" else " " for ch in m.group(0))
+
+
+def _strip_sql_comments(sql: str) -> str:
+    """Blank out /* ... */ (incl. multi-line) and -- to-end-of-line comments WITHOUT changing the
+    length of the string (comment chars -> spaces, newlines kept). Block comments are removed first so
+    a `--` inside a `/* */` is treated as part of the block comment, not a line comment."""
+    if not sql or ("/*" not in sql and "--" not in sql):
+        return sql
+    sql = _RE_BLOCK_COMMENT.sub(_blank_keep_newlines, sql)
+    sql = _RE_LINE_COMMENT.sub(_blank_keep_newlines, sql)
+    return sql
 
 
 def _line_of(sql: str, idx: int) -> int:
@@ -154,6 +359,34 @@ def classify_ddl(sql: str) -> list[DDLOp]:
         ops.append(DDLOp("add_column", "ADD", _unquote(m.group("tbl")),
                          column=_unquote(m.group("col")), extra=(m.group("rest") or "").strip(),
                          line=_line_of(sql, m.start())))
+    # CREATE [UNIQUE] INDEX — surfaced so the floor can apply the expand/contract rule to an index
+    # "rename" (a 2nd UNIQUE index on a column that already has one is the dup-unique-_key landmine).
+    # Unlike a CREATE TABLE, an `IF NOT EXISTS` here does NOT make it safe: IF NOT EXISTS keys off the
+    # NEW index name, so it still adds a duplicate when the OLD index under a different name survives.
+    # We encode the indexed columns in `extra`, the index name in `new_name`, the single-column target
+    # (for the per-column dup probe) in `column`, and whether IF NOT EXISTS was used in classification.
+    # Strip SQL comments (length-preservingly, so _line_of offsets stay exact) before matching CREATE
+    # INDEX: the QA-D bypass hid the "(cols)" behind a `/*c*/` comment between <tbl> and "(", and an
+    # optional `USING <method>` clause is now tolerated by the regex itself. Comment-stripping also
+    # closes the `... ON t -- x\n (_key)` variant. The cleaned text is index-only; the other ops above
+    # already matched against the raw `sql` (their patterns don't straddle a comment).
+    sql_idx = _strip_sql_comments(sql)
+    for m in _RE_CREATE_INDEX.finditer(sql_idx):
+        is_unique = bool(m.group("unique"))
+        cols_raw = (m.group("cols") or "").strip()
+        cols = [c.strip().strip('"') for c in cols_raw.split(",") if c.strip()]
+        single_col = cols[0] if len(cols) == 1 else None
+        cls = ("UNIQUE-INDEX" if is_unique else "INDEX") + ("-IF-NOT-EXISTS" if m.group("ine") else "")
+        ops.append(DDLOp("create_unique_index" if is_unique else "create_index", cls,
+                         _unquote(m.group("tbl")), column=single_col,
+                         new_name=_unquote(m.group("name")),
+                         extra=cols_raw, line=_line_of(sql_idx, m.start())))
+    # BYPASS 1: inline UNIQUE / PRIMARY KEY constraints in CREATE TABLE, and ALTER TABLE ADD
+    # CONSTRAINT ... UNIQUE / PRIMARY KEY — surfaced as synthetic single-column create_unique_index
+    # ops (classification UNIQUE-CONSTRAINT, new_name='constraint:<kind>') so the floor's dup-unique
+    # rule sees a constraint-backed enforcement on a column (e.g. _key) that may ALSO carry a separate
+    # unique index. (W1's catalog-delta over duckdb_constraints() is the regex-independent backstop.)
+    ops.extend(_constraint_unique_ops(sql))
     return ops
 
 
