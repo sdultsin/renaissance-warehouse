@@ -134,41 +134,54 @@ def main():
     if ro is not None:
         slugmap = canon_slug_map(ro); ro.close()
 
-    staged_files = []
-    for slug in sorted(keys):
-        t0 = time.time()
-        try:
-            wsid, rows = pull_workspace(keys[slug])
-        except Exception as e:
-            log.error("  %s FAILED: %s", slug, e); continue
-        canon = slugmap.get(wsid, slug)
-        n, rg, ba, pr = stats(rows)
-        log.info("  %-16s (%s) inboxes=%d  with_RG=%d  with_batch=%d  with_provider=%d  [%.0fs]",
-                 canon, slug, n, rg, ba, pr, time.time() - t0)
-        # stage to parquet immediately (survives a kill; no prod lock held)
-        p = stage_parquet(canon, wsid, rows, now)
-        staged_files.append(p)
-        log.info("    staged -> %s", p)
+    import glob
+    commit_only = "--commit-only" in sys.argv
+    if commit_only:
+        staged_files = sorted(glob.glob(os.path.join(STAGE_DIR, "*.parquet")))
+        log.info("commit-only: writing from %d existing staged parquet(s), skipping walk", len(staged_files))
+    else:
+        staged_files = []
+        for slug in sorted(keys):
+            t0 = time.time()
+            try:
+                wsid, rows = pull_workspace(keys[slug])
+            except Exception as e:
+                log.error("  %s FAILED: %s", slug, e); continue
+            canon = slugmap.get(wsid, slug)
+            n, rg, ba, pr = stats(rows)
+            log.info("  %-16s (%s) inboxes=%d  with_RG=%d  with_batch=%d  with_provider=%d  [%.0fs]",
+                     canon, slug, n, rg, ba, pr, time.time() - t0)
+            # stage to parquet immediately (survives a kill; no prod lock held)
+            p = stage_parquet(canon, wsid, rows, now)
+            staged_files.append(p)
+            log.info("    staged -> %s", p)
 
-    if not write:
+    if not write and not commit_only:
         log.info("DRY complete — %d parquet(s) staged, NO warehouse write. Re-run with --write.", len(staged_files))
         return
     if not staged_files:
         log.error("nothing staged — refusing to write"); return
 
-    # ---- WRITE: ONE set-based bulk upsert from the staged parquets (fast; short lock) ----
+    # ---- WRITE: DELETE the pulled (workspace_uuid,email) rows then bulk INSERT the fresh set,
+    #      inside one transaction. Avoids INSERT ... ON CONFLICT DO UPDATE, which threw a DuckDB
+    #      INTERNAL "duplicate key" index-maintenance error on this big table even with a dup-free
+    #      source (2026-07-01). Net effect is the same reconcile, but through plain DELETE+INSERT. ----
     con = core_db.connect()            # takes /root/core/warehouse.write.lock
     try:
         pre = con.execute("SELECT count(*) FROM core.account_tags").fetchone()[0]
-        con.execute(f"""
-            INSERT INTO core.account_tags
-              (email, workspace_slug, workspace_uuid, tags, tags_arr, n_tags, _loaded_at, _run_id)
-            SELECT email, workspace_slug, workspace_uuid, tags, tags_arr, n_tags, _loaded_at, _run_id
-            FROM read_parquet('{STAGE_DIR}/*.parquet')
-            ON CONFLICT (workspace_uuid, email) DO UPDATE SET
-              workspace_slug=excluded.workspace_slug, tags=excluded.tags,
-              tags_arr=excluded.tags_arr, n_tags=excluded.n_tags,
-              _loaded_at=excluded._loaded_at, _run_id=excluded._run_id""")
+        for pq in staged_files:
+            cnt = con.execute(f"SELECT count(*) FROM read_parquet('{pq}')").fetchone()[0]
+            # AUTO-COMMIT each statement (no BEGIN/COMMIT): a same-transaction delete+reinsert of
+            # the same PKs trips a DuckDB ART-index INTERNAL "duplicate key" abort on this big table
+            # (2026-07-01). Committing the DELETE first makes the re-INSERT see fresh keys. Proven.
+            con.execute(f"""DELETE FROM core.account_tags a WHERE EXISTS (
+                SELECT 1 FROM read_parquet('{pq}') p
+                WHERE p.workspace_uuid = a.workspace_uuid AND p.email = a.email)""")
+            con.execute(f"""INSERT INTO core.account_tags
+                (email, workspace_slug, workspace_uuid, tags, tags_arr, n_tags, _loaded_at, _run_id)
+                SELECT email, workspace_slug, workspace_uuid, tags, tags_arr, n_tags, _loaded_at, _run_id
+                FROM read_parquet('{pq}')""")
+            log.info("  committed %s: %d inboxes", os.path.basename(pq), cnt)
         post = con.execute("SELECT count(*) FROM core.account_tags").fetchone()[0]
         got = con.execute("SELECT count(*) FROM core.account_tags WHERE _run_id=?", [RUN_ID]).fetchone()[0]
         log.info("WRITE complete — table %d -> %d rows; %d rows carry this run_id", pre, post, got)
