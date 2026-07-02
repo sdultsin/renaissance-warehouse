@@ -558,6 +558,175 @@ def test_degraded_repull_does_not_null_out_columns():
           res["messages_upserted"] == 1, repr(res))
 
 
+
+
+# ── 429-hardening (2026-07-02): ordered drain / watermark file / stage sanitize ──
+def test_drain_tracker_contiguous_prefix():
+    from datetime import datetime, timezone
+    from entities.email_thread_sync import _DrainTracker
+    t1, t2, t3 = (datetime(2026, 7, 1, h, tzinfo=timezone.utc) for h in (1, 2, 3))
+    tr = _DrainTracker([None, t1, t2, t3])
+    check("fresh tracker drains nothing", tr.drained_through() is None)
+    tr.mark_done(2)  # out-of-order completion must PARK, not advance
+    check("out-of-order completion parks", tr.drained_through() is None)
+    tr.mark_done(0)  # None key (prior-failed retry) closes its slot, never advances
+    check("None key closes without advancing", tr.drained_through() is None)
+    tr.mark_done(1)  # prefix now contiguous through the parked t2
+    check("prefix closure advances through parked key", tr.drained_through() == t2,
+          repr(tr.drained_through()))
+    check("not all done yet", not tr.all_done())
+    tr.mark_done(3)
+    check("final advance + all_done", tr.drained_through() == t3 and tr.all_done())
+
+
+def test_watermark_file_precedence_and_monotone():
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+
+    import duckdb as _duckdb
+
+    from entities import email_thread_sync as ets
+
+    t_old = datetime(2026, 6, 20, tzinfo=timezone.utc)
+    t_new = datetime(2026, 7, 1, tzinfo=timezone.utc)
+    with tempfile.TemporaryDirectory() as td:
+        wm_path = os.path.join(td, "threads_watermark.json")
+        os.environ["WAREHOUSE_THREADS_WATERMARK"] = wm_path
+        try:
+            adv = ets._advance_watermarks({"ws-a": t_new})
+            check("first advance lands", adv.get("ws-a", "").startswith("2026-07-01"), repr(adv))
+            adv2 = ets._advance_watermarks({"ws-a": t_old})
+            check("older value can NEVER regress the file (monotone)", adv2 == {}, repr(adv2))
+            check("file still holds the newer ts",
+                  ets._load_watermarks()["ws-a"].startswith("2026-07-01"),
+                  repr(ets._load_watermarks()))
+            # workspace_watermark PREFERS the file (minus overlap), even with no atom table.
+            con = _duckdb.connect()
+            got = ets.workspace_watermark(con, "ws-a")
+            check("workspace_watermark prefers file minus overlap",
+                  got == t_new - ets._OVERLAP, repr(got))
+            check("unknown ws falls back to legacy (None here — no atom table)",
+                  ets.workspace_watermark(con, "ws-zzz") is None)
+            con.close()
+        finally:
+            del os.environ["WAREHOUSE_THREADS_WATERMARK"]
+
+
+def test_merge_drain_watermarks_skips_ceiling_and_override():
+    import json as _json
+    import os
+    import tempfile
+    from datetime import datetime, timezone
+
+    from entities import email_thread_sync as ets
+
+    with tempfile.TemporaryDirectory() as td:
+        wm_path = os.path.join(td, "threads_watermark.json")
+        stage = os.path.join(td, "stage.jsonl")
+        os.environ["WAREHOUSE_THREADS_WATERMARK"] = wm_path
+        try:
+            progress = {
+                "ws-ok":   {"drained_through": "2026-07-01T10:00:00+00:00", "complete": True,  "mode": "watermark"},
+                "ws-part": {"drained_through": "2026-06-30T02:00:00+00:00", "complete": False, "mode": "watermark"},
+                "ws-ovr":  {"drained_through": "2026-07-01T10:00:00+00:00", "complete": True,  "mode": "override"},
+                "ws-ceil": {"drained_through": "2026-07-01T10:00:00+00:00", "complete": True,  "mode": "watermark"},
+                "ws-none": {"drained_through": None, "complete": False, "mode": "watermark"},
+            }
+            with open(ets._progress_sidecar_path(stage), "w") as f:
+                _json.dump(progress, f)
+            adv = ets._merge_drain_watermarks(stage, {"ws-ceil"})
+            check("complete watermark ws advanced", "ws-ok" in adv, repr(adv))
+            check("PARTIAL prefix also advances (the whole point)", "ws-part" in adv, repr(adv))
+            check("override mode NEVER advances", "ws-ovr" not in adv, repr(adv))
+            check("ceiling-quarantined ws NEVER advances", "ws-ceil" not in adv, repr(adv))
+            check("None drained_through ignored", "ws-none" not in adv, repr(adv))
+            check("exactly the two eligible advanced", sorted(adv) == ["ws-ok", "ws-part"], repr(adv))
+        finally:
+            del os.environ["WAREHOUSE_THREADS_WATERMARK"]
+
+
+def test_sanitize_stage_drops_torn_tail():
+    import json as _json
+    import os
+    import tempfile
+
+    from entities.email_thread_sync import _sanitize_stage
+
+    with tempfile.TemporaryDirectory() as td:
+        stage = os.path.join(td, "stage.jsonl")
+        good1 = _json.dumps({"message_id": "m1"})
+        good2 = _json.dumps({"message_id": "m2"})
+        with open(stage, "w") as f:
+            f.write(good1 + "\n" + good2 + "\n" + '{"message_id": "m3", "body_te')  # torn tail
+        dropped = _sanitize_stage(stage)
+        check("exactly the torn line dropped", dropped == 1, repr(dropped))
+        lines = [ln for ln in open(stage).read().splitlines() if ln.strip()]
+        check("intact rows survive sanitize", lines == [good1, good2], repr(lines))
+        check("idempotent (clean file untouched)", _sanitize_stage(stage) == 0)
+
+
+def test_backoff_429_series():
+    from sources.instantly import backoff_429_wait
+    waits = [backoff_429_wait(n, base=65, cap=900) for n in range(6)]
+    check("exponential from 65s doubling", waits[:4] == [65, 130, 260, 520], repr(waits))
+    check("capped at ~15min", waits[4] == 900 and waits[5] == 900, repr(waits))
+
+
+
+
+def test_ensure_trailing_newline_isolates_torn_tail():
+    import json as _json
+    import os
+    import tempfile
+
+    from entities.email_thread_sync import _ensure_trailing_newline, _sanitize_stage
+
+    with tempfile.TemporaryDirectory() as td:
+        stage = os.path.join(td, "stage.jsonl")
+        good = _json.dumps({"message_id": "m1"})
+        with open(stage, "w") as f:
+            f.write(good + "\n" + '{"message_id": "m2", "torn')  # killed mid-write, no newline
+        _ensure_trailing_newline(stage)
+        resumed = _json.dumps({"message_id": "m3"})
+        with open(stage, "a") as f:  # a RESUMED fetch appends
+            f.write(resumed + "\n")
+        dropped = _sanitize_stage(stage)
+        lines = [ln for ln in open(stage).read().splitlines() if ln.strip()]
+        check("only the torn fragment dropped (resumed row survives)", dropped == 1, repr(dropped))
+        check("intact + resumed rows both survive", lines == [good, resumed], repr(lines))
+        # idempotent on a clean/empty file
+        _ensure_trailing_newline(stage)
+        check("newline guard idempotent", open(stage).read().count("\n") == 2)
+        empty = os.path.join(td, "empty.jsonl")
+        open(empty, "w").close()
+        _ensure_trailing_newline(empty)
+        check("empty file untouched", os.path.getsize(empty) == 0)
+        _ensure_trailing_newline(os.path.join(td, "absent.jsonl"))  # no raise
+        check("absent file tolerated", True)
+
+
+def test_append_failed_durable_roundtrip():
+    import os
+    import tempfile
+
+    from entities.email_thread_sync import _append_failed_durable, _read_prior_failed
+
+    with tempfile.TemporaryDirectory() as td:
+        failed = os.path.join(td, "stage.jsonl.failed")
+        with open(failed, "a") as fh:
+            ok1 = _append_failed_durable(fh, {"lead": "A@X.com ", "ws": "ws-1", "error": "429 budget"})
+            ok2 = _append_failed_durable(fh, {"lead": "b@y.com", "ws": "ws-2", "error": "boom"})
+        check("appends report durable", ok1 and ok2)
+        prior = _read_prior_failed(failed)
+        check("durably-appended failures are re-discovered next run",
+              prior == {"ws-1": {"a@x.com"}, "ws-2": {"b@y.com"}}, repr(prior))
+        fh2 = open(failed, "a")
+        fh2.close()
+        check("append to CLOSED handle reports NOT durable (slot must stay open)",
+              _append_failed_durable(fh2, {"lead": "c@z.com", "ws": "ws-3"}) is False)
+
+
 def main() -> int:
     tests = [
         test_cleaner_spintax_never_survives,
@@ -575,6 +744,13 @@ def main() -> int:
         test_enumerate_dedups_by_workspace_id_not_org,
         test_enumerate_allowlist_pins_to_the_9,
         test_degraded_repull_does_not_null_out_columns,
+        test_drain_tracker_contiguous_prefix,
+        test_watermark_file_precedence_and_monotone,
+        test_merge_drain_watermarks_skips_ceiling_and_override,
+        test_sanitize_stage_drops_torn_tail,
+        test_backoff_429_series,
+        test_ensure_trailing_newline_isolates_torn_tail,
+        test_append_failed_durable_roundtrip,
     ]
     for t in tests:
         print(f"\n{t.__name__}:")

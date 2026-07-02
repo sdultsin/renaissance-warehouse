@@ -259,19 +259,36 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     ( set -a; [ -f /root/core/.env.threads ] && . /root/core/.env.threads; set +a
       set -o pipefail
       export WAREHOUSE_PULL_THREADS=1
-      rm -f "$THREADS_NIGHTLY_STAGE" "$THREADS_NIGHTLY_STAGE".* 2>/dev/null
-      # [2026-07-01] FAIL-SAFE cap on the per-lead /emails fetch. When the committed watermark falls
-      # behind (429-throttled backlog), the fetch can exceed a nightly window and HANG the singleton
-      # nightly lock for 10-15h (build-fan-out incident 2026-07-01 — same class as the #124/#126 tag
-      # runaway). Time-box the fetch; APPLY only on a CLEAN (exit-0) fetch. A timed-out/partial fetch
-      # is DISCARDED — the 2-day watermark OVERLAP re-pulls the same window next run, so NOTHING is
-      # skipped; email_message just holds last-good for the day. Durable fix = resumable ordered drain.
+      # Clean run artifacts but PRESERVE .failed: the old `stage.*` glob deleted failed.jsonl
+      # before every nightly, silently killing the §4.F one-retry contract on this path — with
+      # the 429-hardened partial commits below, failed leads' ONLY re-pull path is failed.jsonl,
+      # so it must survive across runs. [2026-07-02]
+      rm -f "$THREADS_NIGHTLY_STAGE" "$THREADS_NIGHTLY_STAGE".ceiling \
+            "$THREADS_NIGHTLY_STAGE".progress "$THREADS_NIGHTLY_STAGE".progress.tmp \
+            "$THREADS_NIGHTLY_STAGE".sanitized 2>/dev/null
+      # [2026-07-01] FAIL-SAFE cap on the per-lead /emails fetch (60m so a 429-throttled backlog
+      # can never hang the singleton nightly lock for 10-15h — the build-fan-out incident class).
+      # [2026-07-02] the fetch is now a RESUMABLE ORDERED DRAIN (the durable fix the old comment
+      # named): leads pull ascending by last-reply time with adaptive-exponential 429 backoff;
+      # a timed-out/partial fetch is NO LONGER discarded — the apply commits whatever landed and
+      # advances the explicit per-ws drain watermark (/root/core/threads_watermark.json) ONLY
+      # through the contiguously-drained prefix, so partial progress accrues nightly and NOTHING
+      # is skipped (ceiling-hit workspaces stay quarantined via the .ceiling sidecar; grep
+      # RUN-SUMMARY-FETCH / RUNLOG-APPLY here for fetched/applied/429 counts).
       if timeout -k 30s "${THREADS_FETCH_TIMEOUT:-60m}" "$PYTHON" -m entities.email_thread_sync fetch --local-only --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE"; then
-          "$PYTHON" -m entities.email_thread_sync apply --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE"
+          # `|| echo`: apply exits 4 when it QUARANTINED a ceiling-hit ws (rows for the other
+          # ws DID commit) — without the guard, `set -e` would abort the subshell here, mislabel
+          # the run as email_thread_sync_nightly_failed, and skip the trailing cleanup.
+          "$PYTHON" -m entities.email_thread_sync apply --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE" \
+              || echo "WARN email_thread apply rc!=0 (ceiling quarantine or failure — see RUNLOG-APPLY above)" | tee -a "$LOG_FILE"
       else
-          echo "WARN email_thread fetch incomplete/timed-out (>${THREADS_FETCH_TIMEOUT:-60m} backlog) — skipping apply, keeping last-good (no watermark advance; 2d overlap re-pulls next run)" | tee -a "$LOG_FILE"
+          echo "WARN email_thread fetch incomplete (timeout >${THREADS_FETCH_TIMEOUT:-60m} / ceiling / crash) — applying PARTIAL progress (drain watermark advances only through the completed prefix; the rest re-pulls next run)" | tee -a "$LOG_FILE"
+          "$PYTHON" -m entities.email_thread_sync apply --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE" \
+              || echo "WARN email_thread partial apply failed (stage kept nothing; watermark unchanged — clean re-pull next run)" | tee -a "$LOG_FILE"
       fi
-      rm -f "$THREADS_NIGHTLY_STAGE" "$THREADS_NIGHTLY_STAGE".* 2>/dev/null ) \
+      rm -f "$THREADS_NIGHTLY_STAGE" "$THREADS_NIGHTLY_STAGE".ceiling \
+            "$THREADS_NIGHTLY_STAGE".progress "$THREADS_NIGHTLY_STAGE".progress.tmp \
+            "$THREADS_NIGHTLY_STAGE".sanitized 2>/dev/null ) \
         || echo "WARN email_thread_sync_nightly_failed (continuing)" | tee -a "$LOG_FILE"
     # keep apply manifests out of the repo working tree (gitignored too, belt + suspenders)
     mkdir -p /root/core/threads_bf/manifests 2>/dev/null

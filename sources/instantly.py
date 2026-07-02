@@ -8,6 +8,9 @@ User-Agent override because Instantly blocks `Python-urllib/*` and `python-httpx
 from __future__ import annotations
 
 import logging
+import os
+import random
+import threading
 import time
 from typing import Iterator
 
@@ -21,6 +24,27 @@ _UA = "curl/8.4.0"
 # Conservative serial pace. Per `feedback_instantly_list_accounts_serial_only.md`,
 # do not parallelize across workspaces or hit the API hot.
 _REQUEST_TIMEOUT = 60.0  # 30s tripped on slow /emails pages (big workspaces), 2026-06-11
+
+# ── adaptive 429 backoff [2026-07-02] ────────────────────────────────────────────
+# The old policy (429 shares the flat 3-attempt loop, 65s each) is no match for a SUSTAINED
+# rate-limit window: 3×65s ≈ 3.2 min, then the request hard-fails — which is how
+# email_thread_sync lost 3 consecutive nightlies (every lead pull died inside the storm and
+# core.email_message froze at 2026-06-29). 429s now retry on their OWN adaptive schedule:
+# exponential from _429_BASE_WAIT_S doubling up to _429_MAX_WAIT_S between attempts
+# (65s → 130 → 260 → 520 → 900 cap ≈ 15 min), with ±15% jitter so parallel workers
+# de-synchronize, bounded by a per-request cumulative sleep budget _429_BUDGET_S. Exhausting
+# the budget raises InstantlyError like any other terminal failure (callers' failed-lead /
+# retry-next-run semantics unchanged). Transport/5xx retry behavior is untouched.
+_429_BASE_WAIT_S = float(os.environ.get("INSTANTLY_429_BASE_WAIT_S", "65"))
+_429_MAX_WAIT_S = float(os.environ.get("INSTANTLY_429_MAX_WAIT_S", "900"))
+_429_BUDGET_S = float(os.environ.get("INSTANTLY_429_BUDGET_S", "1800"))
+
+
+def backoff_429_wait(rl_attempt: int, base: float | None = None, cap: float | None = None) -> float:
+    """Nominal (pre-jitter) wait before 429 retry number `rl_attempt` (0-based): base·2^n, capped."""
+    b = _429_BASE_WAIT_S if base is None else base
+    c = _429_MAX_WAIT_S if cap is None else cap
+    return min(b * (2 ** rl_attempt), c)
 
 
 class InstantlyError(RuntimeError):
@@ -40,6 +64,15 @@ class InstantlyClient:
             },
             timeout=_REQUEST_TIMEOUT,
         )
+        # Per-client 429 tally (thread-safe: email_thread_sync shares one client across its
+        # per-lead worker pool) so callers can report the run's rate-limit pressure — the QA
+        # needs to tell "partial progress under a 429 storm" apart from "total failure".
+        self.rate_limit_hits = 0
+        self._rl_lock = threading.Lock()
+
+    def _note_rate_limit(self) -> None:
+        with self._rl_lock:
+            self.rate_limit_hits += 1
 
     def close(self) -> None:
         self._client.close()
@@ -54,39 +87,55 @@ class InstantlyClient:
 
     def _get(self, path: str, params: dict | None = None) -> dict:
         import time as _time
-        retries = 3
-        for attempt in range(retries):
+        retries = 3          # transport/5xx attempts (historic semantics, unchanged)
+        attempt = 0
+        rl_attempt = 0       # 429 attempts — separate ADAPTIVE schedule (see module header)
+        rl_slept = 0.0
+        while True:
             # Transient transport failures (ReadTimeout on slow /emails pages, conn
             # resets) must retry, not kill the whole workspace pull — a single slow
             # page repeatedly aborted the-gatekeepers replies ingest (2026-06-11).
             try:
                 resp = self._client.get(path, params=params)
             except httpx.TransportError as exc:
-                if attempt + 1 >= retries:
+                attempt += 1
+                if attempt >= retries:
                     raise
-                wait = 15 * (attempt + 1)
+                wait = 15 * attempt
                 logger.warning(
                     "GET %s -> %s (attempt %d/%d), sleeping %ds",
-                    path, type(exc).__name__, attempt + 1, retries, wait,
+                    path, type(exc).__name__, attempt, retries, wait,
                 )
                 _time.sleep(wait)
                 continue
             if resp.status_code == 429:
-                wait = 65  # 429 = rate limit; wait >60s (window resets per minute)
+                # Adaptive exponential backoff for SUSTAINED rate-limit windows [2026-07-02]:
+                # does NOT consume the transport/5xx attempts; bounded by a cumulative
+                # per-request sleep budget instead (fail like any terminal error past it).
+                self._note_rate_limit()
+                wait = backoff_429_wait(rl_attempt) * random.uniform(0.85, 1.15)
+                if rl_slept + wait > _429_BUDGET_S:
+                    raise InstantlyError(
+                        f"GET {path} -> 429: adaptive backoff budget exhausted "
+                        f"(~{int(rl_slept)}s slept over {rl_attempt} retries; "
+                        f"budget {int(_429_BUDGET_S)}s)")
                 logger.warning(
-                    "GET %s -> 429 rate-limit (attempt %d/%d), sleeping %ds",
-                    path, attempt + 1, retries, wait,
+                    "GET %s -> 429 rate-limit (429-retry %d, sleeping %.0fs; %.0f/%.0fs budget used)",
+                    path, rl_attempt + 1, wait, rl_slept, _429_BUDGET_S,
                 )
                 _time.sleep(wait)
+                rl_slept += wait
+                rl_attempt += 1
                 continue
             if resp.status_code >= 500:
                 # Instantly 5xx are transient ("please try again") — seen repeatedly
                 # on deep /emails pagination (2026-06-11). Retry with backoff.
-                if attempt + 1 < retries:
-                    wait = 30 * (attempt + 1)
+                attempt += 1
+                if attempt < retries:
+                    wait = 30 * attempt
                     logger.warning(
                         "GET %s -> %d (attempt %d/%d), sleeping %ds",
-                        path, resp.status_code, attempt + 1, retries, wait,
+                        path, resp.status_code, attempt, retries, wait,
                     )
                     _time.sleep(wait)
                     continue
@@ -94,8 +143,6 @@ class InstantlyClient:
                 body = resp.text[:500]
                 raise InstantlyError(f"GET {path} -> {resp.status_code}: {body}")
             return resp.json()
-        body = resp.text[:500]
-        raise InstantlyError(f"GET {path} -> {resp.status_code} after {retries} retries: {body}")
 
     # Pagination page-count ceiling. Crossing it means we BAILED before the cursor
     # was exhausted, i.e. the result set is silently truncated mid-history. Callers
