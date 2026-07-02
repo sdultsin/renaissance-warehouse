@@ -74,7 +74,7 @@ PULL_SQL = """
       AND pe.provider = ANY(%s)
       AND co.email IS NOT NULL
       AND position('@' in co.email) > 1
-    ORDER BY lower(co.email), pe.attempted_at DESC, pe.id DESC
+    ORDER BY lower(co.email), pe.attempted_at DESC NULLS LAST, pe.id DESC
 """
 
 
