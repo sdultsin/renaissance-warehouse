@@ -47,7 +47,9 @@ STAGE_DIR = "/root/tagstage_20260701"
 
 def stage_parquet(canon: str, wsid: str, rows: dict, now):
     """Write a workspace's complete tag rows to a staging parquet via an IN-MEMORY duckdb
-    (fast, holds NO prod lock). The final upsert reads all staged parquets set-based."""
+    (fast, holds NO prod lock). The final write replays each staged parquet as an
+    auto-committed DELETE+INSERT (see the WRITE section — the set-based ON CONFLICT
+    upsert trips a DuckDB ART-index INTERNAL 'duplicate key' abort on this table)."""
     import duckdb, os
     os.makedirs(STAGE_DIR, exist_ok=True)
     path = os.path.join(STAGE_DIR, f"{canon}.parquet")
@@ -139,6 +141,11 @@ def main():
     if commit_only:
         staged_files = sorted(glob.glob(os.path.join(STAGE_DIR, "*.parquet")))
         log.info("commit-only: writing from %d existing staged parquet(s), skipping walk", len(staged_files))
+        for p in staged_files:  # a --commit-only replay overwrites newer tag data with the staged snapshot
+            age_h = (time.time() - os.path.getmtime(p)) / 3600
+            if age_h > 12:
+                log.warning("  STALE STAGE? %s staged %.1fh ago — replaying it clobbers any newer tag state",
+                            os.path.basename(p), age_h)
     else:
         staged_files = []
         for slug in sorted(keys):
