@@ -149,6 +149,14 @@
       "reconciliation": null
     },
 
+    "wa_preipo_meetings": {
+      "section": "yellow block 'WhatsApp PRE-IPO' (Meeting Booked column)",
+      "what": "WhatsApp Pre-IPO meetings for the yellow summary block — was HARDCODED 0 until 2026-07-02 (registry DR-9); now read from the portal like every other booking metric (wa_preipo_meetings in render_daily.py). Sent stays 0: no WA Pre-IPO send feed exists (v_sms_dash_wa_daily is the Funding ISKRA line). The adjacent SEC 125 / Tariffs / R&D Credit rows STAY hardcoded 0 — those offers do not exist yet anywhere (no booking source, no send feed).",
+      "source_type": "warehouse",
+      "warehouse": { "relation": "main.raw_im_bookings", "filter": "offer='Pre-IPO', channel='WhatsApp', latest _snapshot_date, non-deleted", "date_column": "date (ET business date)", "dedup_key": "email|phone" },
+      "reconciliation": null
+    },
+
     "preipo_meetings": {
       "section": "§2 Ren2 (SMS · Pre-IPO) meetings + yellow block 'SMS IPO'",
       "what": "Pre-IPO ('SMS IPO') meetings = the sum of bookings across the active Pre-IPO booking DESKS. THIS is the metric that the data ticket was opened for: the desks were not enumerated/labeled in a way a chat could confirm, and a human had to hand-feed 'Collins + Summit'.",

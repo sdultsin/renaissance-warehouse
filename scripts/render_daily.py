@@ -26,7 +26,6 @@ Canonical sources (verified 2026-06-30; booking cutover 2026-06-30):
                           over the SAME trailing fully-classified window as §2b's opps; Cost/opp =
                           cost ÷ opps. (Was funnel campaign-feed cost_usd = the carrier-fee component
                           only — understated all-in spend ~1.6x; fixed 2026-07-01.)
- §3 warm-caller MTD    -> core.call, 1st-of-month..report-day (ET): dials / distinct people / connects>=60s.
  §1 Opp→mtg %          -> meetings ÷ opportunities, same same-day frame as §1's columns ('—' when opps=0).
  §2 SMS replies (human)-> raw_sendivo_inbound non-opt-out.
  §2 WhatsApp           -> v_sms_dash_wa_daily (sent/delivered/failed/replies); meetings -> im_bookings.
@@ -38,7 +37,9 @@ Canonical sources (verified 2026-06-30; booking cutover 2026-06-30):
                           DAILY column is structurally thin/empty and back-fills on later renders):
                           BUSINESS MINUTES (clock runs 12-8pm ET Mon-Fri only) from each thread's first
                           prospect reply (ue_type 2) to our first reply (ue_type 3); med/avg per
-                          workspace daily/weekly/monthly. Spec locked with Grace 06-30.
+                          workspace daily/weekly. Spec locked with Grace 06-30. NO MTD on a daily tab
+                          [DR-10, Sam 07-01] — §3's MTD rows + §6's Monthly block removed; trailing
+                          windows (§2b 7d, §6 weekly) stay.
  §1b EMAIL KPIs BY INFRA   -> live (re-added after the 06-30 removal); renders INFRA_RENDER_ROWS only
                           (Google/OTD — Milkbox row wiped 2026-07-01 per the 100%-or-wipe rule,
                           pending the centralize-pass rebuild; nonzero Milkbox sends WARN loud).
@@ -369,6 +370,25 @@ def preipo_meetings(date):
     """Total Pre-IPO meetings = SUM of the additive desks (Collins + Summit)."""
     return sum(preipo_by_desk(date)["by_desk"].values())
 
+# WhatsApp PRE-IPO meetings (yellow-block row) — registry DR-9. Reads the SAME portal source with
+# the SAME conventions as every other booking read (latest raw_im_bookings snapshot, email|phone
+# dedup, non-deleted, keyed on the ET business `date` string — see consolidated_bookings): just
+# offer='Pre-IPO' + channel='WhatsApp' instead of offer='Funding'. consolidated_bookings() is
+# deliberately Funding-locked (it feeds the §1/§2/§3 meeting columns), so it cannot serve this row —
+# which is why the row sat hardcoded to 0 until 2026-07-02.
+def wa_preipo_meetings(date):
+    """Deduped (email|phone) WhatsApp Pre-IPO bookings for `date` from the portal mirror.
+    Fail-soft via the _safe() collect wrapper -> 0 (never crashes the summary block)."""
+    rows = wq(f"""
+      SELECT count(DISTINCT lower(coalesce(nullif(email,''), phone)))
+      FROM main.raw_im_bookings
+      WHERE _snapshot_date=(SELECT max(_snapshot_date) FROM main.raw_im_bookings)
+        AND offer='Pre-IPO' AND channel='WhatsApp'
+        AND substr(coalesce(date,''),1,10)=DATE '{date}'::VARCHAR
+        AND (deleted_at IS NULL OR deleted_at='' OR lower(deleted_at)='null')
+        AND coalesce(nullif(email,''), phone) <> ''""")
+    return int(rows[0][0] or 0) if rows else 0
+
 # im_bookings lead_type (cheap/regular) by email|phone, for the report day (warehouse SoT)
 def imbookings_meetings(date):
     """{key(email|phone): lead_type} from the portal mirror (offer=Funding). Fail-soft -> {} so a
@@ -642,25 +662,9 @@ def get_close():
     d, l, cn = (int(c[0][0]), int(c[0][1]), int(c[0][2])) if c else (0, 0, 0)
     book = consolidated_bookings(DAILY)
     m = sum(1 for b in book if b["channel"].lower() == "call")
-    # §3 warm-caller MTD [backlog A7 / Sam ask #5]: month-to-date (1st of the report month .. report
-    # day, ET) dials / distinct people dialed / connects>=60s from the SAME core.call source + ET-day
-    # frame as the daily rows (June full-month proof: 6,283 / 3,187 / 328 — recomputed live each
-    # render). Isolated try: a failure of the NEW query renders the MTD rows '—' + WARN, and can never
-    # regress the pre-existing daily §3 metrics.
-    mo = _d.replace(day=1).isoformat()
-    mtd_d = mtd_l = mtd_c = None
-    try:
-        r = wq(f"""SELECT COUNT(*), COUNT(DISTINCT close_lead_id),
-                     COUNT(*) FILTER (WHERE duration_seconds >= 60)
-                   FROM core.call
-                   WHERE (occurred_at AT TIME ZONE 'America/New_York')::DATE
-                         BETWEEN DATE '{mo}' AND DATE '{DAILY}'""")
-        if r:
-            mtd_d, mtd_l, mtd_c = int(r[0][0]), int(r[0][1]), int(r[0][2])
-    except Exception as e:
-        print(f"WARN get_close MTD query failed ({e}); §3 MTD rows render '—'", file=sys.stderr)
-    return {"dials": d, "leads": l, "connects": cn, "meetings": m,
-            "mtd_start": mo, "mtd_dials": mtd_d, "mtd_leads": mtd_l, "mtd_connects": mtd_c}
+    # NO MTD here [DR-10, Sam 07-01]: "we don't want MTD anything in a daily tab" — the warm-caller
+    # MTD rows added 07-01 (backlog A7) were removed same-day; monthly belongs on a dedicated MTD tab.
+    return {"dials": d, "leads": l, "connects": cn, "meetings": m}
 
 def get_truth():
     """§4 no-lag: Expected = active accounts' configured daily_limit by ws x infra (per-workspace
@@ -878,7 +882,8 @@ def _clock_open_date(p, tz):
 def get_im_reply():
     """§6 IM reply-time from core.email_message: average/median BUSINESS MINUTES from each thread's
     FIRST prospect reply (ue_type 2) to our first reply after it (ue_type 3), per workspace,
-    daily / trailing-7d weekly / MTD monthly.
+    daily / trailing-7d weekly. (Monthly/MTD block REMOVED 2026-07-01 [DR-10, Sam]: no MTD anything
+    on a daily tab; a trailing window like weekly-7d is fine, a calendar-month-to-date is not.)
 
     SPEC [locked with Grace 06-30, supersedes the arrival-filter reading]: the SLA clock accrues
     ONLY inside 12:00-20:00 ET Mon-Fri (IMs log in 11am ET, first hour = catch-up; no nights/
@@ -891,17 +896,15 @@ def get_im_reply():
 
     FRESHNESS: core.email_message is NIGHTLY-synced — D-1 at best BY DESIGN, so the report-day
     DAILY column is structurally thin/empty on day D itself and back-fills on later renders;
-    weekly/monthly carry the signal. Do NOT 'fix' that by switching sources."""
+    weekly carries the signal. Do NOT 'fix' that by switching sources."""
     if ET_TZ is None:                      # no zoneinfo -> _safe renders §6 empty + WARN, never
         raise RuntimeError("zoneinfo unavailable — refusing §6 SLA math in a wrong fixed offset")
     tz = ET_TZ
     wk = (_d - datetime.timedelta(days=6)).isoformat()
-    mo = _d.replace(day=1).isoformat()
     # Pull from 4 days BEFORE the earliest bucket day: an off-window arrival opens its clock up to
-    # 3 calendar days later (Fri 20:00 ET -> Mon 12:00 ET), so e.g. a Saturday May-30 arrival
-    # buckets into Mon Jun-01 and must be in the pull for a June MTD.
-    pull = (min(datetime.date.fromisoformat(wk), datetime.date.fromisoformat(mo))
-            - datetime.timedelta(days=4)).isoformat()
+    # 3 calendar days later (Fri 20:00 ET -> Mon 12:00 ET), so e.g. a Saturday arrival buckets into
+    # the following Monday and must be in the pull for that week's window.
+    pull = (datetime.date.fromisoformat(wk) - datetime.timedelta(days=4)).isoformat()
     # Query notes (each clause is load-bearing):
     #  - seq ranks over the thread's FULL history (no date filter inside inbound), partitioned per
     #    workspace; the pull window only limits which FIRSTS are fetched (`i.p_ts >= pull`). Ranking
@@ -930,9 +933,9 @@ def get_im_reply():
         FROM inbound i
         WHERE i.seq=1 AND i.p_ts >= DATE '{pull}' AND i.ws IN ({SLUGS_SQL}))
       WHERE r IS NOT NULL""")
-    day0, wk0, mo0 = _d, datetime.date.fromisoformat(wk), datetime.date.fromisoformat(mo)
+    day0, wk0 = _d, datetime.date.fromisoformat(wk)
     utc = datetime.timezone.utc
-    lats = {}  # ws -> {"d"/"w"/"m": [business-minute latencies]}
+    lats = {}  # ws -> {"d"/"w": [business-minute latencies]}
     for ws, p_ms, r_ms in rows:
         if r_ms is None:
             continue  # unanswered thread — dropped
@@ -942,17 +945,16 @@ def get_im_reply():
         if d > day0:
             continue  # clock opens after the report day (e.g. a post-8pm arrival on DAILY)
         lat = _biz_minutes(p, r, tz)
-        b = lats.setdefault(ws, {"d": [], "w": [], "m": []})
+        b = lats.setdefault(ws, {"d": [], "w": []})
         if d == day0: b["d"].append(lat)
         if d >= wk0:  b["w"].append(lat)
-        if d >= mo0:  b["m"].append(lat)
     def _stats(v):
         return (len(v), statistics.median(v) if v else None, sum(v) / len(v) if v else None)
     out = []
     for slug, name in WS:
-        b = lats.get(slug, {"d": [], "w": [], "m": []})
-        out.append((name,) + _stats(b["d"]) + _stats(b["w"]) + _stats(b["m"]))
-    return (DAILY, wk, mo), out
+        b = lats.get(slug, {"d": [], "w": []})
+        out.append((name,) + _stats(b["d"]) + _stats(b["w"]))
+    return (DAILY, wk), out
 
 # ============================ source self-verify (the DATA-TICKET fix) ============================
 # A chat / the SLA watchdog can confirm "am I sourcing the right thing for every metric?" with ZERO
@@ -1208,10 +1210,9 @@ def _safe(label, fn, default):
         return default
 _EMAIL_FB = [(name, 0, 0, 0, 0, 0, 0) for _, name in WS]
 _SMS_FB = [("Renaissance 1 (SMS)", 0, 0, None, 0, 0, None), ("Renaissance 2 (SMS · Pre-IPO)", 0, 0, None, 0, 0, None), ("Renaissance 3 (SMS · webform)", 0, 0, None, 0, 0, None), ("WhatsApp (ISKRA)", 0, 0, 0, 0, 0, None)]
-_CLOSE_FB = {"dials": 0, "leads": 0, "connects": 0, "meetings": 0,
-             "mtd_start": DAILY, "mtd_dials": None, "mtd_leads": None, "mtd_connects": None}
+_CLOSE_FB = {"dials": 0, "leads": 0, "connects": 0, "meetings": 0}
 _TRUTH_FB = (None, [(name, 0, 0, 0, 0, 0, 0) for _, name in WS])
-_IMREPLY_FB = ((DAILY, DAILY, DAILY), [(name, 0, None, None, 0, None, None, 0, None, None) for _, name in WS])
+_IMREPLY_FB = ((DAILY, DAILY), [(name, 0, None, None, 0, None, None) for _, name in WS])
 
 EMAIL_D = _safe("email", get_email, _EMAIL_FB)
 SMS_D = _safe("sms_wa", get_sms_wa, _SMS_FB)
@@ -1221,6 +1222,7 @@ SENDING_CENSUS, SENDING_TRUTH = _safe("truth", get_truth, _TRUTH_FB)
 PARTNER_D, PARTNER_D_TOTAL = _safe("partner", get_partner, ([], 0))
 IMREPLY_PERIODS, IMREPLY_D = _safe("imreply", get_im_reply, _IMREPLY_FB)
 PREIPO_MTG = _safe("preipo", lambda: preipo_meetings(DAILY), 0)
+WA_PREIPO_MTG = _safe("wa_preipo", lambda: wa_preipo_meetings(DAILY), 0)
 INFRA_D = _safe("infra", get_infra_kpis, {"by_ws": [], "mtg_by": {}, "unattr_mtg": 0, "flagged": []})
 
 # Milkbox row is wiped from §1b (see INFRA_RENDER_ROWS) — if the classifier still attributed
@@ -1250,8 +1252,9 @@ if DRY:
     print("§3 CLOSE:", CLOSE_D)
     print("§4 TRUTH (ws, otd_exp, goog_exp, tot_exp, actual, otd_actual, goog_actual):"); [print("  ", x) for x in SENDING_TRUTH]
     print("§5 PARTNER:", PARTNER_D, "total", PARTNER_D_TOTAL)
-    print("§6 IM-REPLY (ws, d_n,d_med,d_avg, w_n,w_med,w_avg, m_n,m_med,m_avg):"); [print("  ", x) for x in IMREPLY_D]
+    print("§6 IM-REPLY (ws, d_n,d_med,d_avg, w_n,w_med,w_avg):"); [print("  ", x) for x in IMREPLY_D]
     print("Pre-IPO meetings:", PREIPO_MTG)
+    print("WhatsApp Pre-IPO meetings (yellow block):", WA_PREIPO_MTG)
     sys.exit(0)
 
 # ============================ formatting engine ============================
@@ -1382,14 +1385,10 @@ def build_and_write(tab, build_fn):
         si = add([label]); sec.append(si); row_ncol[si] = W
         hr = add(["Close CRM — metric", "Value"]); th.append(hr); th_ncol[hr] = W
         d2m = f"'{(100.0*close['meetings']/close['dials']):.2f}%" if close['dials'] else "—"
-        def mtd(v): return v if v is not None else "—"   # None = MTD query failed (WARNed) -> dash
+        # DAILY metrics only [DR-10, Sam 07-01]: no MTD rows on a daily tab.
         for r2 in [["Dials", close["dials"]], ["Distinct leads dialed", close["leads"]],
                    ["Connects (≥60s real convo)", close["connects"]],
-                   ["Meetings booked (call-sourced)", close["meetings"]], ["Dial → meeting %", d2m],
-                   # warm-caller MTD [backlog A7 / Sam ask #5] — same core.call source, ET-day frame
-                   [f"MTD dials (since {close.get('mtd_start', DAILY)})", mtd(close.get("mtd_dials"))],
-                   ["MTD distinct people dialed", mtd(close.get("mtd_leads"))],
-                   ["MTD connects (≥60s)", mtd(close.get("mtd_connects"))]]:
+                   ["Meetings booked (call-sourced)", close["meetings"]], ["Dial → meeting %", d2m]]:
             ri = add(r2); data.append(ri); row_ncol[ri] = W
     def partner_table(rows_data, total, label):
         W = 2
@@ -1399,32 +1398,34 @@ def build_and_write(tab, build_fn):
             ri = add([p, n]); data.append(ri); row_ncol[ri] = W
         ti = add(["TOTAL", total]); tot.append(ti); row_ncol[ti] = W
     def imreply_table(rows_data, label):
-        W = 10
+        # Daily + Weekly-7d blocks ONLY [DR-10, Sam 07-01]: the Monthly (MTD) block (was cols H-J)
+        # is removed — no MTD anything on a daily tab (trailing windows like weekly-7d stay).
+        W = 7
         si = add([label]); sec.append(si); row_ncol[si] = W
-        hr_top = add(["Workspace", "Daily (trailing — source is nightly-fed, D-1)", "", "", "Weekly (7d)", "", "", "Monthly (MTD)", "", ""]); th.append(hr_top)
-        hr_sub = add(["", "n", "Median min", "Avg min", "n", "Median min", "Avg min", "n", "Median min", "Avg min"]); th.append(hr_sub)
-        merges.append((hr_top, 1, 4)); merges.append((hr_top, 4, 7)); merges.append((hr_top, 7, 10)); th_ncol[hr_top] = th_ncol[hr_sub] = W
-        for name, dn, dmed, davg, wn, wmed, wavg, mn, mmed, mavg in rows_data:
-            ri = add([name, dn, mins(dmed), mins(davg), wn, mins(wmed), mins(wavg), mn, mins(mmed), mins(mavg)])
+        hr_top = add(["Workspace", "Daily (trailing — source is nightly-fed, D-1)", "", "", "Weekly (7d)", "", ""]); th.append(hr_top)
+        hr_sub = add(["", "n", "Median min", "Avg min", "n", "Median min", "Avg min"]); th.append(hr_sub)
+        merges.append((hr_top, 1, 4)); merges.append((hr_top, 4, 7)); th_ncol[hr_top] = th_ncol[hr_sub] = W
+        for name, dn, dmed, davg, wn, wmed, wavg in rows_data:
+            ri = add([name, dn, mins(dmed), mins(davg), wn, mins(wmed), mins(wavg)])
             data.append(ri); row_ncol[ri] = W
         # Explicit empty-state so a legitimately-quiet day (or the nightly email_message sync lag)
         # never reads as a clobbered/missing §6 — the header + a per-workspace shell ALWAYS render.
-        # TWO distinct notes: daily-only empty (weekly/monthly have data) = the NORMAL D-1 pattern;
+        # TWO distinct notes: daily-only empty (weekly has data) = the NORMAL D-1 pattern;
         # everything empty = the pull FAILED (_safe fallback) or a total source gap — say THAT, never
         # print the benign by-design explanation over a broken query (wrong-but-plausible is the
         # exact failure mode the wq truncation guard exists to prevent).
         if not any((r[1] or 0) for r in rows_data):
-            if any((r[4] or 0) or (r[7] or 0) for r in rows_data):
+            if any((r[4] or 0) for r in rows_data):
                 note = add(["(no answered first-reply pairs clocked to %s yet — core.email_message "
                             "is nightly-fed (D-1 at best by design), so day-D's daily cell is "
-                            "structurally empty on day D and back-fills on later renders; weekly/"
-                            "monthly carry the signal)" % DAILY])
+                            "structurally empty on day D and back-fills on later renders; weekly "
+                            "carries the signal)" % DAILY])
             else:
                 note = add(["(!) §6 rendered EMPTY for %s — the warehouse pull failed or returned "
                             "no pairs at all (see render stderr); this is NOT the normal D-1 "
                             "sync-lag pattern" % DAILY])
             data.append(note); row_ncol[note] = W
-        pend = add(["SMS · WhatsApp first-reply time", "pending", "pending", "pending", "pending", "pending", "pending", "pending", "pending", "pending"])
+        pend = add(["SMS · WhatsApp first-reply time", "pending", "pending", "pending", "pending", "pending", "pending"])
         data.append(pend); row_ncol[pend] = W
     def infra_table(infra, header_label):
         # §1b — one row PER INFRASTRUCTURE, summed across ALL workspaces (Sam 2026-06-30; Google == reseller).
@@ -1544,7 +1545,13 @@ def write_summary_block(sid):
         blk.append([lbl, s, m, ratio(s, m)])
     blk.append(["", "", "", ""])
     blk.append(["SMS IPO", sms2[1], PREIPO_MTG, ratio(sms2[1], PREIPO_MTG)])
-    for lbl in ["WhatsApp PRE-IPO", "SEC 125", "Tariffs", "R&D Credit"]:
+    # WhatsApp PRE-IPO meetings now READ from the portal (wa_preipo_meetings — registry DR-9; was
+    # hardcoded 0). Sent stays 0: no WA Pre-IPO send feed exists (v_sms_dash_wa_daily is the Funding
+    # ISKRA line), and the ratio stays '' — a KPI over a structurally-0 sent would be fake.
+    blk.append(["WhatsApp PRE-IPO", 0, WA_PREIPO_MTG, ""])
+    # SEC 125 / Tariffs / R&D Credit stay HARDCODED 0: those offers do not exist yet (no booking
+    # source, no send feed anywhere). Wire each one like WhatsApp PRE-IPO above when it launches.
+    for lbl in ["SEC 125", "Tariffs", "R&D Credit"]:
         blk.append([lbl, 0, 0, ""])
     api("PUT", f"{BASE}/values/{urllib.parse.quote(DAILY_TAB)}!L4?valueInputOption=USER_ENTERED", {"values": blk})
     n = len(blk); r0 = 3; r1 = r0 + n; CREAM = rgb(0.988, 0.953, 0.804)
@@ -1584,7 +1591,7 @@ def daily(ctx):
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
     ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (CONNECTED active capacity; disconnected/paused inboxes excluded) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · no-lag · census {SENDING_CENSUS}"); add()
     ctx["partner_table"](PARTNER_D, PARTNER_D_TOTAL, f"5 · BOOKINGS BY PARTNER · day {DAILY}"); add()
-    ctx["imreply_table"](IMREPLY_D, f"6 · IM REPLY-TIME — business minutes to first reply, by workspace · clock runs 12-8pm ET Mon-Fri only (all arrivals count; off-hours clock opens next window) · daily / weekly / monthly · email (SMS+WA pending) · Grace & Sam")
+    ctx["imreply_table"](IMREPLY_D, f"6 · IM REPLY-TIME — business minutes to first reply, by workspace · clock runs 12-8pm ET Mon-Fri only (all arrivals count; off-hours clock opens next window) · daily / weekly · email (SMS+WA pending) · Grace & Sam")
 
 def _alert(text):
     """Best-effort drift alert via the established scripts/alert_slack.py path; never raises (the tab
