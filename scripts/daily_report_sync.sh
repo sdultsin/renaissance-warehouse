@@ -17,8 +17,13 @@
 #                      keep their evening state FOREVER. Render-ONLY (no ingest phases, no promote):
 #                      the nightly already rebuilt + promoted; we just re-read the fresh snapshot.
 #                      GUARD: skips + Slack-warns unless today's nightly COMPLETED (exit 0/1 in
-#                      logs/<utc-date>.log) AND the serving snapshot was promoted AFTER it started —
-#                      never silently re-render the same stale data as if it were fresh.
+#                      logs/<utc-date>.log, or the orchestrator's own "ended (status=success|
+#                      partial)" line as fallback — the exit= line is missing whenever a post-
+#                      orchestrator step dies under set -e) AND the serving snapshot was promoted
+#                      AFTER it started (after it ENDED, on the fallback path) — never silently
+#                      re-render the same stale data as if it were fresh.
+#                      BACKFILL_GUARD_ONLY=1 evaluates the guard and exits (0=GO / 3=SKIP) without
+#                      rendering or alerting — the dry guard check.
 #
 # Cron (UTC, droplet):
 #   0  1 * * *  /root/renaissance-warehouse/scripts/daily_report_sync.sh evening >> .../logs/daily_report_sync.log 2>&1   # 9 PM ET
@@ -88,23 +93,62 @@ if [[ "$MODE" == "backfill" ]]; then
     NEXIT="$(grep -o '^exit=[0-9]*' "$NIGHTLY_LOG" 2>/dev/null | tail -1 | cut -d= -f2)"
     skip_backfill(){
         log "SKIP backfill: $1"
+        if [[ "${BACKFILL_GUARD_ONLY:-0}" == "1" ]]; then
+            log "guard-only evaluation (BACKFILL_GUARD_ONLY=1): verdict=SKIP — no Slack alert, no render"
+            exit 3
+        fi
         alert ":warning: *daily_report_sync (backfill)* — SKIPPED the post-nightly re-render of $REPORT_DATE (tab '$TAB'): $1. §2 Fail% / §4 OTD-Google split / §6 stay at their evening state until a manual \`scripts/daily_report_sync.sh backfill\` after the nightly lands."
         exit 0
     }
     [[ -n "$NSTART" ]] || skip_backfill "no nightly start marker in $NIGHTLY_LOG (nightly did not run today?)"
-    [[ -n "$NEXIT" ]] || skip_backfill "nightly started $NSTART but has no exit line yet (still running, or died without one)"
+    # Completion detection [2026-07-02 fix]: the `exit=N` line is nightly.sh's LAST line, written only
+    # if every post-orchestrator step survives — a step dying under `set -euo pipefail` (the
+    # warehouse_qa breach-exit bug, fixed alongside this) killed the script BEFORE it on BOTH Jul-1
+    # and Jul-2, so the guard skipped even though the nightly HAD completed (orchestrator
+    # "ended (status=success)" 10:12:20Z, QA wrapped 11:23Z). FALLBACK: accept the orchestrator's own
+    # completion line, which IS reliably tee'd into the per-date log:
+    #   "HH:MM:SS INFO core.orchestrator: Run <ts>-<id> ended (status=success|partial, failed_ingests=N)"
+    # status=success ≙ exit 0, status=partial ≙ exit 1 (core/orchestrator.py:269-274 — the identical
+    # GO threshold: tables rebuilt, only peripheral ingests failed). Any other/absent status -> SKIP
+    # (fail-safe unchanged). On this fallback path the snapshot comparison below uses the ENDED time
+    # (stricter than start: the promote must postdate actual completion, not just launch).
+    NENDED_TS=""
+    if [[ -z "$NEXIT" ]]; then
+        ENDED_LINE="$(grep 'core\.orchestrator: Run .* ended (status=' "$NIGHTLY_LOG" 2>/dev/null | tail -1)"
+        NSTATUS="$(echo "$ENDED_LINE" | grep -o 'ended (status=[a-z]*' | cut -d= -f2)"
+        case "$NSTATUS" in
+            success) NEXIT=0 ;;
+            partial) NEXIT=1 ;;
+        esac
+        if [[ -n "$NEXIT" ]]; then
+            ENDED_HMS="$(echo "$ENDED_LINE" | grep -o '^[0-9]\{2\}:[0-9]\{2\}:[0-9]\{2\}')"
+            [[ -n "$ENDED_HMS" ]] && NENDED_TS="$(date -u +%Y%m%d)$(echo "$ENDED_HMS" | tr -d ':')"
+            log "backfill guard: no exit= line, using orchestrator completion fallback (status=$NSTATUS -> exit $NEXIT, ended ${ENDED_HMS:-unknown}Z)"
+        fi
+    fi
+    [[ -n "$NEXIT" ]] || skip_backfill "nightly started $NSTART but has neither an exit line nor an orchestrator 'ended (status=success|partial)' line yet (still running, or died hard)"
     [[ "$NEXIT" == "0" || "$NEXIT" == "1" ]] || skip_backfill "nightly exited $NEXIT (hard fail — D-1 sources were NOT rebuilt)"
     SNAP="$(snap_id | grep -o 'warehouse_[0-9]\{8\}_[0-9]\{6\}')"
     [[ -n "$SNAP" ]] || skip_backfill "could not read a snapshot_id from the query API (read API down?)"
     SNAP_TS="${SNAP#warehouse_}"; SNAP_TS="${SNAP_TS/_/}"            # warehouse_YYYYMMDD_HHMMSS -> YYYYMMDDHHMMSS
     NSTART_TS="$(echo "$NSTART" | tr -dc '0-9')"                     # 2026-07-02T05:30:02Z -> 20260702053002
-    if ! [[ "$SNAP_TS" =~ ^[0-9]{14}$ && "$NSTART_TS" =~ ^[0-9]{14}$ ]]; then
-        skip_backfill "unparseable snapshot/nightly timestamps (snap='$SNAP', start='$NSTART')"
+    # On the orchestrator-fallback path compare against the ENDED time when parseable (stricter);
+    # otherwise keep the original start-time comparison.
+    CMP_TS="$NSTART_TS"; CMP_WHAT="today's nightly start $NSTART"
+    if [[ -n "$NENDED_TS" ]]; then
+        CMP_TS="$NENDED_TS"; CMP_WHAT="today's orchestrator completion ${ENDED_HMS}Z"
     fi
-    if (( 10#$SNAP_TS < 10#$NSTART_TS )); then
-        skip_backfill "serving snapshot $SNAP predates today's nightly start $NSTART — the post-nightly promote has not happened"
+    if ! [[ "$SNAP_TS" =~ ^[0-9]{14}$ && "$CMP_TS" =~ ^[0-9]{14}$ ]]; then
+        skip_backfill "unparseable snapshot/nightly timestamps (snap='$SNAP', start='$NSTART', ended='$NENDED_TS')"
+    fi
+    if (( 10#$SNAP_TS < 10#$CMP_TS )); then
+        skip_backfill "serving snapshot $SNAP predates $CMP_WHAT — the post-nightly promote has not happened"
     fi
     log "backfill guard OK: nightly start=$NSTART exit=$NEXIT snapshot=$SNAP — re-rendering $REPORT_DATE from the promoted snapshot"
+    if [[ "${BACKFILL_GUARD_ONLY:-0}" == "1" ]]; then
+        log "guard-only evaluation (BACKFILL_GUARD_ONLY=1): verdict=GO — exiting before render"
+        exit 0
+    fi
 fi
 
 source .venv/bin/activate 2>/dev/null || true
@@ -217,6 +261,6 @@ if $PY scripts/render_daily.py "$REPORT_DATE" "$TAB"; then
 else
     rc=$?
     log "ERROR render failed rc=$rc"
-    alert ":rotating_light: *daily_report_sync ($MODE)* — render FAILED for $REPORT_DATE (rc=$rc). Tab '$TAB' may be stale. Box log: $REPO_DIR/$LOG"
+    alert ":rotating_light: *daily_report_sync ($MODE)* — render FAILED for $REPORT_DATE (rc=$rc). Tab '$TAB' may be stale. Box log: $REPO_DIR/logs/daily_report_sync.log"
     exit 1
 fi

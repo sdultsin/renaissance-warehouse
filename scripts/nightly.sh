@@ -324,8 +324,18 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
         || echo "WARN sync_registry_refresh_failed (continuing)" | tee -a "$LOG_FILE"
 
     echo "running warehouse QA (fail-loud freshness/invariant alert)" | tee -a "$LOG_FILE"
+    # GUARD [2026-07-02]: this was the ONE unguarded pipeline in the success branch. Under the
+    # top-level `set -euo pipefail`, warehouse_qa.py exiting non-zero (any SLA breach — true on
+    # BOTH Jul-1 and Jul-2) made the pipeline fail and ABORTED the whole script right here,
+    # BEFORE QA_RC was even captured: no hardening-DoD check, no promote-at-completion, and no
+    # final `exit=` line — which in turn made daily_report_sync.sh's backfill guard read the
+    # nightly as "died without an exit line" and skip the D-1 re-render. Mirror the orchestrator/
+    # publish steps: disable -e around the pipeline so breaches WARN (the QA already alerted
+    # #cc-sam itself) and the tail always runs.
+    set +e
     "$PYTHON" scripts/warehouse_qa.py 2>&1 | tee -a "$LOG_FILE"
     QA_RC=${PIPESTATUS[0]}
+    set -e
     if [[ "$QA_RC" -ne 0 ]]; then
         echo "WARN warehouse_qa reported breaches (alert posted to #cc-sam)" | tee -a "$LOG_FILE"
     fi
