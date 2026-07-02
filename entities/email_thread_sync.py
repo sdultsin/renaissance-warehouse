@@ -293,8 +293,150 @@ def enumerate_orgs(
 
 
 # ── discovery (FINALIZED-SPEC §4.B / R7) ────────────────────────────────────────
+# ── explicit per-workspace drain watermark (429-hardening, 2026-07-02) ──────────
+# WHY A FILE, not max(message_at): committed max(message_at) only equals "drained through T"
+# when a fetch ran to COMPLETION. To let a 429-storm night commit PARTIAL progress (instead of
+# discarding the whole stage, which froze core.email_message at 2026-06-29 for 3 nights), the
+# apply must be able to commit whatever leads DID get pulled without the watermark silently
+# jumping past the leads that did NOT. So the fetch drains leads in ASCENDING last-reply order,
+# tracks the contiguously-completed prefix, and the apply — after the rows durably commit —
+# advances this explicit per-ws watermark only through that prefix. workspace_watermark()
+# PREFERS the file; the legacy max(message_at) derivation remains the fallback for workspaces
+# that have never had a file entry (identical behavior to before on the happy path).
+def _watermark_file_path() -> Path:
+    return Path(os.environ.get(
+        "WAREHOUSE_THREADS_WATERMARK",
+        str(Path(DB_PATH).parent / "threads_watermark.json"),
+    ))
+
+
+def _load_watermarks() -> dict[str, str]:
+    """{ws_slug: iso-ts 'drained through'} — empty on absent/corrupt file (fallback applies)."""
+    p = _watermark_file_path()
+    try:
+        with open(p) as f:
+            data = json.load(f)
+        return {str(k): str(v) for k, v in data.items() if v}
+    except (OSError, ValueError):
+        return {}
+
+
+def _parse_iso_utc(s: str):
+    try:
+        dt = datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _advance_watermarks(updates: dict) -> dict[str, str]:
+    """MONOTONICALLY advance the explicit watermark file (atomic tmp+rename). A ws entry only
+    moves FORWARD (max of existing and new) so a re-applied old stage can never regress it.
+    Returns the entries actually advanced ({ws: new_iso})."""
+    if not updates:
+        return {}
+    p = _watermark_file_path()
+    current = _load_watermarks()
+    advanced: dict[str, str] = {}
+    for ws, new_dt in updates.items():
+        if new_dt is None:
+            continue
+        old = _parse_iso_utc(current[ws]) if ws in current else None
+        if old is None or new_dt > old:
+            current[ws] = new_dt.astimezone(timezone.utc).isoformat()
+            advanced[ws] = current[ws]
+    if not advanced:
+        return {}
+    tmp = str(p) + ".tmp"
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        with open(tmp, "w") as f:
+            json.dump(current, f, indent=1, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, p)
+    except OSError as exc:
+        logger.warning("could not persist thread watermarks to %s: %s", p, exc)
+        return {}
+    return advanced
+
+
+class _DrainTracker:
+    """Contiguous-prefix drain tracker for the ordered lead pull.
+
+    Leads are submitted in ASCENDING last-reply order; `drained_through()` is the highest
+    last-reply timestamp T such that EVERY lead with key <= T has completed (rows durably
+    staged, or recorded in failed.jsonl — failed leads don't block the prefix because
+    failed.jsonl owns their one-retry, the historic §4.F contract). Completion order is not
+    submission order (worker pool), so out-of-order completions park until the prefix
+    closes. None keys (prior-failed retries with no local reply row) sort FIRST and never
+    advance the watermark themselves."""
+
+    def __init__(self, ordered_keys: list):
+        self._keys = ordered_keys
+        self._done = [False] * len(ordered_keys)
+        self._ptr = 0
+        self._best = None  # max non-None key in the completed prefix
+
+    def mark_done(self, idx: int) -> None:
+        self._done[idx] = True
+        while self._ptr < len(self._done) and self._done[self._ptr]:
+            k = self._keys[self._ptr]
+            if k is not None and (self._best is None or k > self._best):
+                self._best = k
+            self._ptr += 1
+
+    def drained_through(self):
+        return self._best
+
+    def all_done(self) -> bool:
+        return self._ptr == len(self._done)
+
+
+def _progress_sidecar_path(stage_path: str) -> str:
+    return stage_path + ".progress"
+
+
+def _write_progress_sidecar(stage_path: str, progress: dict) -> None:
+    """Atomically persist per-ws fetch progress ({ws: {drained_through, complete, mode}}).
+    Written ONLY right after a stage fsync so it never claims more than what is durably
+    staged; survives a SIGKILL'd fetch so the apply can advance watermarks for the drained
+    prefix (partial-progress commit)."""
+    path = _progress_sidecar_path(stage_path)
+    tmp = path + ".tmp"
+    try:
+        with open(tmp, "w") as f:
+            json.dump(progress, f, default=str, indent=1, sort_keys=True)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except OSError as exc:
+        logger.warning("could not write progress sidecar for %s: %s", stage_path, exc)
+
+
+def _read_progress_sidecar(stage_path: str) -> dict:
+    try:
+        with open(_progress_sidecar_path(stage_path)) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
 def workspace_watermark(read_conn: duckdb.DuckDBPyConnection, ws_slug: str):
-    """max(message_at) for THIS workspace (R7 — per-workspace, never global)."""
+    """Effective incremental lower bound for THIS workspace (R7 — per-workspace, never global).
+
+    PREFERS the explicit drain watermark file (exact 'drained through' state, advanced only
+    after an apply commits — see _advance_watermarks): after a PARTIAL apply, committed
+    max(message_at) overshoots the true drained state, so the file is authoritative once it
+    exists. Falls back to the historic max(message_at) derivation otherwise. Both paths keep
+    the 2-day overlap re-pull."""
+    wm = _load_watermarks().get(ws_slug)
+    if wm:
+        dt = _parse_iso_utc(wm)
+        if dt is not None:
+            return dt - _OVERLAP
     try:
         row = read_conn.execute(
             "SELECT max(message_at) FROM raw_instantly_email_message WHERE workspace_id = ?",
@@ -314,8 +456,12 @@ def discover_replied_leads(
     ws_uuid: str | None,
     since_ws,
     skip_live_walk: bool = False,
-) -> tuple[set[str], dict]:
-    """Lowercased lead set to (re)pull for one org since `since_ws`.
+) -> tuple[dict[str, "datetime | None"], dict]:
+    """{lowercased lead -> last known reply ts (drain key)} to (re)pull for one org since
+    `since_ws`. The timestamp keys the ORDERED DRAIN (429-hardening 2026-07-02): leads are
+    pulled ascending by last-reply time so a partial fetch's contiguously-completed prefix is a
+    valid 'drained through T' watermark. A None ts (unparseable) orders first and never
+    advances the watermark.
 
     DISCOVERY SOURCE = the ALREADY-SYNCED LOCAL inbound atom (raw_instantly_email, DDL 36 —
     the received/inbound stream the native pipe #36/#77 keeps current), NOT a live full /emails
@@ -341,7 +487,15 @@ def discover_replied_leads(
     On the bounded incremental walk a pagination-ceiling hit is still surfaced (HARD FAIL — no
     watermark advance) the same as a per-lead pull truncation (FINALIZED-SPEC §4.C).
     """
-    leads: set[str] = set()
+    leads: dict[str, datetime | None] = {}
+
+    def _note(lead: str, ts) -> None:
+        """Keep the MAX known reply ts per lead (the drain key); None never displaces a ts."""
+        ts = _coerce_utc(ts)
+        cur = leads.get(lead)
+        if lead not in leads or (ts is not None and (cur is None or ts > cur)):
+            leads[lead] = ts
+
     # --- LOCAL discovery from the synced inbound atom (zero API calls) ---
     # Match raw_instantly_email.workspace_id against BOTH the org_id and the ws UUID (DDL 36
     # writes `organization_id or ws.id`, so either may be present depending on the API payload).
@@ -351,20 +505,21 @@ def discover_replied_leads(
     try:
         if since_ws is None:
             rows = read_conn.execute(
-                f"SELECT DISTINCT lower(trim(lead_email)) FROM raw_instantly_email "
-                f"WHERE workspace_id IN ({placeholders}) AND lead_email IS NOT NULL",
+                f"SELECT lower(trim(lead_email)), max(reply_timestamp) FROM raw_instantly_email "
+                f"WHERE workspace_id IN ({placeholders}) AND lead_email IS NOT NULL "
+                f"GROUP BY 1",
                 ids,
             ).fetchall()
         else:
             rows = read_conn.execute(
-                f"SELECT DISTINCT lower(trim(lead_email)) FROM raw_instantly_email "
+                f"SELECT lower(trim(lead_email)), max(reply_timestamp) FROM raw_instantly_email "
                 f"WHERE workspace_id IN ({placeholders}) AND lead_email IS NOT NULL "
-                f"AND reply_timestamp > ?",
+                f"AND reply_timestamp > ? GROUP BY 1",
                 ids + [since_ws],
             ).fetchall()
-        for (lead,) in rows:
+        for lead, ts in rows:
             if lead:
-                leads.add(lead)
+                _note(lead, ts)
                 local_n += 1
     except duckdb.Error as exc:
         # raw_instantly_email not present (e.g. a brand-new warehouse before #36 ran) -> empty
@@ -385,7 +540,7 @@ def discover_replied_leads(
         for e in client.all_emails(since=cutoff_iso, ceiling_flag=flag):
             lead = (e.get("lead") or "").lower().strip()
             if lead:
-                leads.add(lead)
+                _note(lead, e.get("timestamp_email") or e.get("timestamp_created"))
             n_seen += 1
         ceiling_hit = bool(flag.get("hit"))
 
@@ -394,6 +549,19 @@ def discover_replied_leads(
         "incremental_emails_scanned": n_seen,
         "discovery_ceiling_hit": ceiling_hit,
     }
+
+
+def _coerce_utc(ts):
+    """Best-effort tz-AWARE UTC datetime from a DuckDB TIMESTAMP(TZ) / ISO string; None if
+    unparseable. Naive values are assumed UTC (the warehouse convention) so drain keys are
+    always mutually comparable."""
+    if ts is None:
+        return None
+    if isinstance(ts, str):
+        return _parse_iso_utc(ts)
+    if isinstance(ts, datetime):
+        return ts if ts.tzinfo is not None else ts.replace(tzinfo=timezone.utc)
+    return None
 
 
 # ── transform (FINALIZED-SPEC §4.D) ─────────────────────────────────────────────
@@ -539,6 +707,45 @@ def _write_failed(failed_path: str, records: list[dict]) -> None:
         logger.warning("could not write failed.jsonl %s: %s", failed_path, exc)
 
 
+def _append_failed_durable(fh, rec: dict) -> bool:
+    """DURABLY append one failure record to the open failed.jsonl handle (write+flush+fsync).
+
+    Adversarial-review B1: a failed lead may only close its drain slot (letting the watermark
+    advance past it) once its retry record is ON DISK — an in-memory-only `new_failed` entry
+    dies with a 60m-timeout SIGKILL, and a watermark that advanced past it would then skip the
+    lead FOREVER. Returns False on any OSError (caller must then NOT close the slot — the
+    prefix stalls, which is the fail-safe direction)."""
+    try:
+        fh.write(json.dumps(rec, default=str) + "\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+        return True
+    except (OSError, ValueError) as exc:  # ValueError = closed handle; both mean NOT durable
+        logger.warning("could not durably append failed-lead record (%s) — drain slot stays open", exc)
+        return False
+
+
+def _ensure_trailing_newline(path: str) -> None:
+    """Terminate a torn final line before appending (adversarial-review M2): a hard-killed
+    fetch can leave a partial line with no newline; a resumed fetch's first row would
+    concatenate onto it, corrupting an INTACT row that sanitize would then drop. Appending a
+    newline isolates the torn fragment as its own (sanitize-dropped) line."""
+    try:
+        with open(path, "rb+") as f:
+            f.seek(0, 2)
+            if f.tell() == 0:
+                return
+            f.seek(-1, 2)
+            if f.read(1) != b"\n":
+                f.write(b"\n")
+                f.flush()
+                os.fsync(f.fileno())
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        logger.warning("could not newline-terminate stage %s: %s", path, exc)
+
+
 def _resume_done(stage_path: str) -> set[str]:
     """message_ids already in the staging checkpoint (restart resumes, never re-pulls)."""
     done: set[str] = set()
@@ -604,6 +811,14 @@ def run_fetch(
 
     per_ws_runlog: list[dict] = []
     ceiling_hit_ws: list[str] = []
+    # Ordered-drain progress ({ws: {drained_through, complete, mode}}) — persisted to the
+    # .progress sidecar after every stage fsync so a KILLED fetch (the 60m nightly timeout /
+    # SIGKILL) leaves an exact, durable "drained through T" record the apply can trust.
+    # mode drives whether the apply may advance the explicit watermark: watermark/full yes,
+    # override no (a fixed window says nothing about completeness before its lower bound).
+    mode = "override" if since_override is not None else ("full" if full_backfill else "watermark")
+    progress: dict[str, dict] = {}
+    total_429 = 0
 
     # First retry the leads that 4xx/5xx-failed their ?lead= pull on a PRIOR run (FINALIZED-SPEC
     # §4.F: "one retry on the next full run — not permanently skipped"). We read the prior
@@ -612,8 +827,13 @@ def run_fetch(
     # AGAIN this run.
     prior_failed_by_ws = _read_prior_failed(failed_path)
 
-    # Serial across orgs (never parallelize workspaces).
-    with open(stage_path, "a") as stage:
+    # Serial across orgs (never parallelize workspaces). The failed.jsonl handle is opened in
+    # APPEND mode alongside the stage: each failure is durably appended the moment it happens
+    # (B1 — see _append_failed_durable); the end-of-run _write_failed rewrite still performs the
+    # §4.F one-retry consolidation on a clean finish. _ensure_trailing_newline isolates a torn
+    # tail before a RESUMED fetch appends (M2).
+    _ensure_trailing_newline(stage_path)
+    with open(stage_path, "a") as stage, open(failed_path, "a") as failed_out:
         new_failed: list[dict] = []
         retried_ws: set[str] = set()  # ws whose pull loop ran (its prior-failed were retried)
         for ws_uuid, (ws_slug, api_key, organization_id) in workspaces.items():
@@ -623,6 +843,7 @@ def run_fetch(
                     # ── discovery phase: a SHORT-LIVED read-only conn, CLOSED before the pull ──
                     # so the long per-lead network pull below holds NO DuckDB shared lock (which would
                     # otherwise block the nightly's RW open + every apply for the whole run).
+                    discovery_started = datetime.now(timezone.utc)
                     disc_conn = db_module.connect(read_only=True)
                     try:
                         if full_backfill:
@@ -634,63 +855,130 @@ def run_fetch(
                         # discovery matches raw_instantly_email.workspace_id against BOTH the org UUID
                         # AND the ws UUID (DDL 36 stored `organization_id or ws.id`) so no existing
                         # lead is missed regardless of which the inbound row carries.
-                        replied_leads, dd = discover_replied_leads(
+                        lead_keys, dd = discover_replied_leads(
                             disc_conn, client, organization_id, ws_uuid, since_ws,
                             skip_live_walk=(local_only or full_backfill),
                         )
                         total_cold_sends_window = _cold_send_count(disc_conn, ws_slug, since_ws)
+                        # pre-run effective drained-through (for the M1 seed below): the value
+                        # discovery is ABOUT to be correct against, whatever the mode.
+                        pre_run_wm = since_ws if mode == "watermark" else workspace_watermark(disc_conn, ws_slug)
                     finally:
                         disc_conn.close()   # release the shared lock BEFORE the multi-hour pull
-                    # union back the prior-run failures for this ws (one retry — §4.F)
-                    replied_leads = set(replied_leads) | prior_failed_by_ws.get(ws_slug, set())
+                    # M1 (adversarial review): durably SEED this ws's watermark-file entry with
+                    # its pre-run effective state BEFORE any of its rows can commit. If the apply
+                    # later dies between COMMIT and the sidecar merge, workspace_watermark() must
+                    # NOT fall back to max(message_at) — which the partial commit just pushed
+                    # past the true drained state. Monotone max-merge makes this a no-op for
+                    # file-backed workspaces and a one-time (bounded, 2d) conservative pin for
+                    # legacy-fallback ones. A BRAND-NEW ws (no prior state at all) pins at the
+                    # 1970 epoch so a crashed first partial run re-discovers in full rather
+                    # than trusting its own partial max(message_at); override windows are
+                    # operator-managed and keep their historic semantics (no pin).
+                    seeded = _coerce_utc(pre_run_wm)
+                    if seeded is None and mode != "override":
+                        seeded = datetime(1970, 1, 1, tzinfo=timezone.utc)
+                    if seeded is not None:
+                        _advance_watermarks({ws_slug: seeded})
+                    # union back the prior-run failures for this ws (one retry — §4.F); no local
+                    # reply row -> None drain key (ordered first, never advances the watermark).
+                    for lead in prior_failed_by_ws.get(ws_slug, set()):
+                        lead_keys.setdefault(lead, None)
                     if dd.get("discovery_ceiling_hit"):
                         # Discovery scan itself truncated -> the replied-lead SET is incomplete.
                         # HARD FAIL the workspace exactly like a per-lead pull truncation: do NOT
                         # advance its watermark, exclude its rows from apply (§4.C, both halves).
                         ws_ceiling = True
+                        ceiling_hit_ws.append(ws_slug)
+                        _write_ceiling_sidecar(stage_path, ceiling_hit_ws)  # durable IMMEDIATELY
                         logger.error(
                             "DISCOVERY PAGINATION CEILING on ws=%s — replied-lead set truncated; "
                             "HARD FAIL, watermark NOT advanced, ws rows quarantined.", ws_slug,
                         )
-                    replied_lead_delta = len(replied_leads)
+                    replied_lead_delta = len(lead_keys)
                     leads_pulled = 0
                     api_calls = 0
                     messages_upserted = 0
+
+                    # Baseline progress entry BEFORE the pull: "drained through since_ws" is
+                    # already true of the pre-run state on the watermark path (since_ws is the
+                    # prior watermark minus the overlap; _advance_watermarks is monotone so this
+                    # can never regress anything). Ensures every ws that stages ANY row this run
+                    # has a durable progress entry — a mid-ws kill can then never let the apply
+                    # fall back to the overshooting max(message_at) derivation.
+                    baseline = _coerce_utc(since_ws) if mode == "watermark" else None
+                    progress[ws_slug] = {
+                        "drained_through": baseline.isoformat() if baseline else None,
+                        "complete": False, "mode": mode,
+                    }
+                    _write_progress_sidecar(stage_path, progress)
 
                     def pull_one(lead: str):
                         items, hit = client.lead_emails_window(lead)
                         return lead, items, hit
 
-                    # bounded concurrency WITHIN the org. Map each future -> its lead so a pull
-                    # that raises after _get's retries records the ACTUAL lead in failed.jsonl
-                    # (FINALIZED-SPEC §4.F: route the failing id to failed.jsonl for one retry on
-                    # the next full run — NOT permanently skipped). Without the map the except
-                    # block has no bound `lead` and would write a useless '?' (the bug fixed here):
-                    # the next run would have nothing to retry and the lead would be silently and
-                    # permanently dropped (violating ~100%-or-wipe completeness).
-                    retried_ws.add(ws_slug)  # this ws's prior-failed leads ARE being retried now
+                    # ── ORDERED DRAIN (429-hardening 2026-07-02) ──────────────────────────────
+                    # Leads are pulled ASCENDING by last-reply time (None keys — prior-failed
+                    # retries — first). The _DrainTracker's contiguously-completed prefix is a
+                    # valid per-ws "drained through T" even if this process is KILLED mid-pull
+                    # (the 60m nightly timeout during a sustained 429 storm): everything with a
+                    # key <= T is durably staged or DURABLY in failed.jsonl at the instant its
+                    # slot closes (B1: failures fsync via _append_failed_durable BEFORE
+                    # mark_done; failed.jsonl is preserved across nightly runs). The sidecar is
+                    # only written right after a stage fsync so it never claims un-staged work.
+                    # Map each future -> its ordinal so a pull that raises after _get's retries
+                    # records the ACTUAL lead in failed.jsonl (§4.F: one retry on the next run —
+                    # NOT permanently skipped) AND still closes its slot in the drain prefix
+                    # (failed.jsonl owns the retry; the watermark must not stall on it).
+                    epoch = datetime.min.replace(tzinfo=timezone.utc)
+                    ordered = sorted(lead_keys.items(),
+                                     key=lambda kv: (kv[1] is not None, kv[1] or epoch))
+                    tracker = _DrainTracker([k for _, k in ordered])
+
+                    def _sync_progress() -> None:
+                        dt = tracker.drained_through() or baseline
+                        progress[ws_slug] = {
+                            "drained_through": dt.isoformat() if dt else None,
+                            "complete": False, "mode": mode,
+                        }
+                        _write_progress_sidecar(stage_path, progress)
+
                     with ThreadPoolExecutor(max_workers=_LEAD_WORKERS) as ex:
-                        fut_to_lead = {ex.submit(pull_one, lead): lead for lead in replied_leads}
-                        for n, fut in enumerate(as_completed(fut_to_lead), 1):
-                            lead = fut_to_lead[fut]
+                        fut_to_idx = {ex.submit(pull_one, lead): i
+                                      for i, (lead, _key) in enumerate(ordered)}
+                        for n, fut in enumerate(as_completed(fut_to_idx), 1):
+                            idx = fut_to_idx[fut]
+                            lead = ordered[idx][0]
                             try:
                                 lead, items, hit = fut.result()
                             except InstantlyError as exc:
-                                new_failed.append(
-                                    {"lead": lead, "ws": ws_slug, "error": str(exc)[:200],
-                                     "fetched_at": fetched_at})
+                                rec = {"lead": lead, "ws": ws_slug, "error": str(exc)[:200],
+                                       "fetched_at": fetched_at}
+                                new_failed.append(rec)
+                                # B1: the slot closes ONLY once the retry record is ON DISK —
+                                # failed.jsonl owns the retry (§4.F); an fsync failure keeps the
+                                # slot open so the watermark can never pass an unrecorded lead.
+                                if _append_failed_durable(failed_out, rec):
+                                    tracker.mark_done(idx)
                                 continue
                             except Exception as exc:  # noqa: BLE001 — any pull error -> retry next run
-                                new_failed.append(
-                                    {"lead": lead, "ws": ws_slug,
-                                     "error": f"{type(exc).__name__}: {exc}"[:200],
-                                     "fetched_at": fetched_at})
+                                rec = {"lead": lead, "ws": ws_slug,
+                                       "error": f"{type(exc).__name__}: {exc}"[:200],
+                                       "fetched_at": fetched_at}
+                                new_failed.append(rec)
+                                if _append_failed_durable(failed_out, rec):
+                                    tracker.mark_done(idx)
                                 continue
                             leads_pulled += 1
                             # 1 cursor walk = >=1 api call; approximate (page count unknown here).
                             api_calls += max(1, len(items) // 100 + 1)
                             if hit:
-                                ws_ceiling = True  # pagination ceiling => HARD FAIL for this ws
+                                if not ws_ceiling:
+                                    ws_ceiling = True  # pagination ceiling => HARD FAIL for this ws
+                                    ceiling_hit_ws.append(ws_slug)
+                                    _write_ceiling_sidecar(stage_path, ceiling_hit_ws)  # durable NOW
+                                # a TRUNCATED lead's slot never closes -> the drain watermark can
+                                # never advance past it (its rows are quarantined at apply anyway).
                             for item in items:
                                 # org provenance fallback = the REAL organization_id (when the
                                 # item omits its own); ws_slug is the canonical stored workspace_id.
@@ -707,12 +995,33 @@ def run_fetch(
                                 # is the RUNLOG-APPLY line's messages_upserted emitted by _apply_core
                                 # — on a fresh (non-resumed) stage the per-ws sum equals it.
                                 messages_upserted += 1
+                            if not hit:
+                                tracker.mark_done(idx)  # rows written to the stage buffer above
                             if n % 200 == 0:
                                 stage.flush()
                                 os.fsync(stage.fileno())
+                                _sync_progress()  # ONLY after fsync: never claim un-staged work
                     stage.flush()
                     os.fsync(stage.fileno())
+                    # M4: only NOW did this ws's prior-failed leads genuinely get their retry
+                    # (the pool drained; every outcome is durable). Marking earlier let a
+                    # mid-pool ws-level error erase the §4.F ledger for leads never retried.
+                    retried_ws.add(ws_slug)
 
+                    # ws pull loop finished. Clean completion (no ceiling) drains through the
+                    # DISCOVERY time: everything discoverable as of that instant was pulled or
+                    # recorded failed; replies landing after it belong to the next window.
+                    if ws_ceiling:
+                        _sync_progress()  # keep the last honest partial prefix
+                    else:
+                        progress[ws_slug] = {
+                            "drained_through": discovery_started.isoformat(),
+                            "complete": True, "mode": mode,
+                        }
+                        _write_progress_sidecar(stage_path, progress)
+
+                    ws_429 = client.rate_limit_hits
+                    total_429 += ws_429
                     rl = {
                         "ws": ws_slug,
                         "replied_lead_delta": replied_lead_delta,
@@ -721,18 +1030,22 @@ def run_fetch(
                         "messages_upserted": messages_upserted,
                         "total_cold_sends_window": total_cold_sends_window,
                         "ceiling_hit": ws_ceiling,
+                        "rate_limit_429s": ws_429,
+                        "drained_through": progress[ws_slug]["drained_through"],
+                        "complete": progress[ws_slug]["complete"],
                     }
                     per_ws_runlog.append(rl)
-                    # G6/G7 parse this exact line.
+                    # G6/G7 parse this exact line (new fields appended AFTER the historic ones).
                     logger.info(
                         "RUNLOG run_id=%s ws=%s replied_lead_delta=%d leads_pulled=%d "
-                        "api_calls=%d messages_upserted=%d total_cold_sends_window=%d",
+                        "api_calls=%d messages_upserted=%d total_cold_sends_window=%d "
+                        "rate_limit_429s=%d drained_through=%s complete=%s",
                         run_id, ws_slug, replied_lead_delta, leads_pulled, api_calls,
-                        messages_upserted, total_cold_sends_window,
+                        messages_upserted, total_cold_sends_window, ws_429,
+                        progress[ws_slug]["drained_through"], progress[ws_slug]["complete"],
                     )
                     if ws_ceiling:
                         # HARD FAIL: do NOT advance this ws watermark; escalate.
-                        ceiling_hit_ws.append(ws_slug)
                         logger.error(
                             "PAGINATION CEILING on ws=%s (full backfill=%s) — HARD FAIL, "
                             "watermark NOT advanced, escalate.",
@@ -764,12 +1077,28 @@ def run_fetch(
     diag["per_ws_runlog"] = per_ws_runlog
     diag["ceiling_hit_ws"] = ceiling_hit_ws
     diag["stage_path"] = stage_path
+    diag["rate_limit_429s"] = total_429
+    diag["progress"] = progress
     # Persist the ceiling-hit workspace list next to the stage file so a SEPARATE apply
     # invocation (the CLI fetch/apply split) can EXCLUDE those workspaces' partial rows
     # from the upsert — otherwise a truncated ws's rows would commit and ADVANCE its
     # max(message_at) watermark, silently skipping the unreached middle of its history
-    # (FINALIZED-SPEC §4.C/§4.E HARD FAIL). The apply reads this sidecar.
+    # (FINALIZED-SPEC §4.C/§4.E HARD FAIL). The apply reads this sidecar. (Also written
+    # INCREMENTALLY at first detection above, so a killed fetch still quarantines.)
     _write_ceiling_sidecar(stage_path, ceiling_hit_ws)
+    # One-line per-run FETCH summary so the QA can tell partial progress under a 429 storm
+    # from total failure at a glance (grep RUN-SUMMARY-FETCH in the nightly log).
+    logger.info(
+        "RUN-SUMMARY-FETCH run_id=%s mode=%s workspaces=%d ws_errors=%d leads_discovered=%d "
+        "leads_pulled=%d leads_failed=%d messages_staged=%d rate_limit_429s=%d "
+        "ceiling_hit_ws=%s complete_ws=%d/%d",
+        run_id, mode, len(workspaces), len(diag.get("ws_errors", [])),
+        sum(r["replied_lead_delta"] for r in per_ws_runlog),
+        sum(r["leads_pulled"] for r in per_ws_runlog),
+        len(new_failed), sum(r["messages_upserted"] for r in per_ws_runlog), total_429,
+        sorted(ceiling_hit_ws),
+        sum(1 for p in progress.values() if p.get("complete")), len(workspaces),
+    )
     return diag
 
 
@@ -849,6 +1178,14 @@ def run_apply(stage_path: str, run_id: str, db_path: Path | None = None) -> dict
         logger.info("apply: no staging file at %s — nothing to apply", stage_path)
         return {"messages_upserted": 0, "manifest": None, "messages_upserted_changed": 0}
 
+    # PARTIAL-FETCH tolerance [2026-07-02]: a fetch killed mid-write (the 60m nightly timeout
+    # under a 429 storm) can leave ONE torn (non-JSON) trailing line in the stage. read_json
+    # runs ignore_errors=false (strict — data-quality invariant for intact lines), so a torn
+    # tail would abort the WHOLE apply and lose the night's progress. Drop unparseable lines
+    # (loudly) before loading; the drain watermark never advanced past un-fsynced work, so a
+    # dropped torn line is re-pulled next run by construction.
+    _sanitize_stage(stage_path)
+
     ceiling_excluded = _read_ceiling_sidecar(stage_path)
     # read-write connect acquires the writer flock (unless a wrapper already holds it).
     con = db_module.connect(db_path)
@@ -856,6 +1193,56 @@ def run_apply(stage_path: str, run_id: str, db_path: Path | None = None) -> dict
         return _apply_core(con, stage_path, run_id, ceiling_excluded)
     finally:
         con.close()
+
+
+def _sanitize_stage(stage_path: str) -> int:
+    """Drop unparseable JSONL lines (torn tail from a killed fetch) — STREAMING (M3).
+
+    Pass 1 counts bad lines with O(1) memory; only when something is bad does pass 2
+    stream-rewrite to a tmp file + atomic replace (a full-backfill stage can be multi-GB —
+    accumulating kept lines in memory OOMs the droplet on the happy path). Returns dropped."""
+    bad = 0
+    try:
+        with open(stage_path) as f:
+            for line in f:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    json.loads(s)
+                except ValueError:
+                    bad += 1
+    except OSError as exc:
+        logger.warning("apply: could not sanitize stage %s: %s", stage_path, exc)
+        return 0
+    if not bad:
+        return 0
+    kept = 0
+    tmp = stage_path + ".sanitized"
+    try:
+        with open(stage_path) as srcf, open(tmp, "w") as dst:
+            for line in srcf:
+                s = line.strip()
+                if not s:
+                    continue
+                try:
+                    json.loads(s)
+                except ValueError:
+                    continue
+                dst.write(s + "\n")
+                kept += 1
+            dst.flush()
+            os.fsync(dst.fileno())
+        os.replace(tmp, stage_path)
+    except OSError as exc:
+        logger.warning("apply: sanitize rewrite failed for %s: %s", stage_path, exc)
+        return 0
+    logger.warning(
+        "apply: dropped %d unparseable stage line(s) (torn tail from a killed fetch) — "
+        "kept %d intact rows; the drain watermark never covered un-fsynced work, so the "
+        "dropped lines re-pull next run.", bad, kept,
+    )
+    return bad
 
 
 def _apply_core(
@@ -917,8 +1304,12 @@ def _apply_core(
     if not staged:
         logger.info("apply: staging empty after dedup/ceiling-exclude — nothing to write")
         con.execute("DROP TABLE IF EXISTS _stage_email_message")
+        # An empty stage can still carry real drain progress (e.g. every discovered lead's
+        # messages were already committed by a prior run) — advance watermarks anyway.
+        advanced = _merge_drain_watermarks(stage_path, ceiling_excluded)
         return {"messages_upserted": 0, "manifest": None, "messages_upserted_changed": 0,
-                "ceiling_excluded": sorted(ceiling_excluded)}
+                "ceiling_excluded": sorted(ceiling_excluded),
+                "watermarks_advanced": advanced}
 
     # messages_upserted_changed (G2): count staged ids whose business payload differs from the
     # CURRENTLY-committed row (a brand-new id counts as changed; an unchanged re-pull does NOT).
@@ -959,12 +1350,18 @@ def _apply_core(
     con.execute("CHECKPOINT")
     con.execute("DROP TABLE IF EXISTS _stage_email_message")
     guard = interest_status_guard(con)
+    # PARTIAL-PROGRESS WATERMARK COMMIT [2026-07-02]: the rows are now durably committed
+    # (post-CHECKPOINT), so it is safe to advance the explicit per-ws drain watermark through
+    # the fetch's contiguously-drained prefix (the .progress sidecar). This is what turns a
+    # 429-storm night from "whole night discarded" into "whatever landed, landed" — the next
+    # run resumes from the drained prefix instead of re-losing everything.
+    advanced = _merge_drain_watermarks(stage_path, ceiling_excluded)
     # Run-level summary line (G2 reads messages_upserted_changed; G7 reconciles
-    # messages_upserted == manifest line count).
+    # messages_upserted == manifest line count; new fields appended AFTER the historic ones).
     logger.info(
         "RUNLOG-APPLY run_id=%s messages_upserted=%d messages_upserted_changed=%d "
-        "ceiling_excluded=%s manifest=%s",
-        run_id, len(ids), changed, sorted(ceiling_excluded), manifest,
+        "ceiling_excluded=%s manifest=%s watermarks_advanced=%s",
+        run_id, len(ids), changed, sorted(ceiling_excluded), manifest, advanced,
     )
     return {
         "messages_upserted": len(ids),
@@ -972,7 +1369,33 @@ def _apply_core(
         "manifest": str(manifest),
         "interest_guard": guard,
         "ceiling_excluded": sorted(ceiling_excluded),
+        "watermarks_advanced": advanced,
     }
+
+
+def _merge_drain_watermarks(stage_path: str, ceiling_excluded: set[str] | None) -> dict[str, str]:
+    """Advance the explicit per-ws watermark file from the fetch's .progress sidecar.
+
+    Only AFTER the staged rows durably committed (callers invoke this post-CHECKPOINT / on the
+    provably-empty path). Skips: ceiling-hit workspaces (their rows were quarantined — §4.C),
+    override-mode entries (a fixed window proves nothing about completeness before its lower
+    bound), and entries with no drained_through. Monotone by construction (_advance_watermarks
+    takes max), so replaying an old sidecar can never regress a watermark."""
+    ceiling_excluded = ceiling_excluded or set()
+    progress = _read_progress_sidecar(stage_path)
+    updates: dict[str, datetime] = {}
+    for ws, entry in progress.items():
+        if ws in ceiling_excluded:
+            continue
+        if not isinstance(entry, dict) or entry.get("mode") == "override":
+            continue
+        dt = _parse_iso_utc(entry.get("drained_through") or "") if entry.get("drained_through") else None
+        if dt is not None:
+            updates[ws] = dt
+    advanced = _advance_watermarks(updates)
+    if advanced:
+        logger.info("drain watermarks advanced: %s (file=%s)", advanced, _watermark_file_path())
+    return advanced
 
 
 def interest_status_guard(con: duckdb.DuckDBPyConnection) -> dict:
