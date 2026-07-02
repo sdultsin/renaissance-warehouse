@@ -26,6 +26,16 @@ STAGED="$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null || true)"
 if ! echo "$STAGED" | grep -Eq '^(sql/ddl/.*\.sql|(entities|sources|scripts)/.*\.py)$'; then
   exit 0
 fi
+# Scope condition [2026-07-02]: scripts/*.py are mostly RENDERERS/report code, which the moderator's
+# schema lens false-BLOCKs (PR #165: a no-DDL render_daily.py diff drew BLOCK verdicts from this
+# warn-only backstop). Only send a scripts/-only change to the moderator when its staged DIFF
+# actually touches schema surface (DDL statements / raw_pipeline / an INSERT column list).
+# sql/ddl + entities/sources (the schema owners/loaders) always go.
+if ! echo "$STAGED" | grep -Eq '^(sql/ddl/.*\.sql|(entities|sources)/.*\.py)$' \
+   && ! git diff --cached -U0 -- 'scripts/*.py' 2>/dev/null \
+        | grep -qiE '(CREATE|ALTER|DROP)[[:space:]]+(OR[[:space:]]+REPLACE[[:space:]]+)?(TABLE|VIEW)|INSERT[[:space:]]+(OR[[:space:]]+(REPLACE|IGNORE)[[:space:]]+)?INTO|raw_pipeline'; then
+  exit 0
+fi
 
 echo "── schema moderator (WARN-ONLY backstop; never blocks) ──"
 GATE_RC=0

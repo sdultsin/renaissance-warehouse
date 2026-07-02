@@ -10,10 +10,21 @@
 #                      sendivo(mirror+inbound), iskra, close, canonical(meeting) -> promote -> render.
 #   relock             cheap final re-lock at ~12:30 AM ET: stage funding form -> sheets ->
 #                      canonical(meeting) -> promote -> re-render (locks ~99%-final bookings).
+#   backfill           post-NIGHTLY re-render of YESTERDAY-ET's tab [2026-07-02]. Both renders above
+#                      fire BEFORE the 05:30Z heavy nightly that lands the D-1 sources (sendivo
+#                      log-level delivered/fail -> §2 Fail%, core.sending_account_daily -> §4 Actual
+#                      OTD/Google split, core.email_message -> §6), so without this pass those columns
+#                      keep their evening state FOREVER. Render-ONLY (no ingest phases, no promote):
+#                      the nightly already rebuilt + promoted; we just re-read the fresh snapshot.
+#                      GUARD: skips + Slack-warns unless today's nightly COMPLETED (exit 0/1 in
+#                      logs/<utc-date>.log) AND the serving snapshot was promoted AFTER it started —
+#                      never silently re-render the same stale data as if it were fresh.
 #
 # Cron (UTC, droplet):
 #   0  1 * * *  /root/renaissance-warehouse/scripts/daily_report_sync.sh evening >> .../logs/daily_report_sync.log 2>&1   # 9 PM ET
 #   30 4 * * *  /root/renaissance-warehouse/scripts/daily_report_sync.sh relock  >> .../logs/daily_report_sync.log 2>&1   # 12:30 AM ET
+#   45 12 * * * /root/renaissance-warehouse/scripts/daily_report_sync.sh backfill >> .../logs/daily_report_sync.log 2>&1  # post-nightly D-1 re-render (nightly 05:30Z + ~2-4h expected post-compaction; guard skips if late)
+#   (each wrapped in `/usr/bin/flock -n /tmp/daily_report_sync.lock` — see scripts/install_daily_report_backfill_cron.sh)
 #
 # Each orchestrator --phase self-serializes on the warehouse writer lock (core/db.py in-proc
 # acquire-or-wait), so this never clobbers another writer. The heavy nightly is scheduled AFTER
@@ -29,11 +40,12 @@ mkdir -p logs
 
 MODE="${1:-evening}"
 # REPORT_DATE = the ET day the tab is for.
-#   evening cron fires 01:00Z (= 9 PM ET, same ET day)        -> today ET
-#   relock  cron fires 04:30Z (= 12:30 AM ET, the day ended)  -> yesterday ET
+#   evening  cron fires 01:00Z (= 9 PM ET, same ET day)        -> today ET
+#   relock   cron fires 04:30Z (= 12:30 AM ET, the day ended)  -> yesterday ET
+#   backfill cron fires ~12:45Z (= ~8:45 AM ET, post-nightly)  -> yesterday ET
 if [[ -n "${2:-}" ]]; then
     REPORT_DATE="$2"
-elif [[ "$MODE" == "relock" ]]; then
+elif [[ "$MODE" == "relock" || "$MODE" == "backfill" ]]; then
     REPORT_DATE="$(TZ=America/New_York date -d 'yesterday' +%F)"
 else
     REPORT_DATE="$(TZ=America/New_York date +%F)"
@@ -54,6 +66,47 @@ snap_id(){ curl -s -m 20 -X POST "$WH_API" -H "Authorization: Bearer $READER_TOK
 
 log "================ daily_report_sync MODE=$MODE REPORT_DATE=$REPORT_DATE TAB='$TAB' ================"
 
+# ---- 0) backfill GUARD [2026-07-02] — render only from a genuinely post-nightly snapshot ----
+# Two facts must BOTH hold, else re-rendering would just repaint the same stale evening-state data
+# with a fresher-looking timestamp (worse than skipping):
+#   (a) today's heavy nightly (05:30Z cron -> logs/<utc-date>.log) COMPLETED with exit 0 (clean) or
+#       1 (partial: tables rebuilt, only peripheral ingests failed — same threshold the nightly
+#       itself uses to publish dashboards + promote). No start marker / no exit line (still running,
+#       e.g. the 10.6h Jul-1 run, or died hard like the exit-line-less Jul-1 log) / exit>=2 -> SKIP.
+#   (b) the SERVING snapshot the renderer reads was promoted AFTER that nightly STARTED. The
+#       snapshot_id embeds its build UTC timestamp (warehouse_YYYYMMDD_HHMMSS_mmm.duckdb), and the
+#       evening/relock promotes (01:00Z/04:30Z) all predate a 05:30Z start, so ts >= nightly-start
+#       can only be the nightly's own promote-at-completion, the 06:30Z fallback timer, or a later
+#       manual promote. (Accepted edge: a 06:30Z fallback promote of a mid-build DB while the
+#       completion-promote failed — that failure already fires its own :warning: alert path in
+#       nightly.sh, and the publisher server-side re-validates before swapping.)
+# Skip = log + Slack-warn + exit 0 (the tab keeps its relock state; re-run manually post-nightly:
+# `daily_report_sync.sh backfill`). Idempotent: the render rewrites the whole tab, so re-runs are safe.
+if [[ "$MODE" == "backfill" ]]; then
+    NIGHTLY_LOG="$REPO_DIR/logs/$(date -u +%F).log"
+    NSTART="$(grep -o '^=== nightly @ [0-9T:Z-]*' "$NIGHTLY_LOG" 2>/dev/null | tail -1 | grep -o '[0-9][0-9-]*T[0-9:]*Z')"
+    NEXIT="$(grep -o '^exit=[0-9]*' "$NIGHTLY_LOG" 2>/dev/null | tail -1 | cut -d= -f2)"
+    skip_backfill(){
+        log "SKIP backfill: $1"
+        alert ":warning: *daily_report_sync (backfill)* — SKIPPED the post-nightly re-render of $REPORT_DATE (tab '$TAB'): $1. §2 Fail% / §4 OTD-Google split / §6 stay at their evening state until a manual \`scripts/daily_report_sync.sh backfill\` after the nightly lands."
+        exit 0
+    }
+    [[ -n "$NSTART" ]] || skip_backfill "no nightly start marker in $NIGHTLY_LOG (nightly did not run today?)"
+    [[ -n "$NEXIT" ]] || skip_backfill "nightly started $NSTART but has no exit line yet (still running, or died without one)"
+    [[ "$NEXIT" == "0" || "$NEXIT" == "1" ]] || skip_backfill "nightly exited $NEXIT (hard fail — D-1 sources were NOT rebuilt)"
+    SNAP="$(snap_id | grep -o 'warehouse_[0-9]\{8\}_[0-9]\{6\}')"
+    [[ -n "$SNAP" ]] || skip_backfill "could not read a snapshot_id from the query API (read API down?)"
+    SNAP_TS="${SNAP#warehouse_}"; SNAP_TS="${SNAP_TS/_/}"            # warehouse_YYYYMMDD_HHMMSS -> YYYYMMDDHHMMSS
+    NSTART_TS="$(echo "$NSTART" | tr -dc '0-9')"                     # 2026-07-02T05:30:02Z -> 20260702053002
+    if ! [[ "$SNAP_TS" =~ ^[0-9]{14}$ && "$NSTART_TS" =~ ^[0-9]{14}$ ]]; then
+        skip_backfill "unparseable snapshot/nightly timestamps (snap='$SNAP', start='$NSTART')"
+    fi
+    if (( 10#$SNAP_TS < 10#$NSTART_TS )); then
+        skip_backfill "serving snapshot $SNAP predates today's nightly start $NSTART — the post-nightly promote has not happened"
+    fi
+    log "backfill guard OK: nightly start=$NSTART exit=$NEXIT snapshot=$SNAP — re-rendering $REPORT_DATE from the promoted snapshot"
+fi
+
 source .venv/bin/activate 2>/dev/null || true
 PY=".venv/bin/python"
 export WAREHOUSE_PULL_REPLIES=1
@@ -68,27 +121,32 @@ run_phase(){  # run_phase <label> <orchestrator args...>  — fail-aware, never 
     return 0
 }
 
-# ---- 1) pre-stage the Funding-Form bookings sheet (box-local) ----
-log "staging funding form ..."
-if ! $PY scripts/stage_funding_form.py; then
-    log "WARN funding-form stage failed (consumer will use prior snapshot)"
-fi
-
-# ---- 1b) writer-lock PRE-PROBE — resilience against a long/stuck warehouse writer ----
-# The report-path phases below each acquire-or-WAIT on the warehouse writer lock. If the heavy
-# nightly (or any writer) is stuck holding it, an unguarded run would HANG here indefinitely (the
-# antithesis of "auto-produces nightly with zero hand-holding"). Probe the lock non-blocking: if a
-# writer holds it, SKIP the phases + promote and render straight from the existing serving snapshot +
-# the LIVE APIs — §1 (Instantly), §2 (sendivo), §4-Actual are promote-independent, so the report
-# still produces (meetings/§6 are then as-of the last promote). Normal evening runs (writer idle at
-# 9 PM ET, nightly is later) take the full path.
-SKIP_WAREHOUSE=0
-if flock -n "$WLOCK" -c true 2>/dev/null; then
-    log "writer lock free — running full warehouse-refresh path"
+# ---- 1) pre-stage the Funding-Form bookings sheet (box-local; NOT in backfill — render-only) ----
+if [[ "$MODE" == "backfill" ]]; then
+    SKIP_WAREHOUSE=1   # render-only BY DESIGN: no staging, no phases, no promote (guard above ensured
+                       # the nightly already rebuilt + promoted everything the render reads)
 else
-    SKIP_WAREHOUSE=1
-    log "WARN warehouse writer lock HELD (long/stuck writer) — SKIPPING phases + promote; rendering from the existing snapshot + live APIs"
-    alert ":warning: *daily_report_sync ($MODE)* — warehouse writer busy at run time; report rendered from the existing snapshot + live APIs (email/SMS/§4-actual current; meetings/§6 as of the last promote). If this persists, the nightly writer is likely stuck."
+    log "staging funding form ..."
+    if ! $PY scripts/stage_funding_form.py; then
+        log "WARN funding-form stage failed (consumer will use prior snapshot)"
+    fi
+
+    # ---- 1b) writer-lock PRE-PROBE — resilience against a long/stuck warehouse writer ----
+    # The report-path phases below each acquire-or-WAIT on the warehouse writer lock. If the heavy
+    # nightly (or any writer) is stuck holding it, an unguarded run would HANG here indefinitely (the
+    # antithesis of "auto-produces nightly with zero hand-holding"). Probe the lock non-blocking: if a
+    # writer holds it, SKIP the phases + promote and render straight from the existing serving snapshot +
+    # the LIVE APIs — §1 (Instantly), §2 (sendivo), §4-Actual are promote-independent, so the report
+    # still produces (meetings/§6 are then as-of the last promote). Normal evening runs (writer idle at
+    # 9 PM ET, nightly is later) take the full path.
+    SKIP_WAREHOUSE=0
+    if flock -n "$WLOCK" -c true 2>/dev/null; then
+        log "writer lock free — running full warehouse-refresh path"
+    else
+        SKIP_WAREHOUSE=1
+        log "WARN warehouse writer lock HELD (long/stuck writer) — SKIPPING phases + promote; rendering from the existing snapshot + live APIs"
+        alert ":warning: *daily_report_sync ($MODE)* — warehouse writer busy at run time; report rendered from the existing snapshot + live APIs (email/SMS/§4-actual current; meetings/§6 as of the last promote). If this persists, the nightly writer is likely stuck."
+    fi
 fi
 
 # ---- 2) report-path phases (each self-locks the warehouse writer) ----
@@ -122,7 +180,9 @@ fi
 #         broken-pipe; nohup + poll the read-API snapshot_id is the robust pattern) ----
 # Skipped when the writer was busy (nothing new staged to promote; the publisher's own writer-lock
 # guard would benign-abort anyway). The render then uses the existing snapshot + live APIs.
-if [[ "$SKIP_WAREHOUSE" != "0" ]]; then
+if [[ "$MODE" == "backfill" ]]; then
+    log "skipping promote (backfill is render-only — the nightly already promoted the snapshot this render reads)"
+elif [[ "$SKIP_WAREHOUSE" != "0" ]]; then
     log "skipping promote (writer busy / phases skipped) — render uses existing snapshot + live APIs"
 else
 PREV_SNAP="$(snap_id)"
