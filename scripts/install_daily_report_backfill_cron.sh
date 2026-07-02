@@ -30,6 +30,10 @@ CRON_LINE="45 12 * * * /usr/bin/flock -n /tmp/daily_report_sync.lock $SCRIPT bac
 
 [[ -x "$SCRIPT" ]] || { echo "ERROR: $SCRIPT not found/executable — run on the droplet after git pull" >&2; exit 1; }
 
-( crontab -l 2>/dev/null | grep -vF "daily_report_sync.sh backfill" ; echo "$CRON_LINE" ) | crontab -
+# `|| true` on BOTH stages (same as install_infra_batch_cron.sh): under `set -euo pipefail`, an
+# empty crontab (`crontab -l` rc=1) or a filter-everything grep (rc=1) would otherwise kill the
+# subshell BEFORE the echo while `crontab -` still consumes the empty stream — i.e. silently WIPE
+# root's crontab. [code-review 2026-07-02 MAJOR finding]
+( { crontab -l 2>/dev/null || true; } | { grep -vF "daily_report_sync.sh backfill" || true; } ; echo "$CRON_LINE" ) | crontab -
 echo "installed: $CRON_LINE"
 crontab -l | grep -F "daily_report_sync.sh backfill"
