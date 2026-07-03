@@ -1591,7 +1591,7 @@ def daily(ctx):
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
     ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (CONNECTED active capacity; disconnected/paused inboxes excluded) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · no-lag · census {SENDING_CENSUS}"); add()
     ctx["partner_table"](PARTNER_D, PARTNER_D_TOTAL, f"5 · BOOKINGS BY PARTNER · day {DAILY}"); add()
-    ctx["imreply_table"](IMREPLY_D, f"6 · IM REPLY-TIME — business minutes to first reply, by workspace · clock runs 12-8pm ET Mon-Fri only (all arrivals count; off-hours clock opens next window) · daily / weekly · email (SMS+WA pending) · Grace & Sam")
+    ctx["imreply_table"](IMREPLY_D, f"6 · IM REPLY-TIME — business minutes to first reply, by workspace · clock runs 12-8pm ET Mon-Fri only (all arrivals count; off-hours clock opens next window) · daily / weekly · email (SMS+WA pending) · BLENDED IM+AIM: AIM (AI-drafted) replies ship through the same Instantly inboxes and carry NO distinguishing flag in the data, so a fast median reflects AI-assisted answering, not desk speed (a workspace with little/no AIM — e.g. Renaissance 1 DFY — reads slower for that reason, not because the desk is broken) · Grace & Sam")
 
 def _alert(text):
     """Best-effort drift alert via the established scripts/alert_slack.py path; never raises (the tab
