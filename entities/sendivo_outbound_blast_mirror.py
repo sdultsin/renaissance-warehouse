@@ -70,6 +70,11 @@ def _run(ctx: "RunContext") -> PhaseResult:
                    r.sub_account_name, r.sent_at, now(), ?
             FROM {PG_SRC} r
             WHERE r.blast_id IS NOT NULL
+              -- Guard the anti-join key: a NULL sendivo_log_id can never match the NOT EXISTS
+              -- (NULL = NULL is unknown), so it would be re-inserted every run -> unbounded dupes.
+              -- Source is NON-NULL + UNIQUE per blast row today (verified 2026-07-02: 1,077,535 rows,
+              -- 0 null, all distinct); this keeps it safe if that ever regresses upstream.
+              AND r.sendivo_log_id IS NOT NULL
               AND NOT EXISTS (
                 SELECT 1 FROM {RAW_TABLE} w WHERE w.sendivo_log_id = r.sendivo_log_id
               )
