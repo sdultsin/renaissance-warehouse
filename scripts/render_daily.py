@@ -879,6 +879,8 @@ def _clock_open_date(p, tz):
         d += datetime.timedelta(days=1)
     return d
 
+_IMREPLY_WARN = None  # (frontier_date, n_missing_window_biz_days) set by get_im_reply; read by imreply_table
+
 def get_im_reply():
     """§6 IM reply-time from core.email_message: average/median BUSINESS MINUTES from each thread's
     FIRST prospect reply (ue_type 2) to our first reply after it (ue_type 3), per workspace,
@@ -936,6 +938,7 @@ def get_im_reply():
     day0, wk0 = _d, datetime.date.fromisoformat(wk)
     utc = datetime.timezone.utc
     lats = {}  # ws -> {"d"/"w": [business-minute latencies]}
+    frontier = None  # max clock-open date that carries ANY answered pair = the sync frontier
     for ws, p_ms, r_ms in rows:
         if r_ms is None:
             continue  # unanswered thread — dropped
@@ -944,10 +947,29 @@ def get_im_reply():
         d = _clock_open_date(p, tz)
         if d > day0:
             continue  # clock opens after the report day (e.g. a post-8pm arrival on DAILY)
+        if frontier is None or d > frontier:
+            frontier = d
         lat = _biz_minutes(p, r, tz)
         b = lats.setdefault(ws, {"d": [], "w": []})
         if d == day0: b["d"].append(lat)
         if d >= wk0:  b["w"].append(lat)
+    # WEEKLY-INCOMPLETENESS GUARD (2026-07-02): the weekly block silently HALVES when the
+    # core.email_message sync (SYNC-7 drain) lags into the 7d window — a pair needs BOTH the
+    # inbound first-reply (ue_type=2) AND our reply (ue_type=3), so any window business-day past
+    # the sync frontier contributes ZERO pairs, deflating n and reshuffling the median toward
+    # whatever older days survived (measured 07-02: R1 262→129, median 28→0 purely from dropping
+    # a synced high-volume day while the 3 newest window-days were unsynced). The old empty-state
+    # note below only inspects the DAILY column, so it NEVER caught this — a materially-incomplete
+    # weekly rendered as if it were the signal. Count how many window business-days sit past the
+    # frontier; ≥2 empty days = the weekly is eroded (1 empty = the normal D-1 daily lag, weekly
+    # still intact). Surfaced as a WARN row so the number is never taken at face value.
+    global _IMREPLY_WARN
+    _IMREPLY_WARN = None
+    if frontier is not None:
+        missing = [dd for dd in (wk0 + datetime.timedelta(n) for n in range((day0 - wk0).days + 1))
+                   if dd.isoweekday() <= 5 and dd > frontier]
+        if len(missing) >= 2:
+            _IMREPLY_WARN = (frontier, len(missing))
     def _stats(v):
         return (len(v), statistics.median(v) if v else None, sum(v) / len(v) if v else None)
     out = []
@@ -1425,6 +1447,17 @@ def build_and_write(tab, build_fn):
                             "no pairs at all (see render stderr); this is NOT the normal D-1 "
                             "sync-lag pattern" % DAILY])
             data.append(note); row_ncol[note] = W
+        # WEEKLY-INCOMPLETENESS WARN (2026-07-02): fires when the email_message sync frontier lags
+        # ≥2 business-days into the trailing-7d window, so the weekly n/median are structurally
+        # deflated (not a real speed change). Distinct from the daily-empty note above, which only
+        # ever looked at the daily column and so silently passed a half-populated weekly as signal.
+        if _IMREPLY_WARN:
+            fr, nmiss = _IMREPLY_WARN
+            warn = add(["(⚠ WEEKLY UNDERSTATED — email reply-history synced only through %s (SYNC-7 "
+                        "drain, D-1+); %d of the 7 window business-days have zero synced pairs, so n "
+                        "is deflated and the median reflects only the older synced days — NOT a "
+                        "desk-speed change. Self-corrects as the drain advances.)" % (fr.isoformat(), nmiss)])
+            data.append(warn); row_ncol[warn] = W
         pend = add(["SMS · WhatsApp first-reply time", "pending", "pending", "pending", "pending", "pending", "pending"])
         data.append(pend); row_ncol[pend] = W
     def infra_table(infra, header_label):
