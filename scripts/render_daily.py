@@ -910,115 +910,62 @@ def get_partner():
     pr = sorted(cnt.items(), key=lambda x: (-x[1], x[0]))
     return pr, sum(n for _, n in pr)
 
-def _biz_minutes(p, r, tz):
-    """§6 SLA latency = BUSINESS MINUTES accrued only inside 12:00-20:00 ET Mon-Fri between aware
-    datetimes p (first prospect reply) and r (our first reply after it): for each ET business day d
-    in [p, r], sum GREATEST(0, LEAST(r, d 20:00) - GREATEST(p, d 12:00)). A Saturday arrival answered
-    Monday 12:05pm ET = 5.0. An answer landing before the clock ever opens (e.g. Sat->Sun) = 0.0.
-    DST-correct: the per-day window bounds are built as ET wall-clock via zoneinfo."""
-    if r <= p:
-        return 0.0
-    d = p.astimezone(tz).date()
-    end = r.astimezone(tz).date()
-    tot = 0.0
-    while d <= end:
-        if d.isoweekday() <= 5:
-            o = datetime.datetime.combine(d, datetime.time(12), tzinfo=tz)
-            c = datetime.datetime.combine(d, datetime.time(20), tzinfo=tz)
-            lo = p if p > o else o
-            hi = r if r < c else c
-            if hi > lo:
-                tot += (hi - lo).total_seconds() / 60.0
-        d += datetime.timedelta(days=1)
-    return tot
-
-def _clock_open_date(p, tz):
-    """§6 report bucket = the ET date the thread's SLA clock OPENS, not the raw arrival date. A
-    weekday arrival before 20:00 ET opens that day (pre-noon arrivals open at noon, still that day);
-    a post-8pm or weekend arrival opens the next Mon-Fri day (Sat -> Mon)."""
-    e = p.astimezone(tz)
-    d = e.date()
-    if e.isoweekday() <= 5 and e < datetime.datetime.combine(d, datetime.time(20), tzinfo=tz):
-        return d
-    d += datetime.timedelta(days=1)
-    while d.isoweekday() > 5:
-        d += datetime.timedelta(days=1)
-    return d
+# §6 CLOCK MIGRATED [DR-7, 2026-07-03]: the business-minute clamp (_biz_minutes) + clock-open
+# bucket (_clock_open_date) now live in the WAREHOUSE — scripts/build_sla_reply_time.py materializes
+# core.sla_reply_time.biz_latency_minutes + .clock_open_date (the SAME validated §6 clamp, PR #151).
+# get_im_reply() below READS those columns (seq_in_thread=1) instead of recomputing, so the warehouse
+# and this report share ONE definition and can never drift. Verified equal to the digit at cutover.
 
 _IMREPLY_WARN = None  # (frontier_date, n_missing_window_biz_days) set by get_im_reply; read by imreply_table
 
 def get_im_reply():
-    """§6 IM reply-time from core.email_message: average/median BUSINESS MINUTES from each thread's
-    FIRST prospect reply (ue_type 2) to our first reply after it (ue_type 3), per workspace,
-    daily / trailing-7d weekly. (Monthly/MTD block REMOVED 2026-07-01 [DR-10, Sam]: no MTD anything
-    on a daily tab; a trailing window like weekly-7d is fine, a calendar-month-to-date is not.)
+    """§6 IM reply-time — reads the CANONICAL warehouse fact core.sla_reply_time (DR-7, 2026-07-03).
+    Average/median BUSINESS MINUTES from each thread's FIRST prospect reply to our first reply, per
+    workspace, trailing-7d weekly. (Daily/MTD blocks removed — #180/DR-10; §6 is WEEKLY-only.)
 
-    SPEC [locked with Grace 06-30, supersedes the arrival-filter reading]: the SLA clock accrues
-    ONLY inside 12:00-20:00 ET Mon-Fri (IMs log in 11am ET, first hour = catch-up; no nights/
-    weekends). ALL first prospect replies count — an off-window/weekend arrival is NOT excluded;
-    its clock simply opens at the next window-open (a Saturday arrival answered Monday 12:05pm ET
-    = 5 minutes). Latency = the per-day clamp in _biz_minutes (computed in Python — the pairs come
-    from the warehouse, the clamp+buckets happen here). Each thread buckets on the day its clock
-    OPENS (_clock_open_date), so an off-window arrival lands on the next business day. Unanswered
-    threads are dropped (never a fake latency); first-response-only via seq=1 per thread_id.
+    ONE DEFINITION: the business-minute clamp + clock-open bucket used to be computed inline here in
+    Python; DR-7 migrated them into the warehouse. scripts/build_sla_reply_time.py materializes
+    core.sla_reply_time.biz_latency_minutes (the 12:00-20:00 ET Mon-Fri clock, DST-correct) and
+    .clock_open_date (the ET date the SLA clock opens) using the IDENTICAL validated §6 clamp (PR
+    #151). This function now READS those columns (seq_in_thread=1 = the thread's first prospect reply),
+    so a warehouse consumer and the report can never diverge. Reconciled to the digit at cutover
+    (deliverables/2026-07-02-sla-scrutiny/FINDINGS.md). All first prospect replies count (an off-hours
+    arrival's clock opens at the next window); unanswered threads carry NULL latency and are excluded.
 
-    FRESHNESS: core.email_message is NIGHTLY-synced — D-1 at best BY DESIGN, so the report-day
-    DAILY column is structurally thin/empty on day D itself and back-fills on later renders;
-    weekly carries the signal. Do NOT 'fix' that by switching sources."""
-    if ET_TZ is None:                      # no zoneinfo -> _safe renders §6 empty + WARN, never
-        raise RuntimeError("zoneinfo unavailable — refusing §6 SLA math in a wrong fixed offset")
-    tz = ET_TZ
+    FRESHNESS: core.sla_reply_time is nightly-rebuilt from core.email_message (itself D-1-synced), so
+    the weekly window back-fills as the SYNC-7 email-reply drain advances — the #177 WARN below flags
+    a window still eroded by the drain. Do NOT 'fix' that by switching sources.
+
+    FAIL-SAFE: any read error (e.g. the fact not yet promoted, or empty) raises -> _safe renders §6
+    empty + WARN, never a wrong-but-plausible number (same protection as the old truncation guard)."""
     wk = (_d - datetime.timedelta(days=6)).isoformat()
-    # Pull from 4 days BEFORE the earliest bucket day: an off-window arrival opens its clock up to
-    # 3 calendar days later (Fri 20:00 ET -> Mon 12:00 ET), so e.g. a Saturday arrival buckets into
-    # the following Monday and must be in the pull for that week's window.
-    pull = (datetime.date.fromisoformat(wk) - datetime.timedelta(days=4)).isoformat()
-    # Query notes (each clause is load-bearing):
-    #  - seq ranks over the thread's FULL history (no date filter inside inbound), partitioned per
-    #    workspace; the pull window only limits which FIRSTS are fetched (`i.p_ts >= pull`). Ranking
-    #    inside the window would misclassify a follow-up reply in an older thread as that thread's
-    #    "first" AND make a re-rendered period drift with the render date. A true-first before
-    #    `pull` clock-opens before every bucket day by construction, so nothing in-period is lost.
-    #  - `ours` is matched on thread_id AND ws: 406 thread_ids span multiple workspaces (measured
-    #    2026-07-01), so an unscoped min() could close ws-A's clock with ws-B's reply.
-    #  - Unanswered threads are filtered SERVER-side (r IS NOT NULL): they're ~85% of first-reply
-    #    rows (measured 66k/78k), and shipping them row-level would put the pull on a collision
-    #    course with the read API's 100k-row truncation cap (=> wq raises => §6 empty late-month).
-    #    Python re-guards r_ms anyway (belt+braces).
-    rows = wq(f"""
-      WITH inbound AS (
-        SELECT thread_id, workspace_id AS ws, message_at AS p_ts,
-               row_number() OVER (PARTITION BY thread_id, workspace_id
-                                  ORDER BY message_at, message_id) AS seq
-        FROM core.email_message
-        WHERE ue_type=2 AND thread_id IS NOT NULL),
-      ours AS (SELECT thread_id, workspace_id AS ws, message_at AS r_ts FROM core.email_message
-               WHERE ue_type=3 AND thread_id IS NOT NULL AND message_at >= DATE '{pull}')
-      SELECT * FROM (
-        SELECT i.ws AS ws, epoch_ms(i.p_ts) AS p,
-               epoch_ms((SELECT min(o.r_ts) FROM ours o
-                         WHERE o.thread_id=i.thread_id AND o.ws=i.ws AND o.r_ts > i.p_ts)) AS r
-        FROM inbound i
-        WHERE i.seq=1 AND i.p_ts >= DATE '{pull}' AND i.ws IN ({SLUGS_SQL}))
-      WHERE r IS NOT NULL""")
     day0, wk0 = _d, datetime.date.fromisoformat(wk)
-    utc = datetime.timezone.utc
+    # Read 4 days before wk0 so the sync frontier is detectable even when the WHOLE 7d window is
+    # eroded (the #177 WARN needs to see a frontier that can sit below wk0). We bucket on the
+    # materialized clock_open_date, so filtering on it is exact — the fact already carries the
+    # first-reply (seq=1) grain and the workspace-scoped pairing (no cross-workspace clock-close).
+    lo = (wk0 - datetime.timedelta(days=4)).isoformat()
+    rows = wq(f"""
+      SELECT workspace_slug AS ws, clock_open_date AS d, biz_latency_minutes AS lat
+      FROM core.sla_reply_time
+      WHERE seq_in_thread = 1
+        AND biz_latency_minutes IS NOT NULL
+        AND clock_open_date >= DATE '{lo}'
+        AND clock_open_date <= DATE '{day0}'
+        AND workspace_slug IN ({SLUGS_SQL})""")
     lats = {}  # ws -> {"d"/"w": [business-minute latencies]}
     frontier = None  # max clock-open date that carries ANY answered pair = the sync frontier
-    for ws, p_ms, r_ms in rows:
-        if r_ms is None:
-            continue  # unanswered thread — dropped
-        p = datetime.datetime.fromtimestamp(float(p_ms) / 1000.0, tz=utc)
-        r = datetime.datetime.fromtimestamp(float(r_ms) / 1000.0, tz=utc)
-        d = _clock_open_date(p, tz)
+    for ws, d_val, lat in rows:
+        if lat is None:
+            continue  # belt+braces (SQL already filters answered)
+        d = d_val if isinstance(d_val, datetime.date) else datetime.date.fromisoformat(str(d_val)[:10])
         if d > day0:
-            continue  # clock opens after the report day (e.g. a post-8pm arrival on DAILY)
+            continue  # clock opens after the report day
         if frontier is None or d > frontier:
             frontier = d
-        lat = _biz_minutes(p, r, tz)
         b = lats.setdefault(ws, {"d": [], "w": []})
-        if d == day0: b["d"].append(lat)
-        if d >= wk0:  b["w"].append(lat)
+        if d == day0: b["d"].append(float(lat))
+        if d >= wk0:  b["w"].append(float(lat))
     # WEEKLY-INCOMPLETENESS GUARD (2026-07-02): the weekly block silently HALVES when the
     # core.email_message sync (SYNC-7 drain) lags into the 7d window — a pair needs BOTH the
     # inbound first-reply (ue_type=2) AND our reply (ue_type=3), so any window business-day past
