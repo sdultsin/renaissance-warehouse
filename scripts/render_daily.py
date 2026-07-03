@@ -666,7 +666,7 @@ def get_close():
     # MTD rows added 07-01 (backlog A7) were removed same-day; monthly belongs on a dedicated MTD tab.
     return {"dials": d, "leads": l, "connects": cn, "meetings": m}
 
-def get_truth():
+def get_truth(infra_d=None):
     """§4 no-lag: Expected = active accounts' configured daily_limit by ws x infra (per-workspace
     LAST-GOOD census, Outlook excluded); Actual = Instantly daily per workspace (== §1 sent), now ALSO
     split OTD-vs-Google via account-level sends x the same last-good census (Outlook excluded from the
@@ -783,12 +783,38 @@ def get_truth():
         print(f"WARN §4 per-infra actual: sends on accounts absent from their last-good census "
               f"(unmapped>0) for {unmapped_ws} — Actual OTD/Google understate those rows until the "
               f"census heals (Actual total is unaffected).", file=sys.stderr)
+    # SPLIT SOURCE WATERFALL (fix 2026-07-02, DR-1/DATA-9): the Actual OTD/Google split must NOT read
+    # ONLY core.sending_account_daily. That table is a NIGHTLY (D-1) account-grain entity, so on the
+    # EVENING render (day D, ~10pm ET) it has NO report-day rows and the split zeroed while Actual total
+    # (live Instantly) populated — and on feed-gap/churn days recent days can be absent (2026-07-02 had
+    # 0 rows; 07-01 only ~42% loaded; 06-29 missing entirely). Actual TOTAL and §1 read a LIVE Instantly
+    # fetch; §1b resolves the infra split LIVE (per-campaign -> tag -> infra, same Instantly source), so
+    # it is complete same-day. We therefore waterfall per workspace:
+    #   1. core.sending_account_daily has day-D rows  -> use it (canonical account grain; captures
+    #      subsequence sends; survives deleted campaigns; this is what backfill re-renders heal onto).
+    #   2. else the live §1b infra split (infra_d.by_ws) if available -> reconciles to Actual total by
+    #      construction (shared instantly_daily source).
+    #   3. else UNRESOLVED (None -> rendered "—") — NEVER a fake 0 [partial_data_100pct_or_wipe].
+    sad_present = {slug for slug, v in asplit.items() if (v[0] or v[1] or v[2])}
+    live = {}   # slug -> (otd_live, goog_live) from the §1b live per-infra resolution
+    for _s, _n, agg, *_rest in (infra_d or {}).get("by_ws", []):
+        live[_s] = (float(agg.get("OTD", [0, 0, 0, 0])[0]), float(agg.get("Google", [0, 0, 0, 0])[0]))
     out = []
+    used_live = []
     for slug, name in WS:
         otd = cap.get((slug, "OTD"), 0.0); goog = cap.get((slug, "Google"), 0.0)
         actual = inst.get(slug, (0, 0))[0]
-        otd_a, goog_a, _un = asplit.get(slug, (0.0, 0.0, 0.0))
+        if slug in sad_present:
+            otd_a, goog_a, _un = asplit.get(slug, (0.0, 0.0, 0.0))
+        elif slug in live:
+            otd_a, goog_a = live[slug]; used_live.append(name)
+        else:
+            otd_a, goog_a = None, None   # unresolved -> "—" (never a fake 0)
         out.append((name, otd, goog, otd + goog, actual, otd_a, goog_a))
+    if used_live:
+        print(f"NOTE §4 per-infra actual: core.sending_account_daily has no report-day ({DAILY}) rows "
+              f"for {used_live} (nightly D-1 feed) — used the LIVE §1b infra split (reconciles to §1); "
+              f"the account-grain split heals on the next backfill re-render.", file=sys.stderr)
     census = max(used.values()) if used else None
     stale = sorted({str(d) for d in used.values() if d != census})
     if stale:
@@ -1233,19 +1259,23 @@ def _safe(label, fn, default):
 _EMAIL_FB = [(name, 0, 0, 0, 0, 0, 0) for _, name in WS]
 _SMS_FB = [("Renaissance 1 (SMS)", 0, 0, None, 0, 0, None), ("Renaissance 2 (SMS · Pre-IPO)", 0, 0, None, 0, 0, None), ("Renaissance 3 (SMS · webform)", 0, 0, None, 0, 0, None), ("WhatsApp (ISKRA)", 0, 0, 0, 0, 0, None)]
 _CLOSE_FB = {"dials": 0, "leads": 0, "connects": 0, "meetings": 0}
-_TRUTH_FB = (None, [(name, 0, 0, 0, 0, 0, 0) for _, name in WS])
+_TRUTH_FB = (None, [(name, 0, 0, 0, 0, None, None) for _, name in WS])  # split None -> "—", never fake 0
 _IMREPLY_FB = ((DAILY, DAILY), [(name, 0, None, None, 0, None, None) for _, name in WS])
 
 EMAIL_D = _safe("email", get_email, _EMAIL_FB)
 SMS_D = _safe("sms_wa", get_sms_wa, _SMS_FB)
 SMS_KPI_D = _safe("sms_kpi_to_opp", get_sms_kpi_to_opp, {"dates": [], "rows": []})
 CLOSE_D = _safe("close", get_close, _CLOSE_FB)
-SENDING_CENSUS, SENDING_TRUTH = _safe("truth", get_truth, _TRUTH_FB)
+# §1b infra resolution is collected BEFORE §4 so §4's Actual OTD/Google split can fall back to the LIVE
+# per-infra numbers when core.sending_account_daily has no report-day rows (see get_truth waterfall).
+# Both memoize instantly_daily, so this only reorders — no extra Instantly cost. If §1b fails, INFRA_D
+# is the empty fallback and §4 degrades to sending_account_daily / unresolved (—), never a fake 0.
+INFRA_D = _safe("infra", get_infra_kpis, {"by_ws": [], "mtg_by": {}, "unattr_mtg": 0, "flagged": []})
+SENDING_CENSUS, SENDING_TRUTH = _safe("truth", lambda: get_truth(INFRA_D), _TRUTH_FB)
 PARTNER_D, PARTNER_D_TOTAL = _safe("partner", get_partner, ([], 0))
 IMREPLY_PERIODS, IMREPLY_D = _safe("imreply", get_im_reply, _IMREPLY_FB)
 PREIPO_MTG = _safe("preipo", lambda: preipo_meetings(DAILY), 0)
 WA_PREIPO_MTG = _safe("wa_preipo", lambda: wa_preipo_meetings(DAILY), 0)
-INFRA_D = _safe("infra", get_infra_kpis, {"by_ws": [], "mtg_by": {}, "unattr_mtg": 0, "flagged": []})
 
 # Milkbox row is wiped from §1b (see INFRA_RENDER_ROWS) — if the classifier still attributed
 # volume to it, WARN LOUD here, in BOTH --dry and write paths (never silently swallow). Covers
@@ -1394,14 +1424,22 @@ def build_and_write(tab, build_fn):
         hr = add(["Workspace", "Expected OTD", "Expected Google", "Expected Total",
                   "Actual OTD", "Actual Google", "Actual (total)", "Fulfillment %"])
         th.append(hr); th_ncol[hr] = W
+        # otd_a/goog_a may be None (split UNRESOLVED for that workspace on that day) -> render "—", never
+        # a fake 0 [partial_data_100pct_or_wipe]; the TOTAL sums only resolved rows and shows "—" if NONE
+        # resolved (all-unresolved day) rather than a misleading 0.
+        _cell = lambda v: "—" if v is None else round(v)
         oe = ge = te = ta = oa = ga = 0
+        any_split = False
         for ws, otd, goog, totexp, actual, otd_a, goog_a in SENDING_TRUTH:
             ri = add([ws, round(otd), round(goog), round(totexp),
-                      round(otd_a), round(goog_a), actual, fpct(actual, totexp)])
+                      _cell(otd_a), _cell(goog_a), actual, fpct(actual, totexp)])
             data.append(ri); strows.append(ri); row_ncol[ri] = W
-            oe += otd; ge += goog; te += totexp; ta += actual; oa += otd_a; ga += goog_a
+            oe += otd; ge += goog; te += totexp; ta += actual
+            oa += otd_a or 0; ga += goog_a or 0
+            any_split = any_split or otd_a is not None or goog_a is not None
         sti = add(["TOTAL", round(oe), round(ge), round(te),
-                   round(oa), round(ga), ta, fpct(ta, te)]); tot.append(sti); strows.append(sti); row_ncol[sti] = W
+                   (round(oa) if any_split else "—"), (round(ga) if any_split else "—"),
+                   ta, fpct(ta, te)]); tot.append(sti); strows.append(sti); row_ncol[sti] = W
     def close_table(close, label):
         W = 2
         si = add([label]); sec.append(si); row_ncol[si] = W
@@ -1627,7 +1665,7 @@ def daily(ctx):
             if (_w and SMS_KPI_D.get("rows")) else "trailing fully-classified window")
     ctx["sms_kpi_table"](SMS_KPI_D, f"2b · SMS KPI-to-opp — texts per opportunity by workspace · {_win} (the web-form-economics gate)"); add()
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
-    ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (CONNECTED active capacity; disconnected/paused inboxes excluded) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · no-lag · census {SENDING_CENSUS}"); add()
+    ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (CONNECTED active capacity; disconnected/paused inboxes excluded) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · split = account-grain sending_account_daily when the report day has loaded, else the live §1b infra split (unresolved shows '—', never 0) · no-lag · census {SENDING_CENSUS}"); add()
     ctx["partner_table"](PARTNER_D, PARTNER_D_TOTAL, f"5 · BOOKINGS BY PARTNER · day {DAILY}"); add()
     ctx["imreply_table"](IMREPLY_D, f"6 · IM REPLY-TIME — business minutes to first reply, by workspace · clock runs 12-8pm ET Mon-Fri only (all arrivals count; off-hours clock opens next window) · daily / weekly · email (SMS+WA pending) · BLENDED IM+AIM: AIM (AI-drafted) replies ship through the same Instantly inboxes and carry NO distinguishing flag in the data, so a fast median reflects AI-assisted answering, not desk speed (a workspace with little/no AIM — e.g. Renaissance 1 DFY — reads slower for that reason, not because the desk is broken) · Grace & Sam")
 
