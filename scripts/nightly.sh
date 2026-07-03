@@ -226,12 +226,10 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     # lock; core/db.py's in-process warehouse-writer lock serializes these (acquire-or-wait).
     LOCK_NIGHTLY=/root/core/warehouse.write.lock
 
-    # SLA reply-time: rebuild the response-level fact + re-snapshot the trailing 14d
-    # (covers late-arriving IM responses). Reads core.iam_response_time (built in the
-    # canonical phase) + main.raw_pipeline_conversation_messages.
-    echo "building core.sla_reply_time (portal gap dim)" | tee -a "$LOG_FILE"
-    "$PYTHON" scripts/build_sla_reply_time.py 2>&1 | tee -a "$LOG_FILE" \
-        || echo "WARN sla_reply_time_build_failed (continuing)" | tee -a "$LOG_FILE"
+    # NOTE: core.sla_reply_time (the canonical §6 business-minute fact) is built LATER — AFTER the
+    # email-thread drain/apply below feeds core.email_message with tonight's new prospect replies +
+    # our ue_type=3 responses. Building it here (before that apply) would source a stale
+    # core.email_message and understate answered pairs. See the build block after the email-thread sync.
 
     # Deliverability reply-lag monitor (D2): rebuild core.deliv_reply_lag (send->first-reply
     # latency, the deliverability leading indicator — distinct from the SLA handling metric
@@ -293,6 +291,16 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     # keep apply manifests out of the repo working tree (gitignored too, belt + suspenders)
     mkdir -p /root/core/threads_bf/manifests 2>/dev/null
     mv /root/renaissance-warehouse/core/email_thread_manifest_*.txt /root/core/threads_bf/manifests/ 2>/dev/null || true
+
+    # SLA reply-time (§6 canonical business-minute clock) — MUST run AFTER the email-thread apply
+    # above so core.email_message carries tonight's fresh prospect replies (ue_type=2) + our replies
+    # (ue_type=3). Rebuilds the first-reply (seq=1, thread-grain) fact and materializes
+    # biz_latency_minutes (12:00-20:00 ET Mon-Fri clamp) + clock_open_date — the SAME validated §6
+    # clamp render_daily.py §6 now READS, so warehouse + report share ONE definition (DR-7,
+    # 2026-07-03). Re-snapshots the trailing 14d (late replies back-fill as the SYNC-7 drain advances).
+    echo "building core.sla_reply_time (§6 canonical business-minute clock)" | tee -a "$LOG_FILE"
+    "$PYTHON" scripts/build_sla_reply_time.py 2>&1 | tee -a "$LOG_FILE" \
+        || echo "WARN sla_reply_time_build_failed (continuing)" | tee -a "$LOG_FILE"
 
     # Instantly credits: pull per-workspace lead-list quota from the Instantly billing
     # API (read-only) and UPSERT a daily snapshot into core.instantly_credit (drops the

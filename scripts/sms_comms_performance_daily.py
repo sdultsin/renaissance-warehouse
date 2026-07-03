@@ -226,8 +226,13 @@ class ApiBackend:
                      "Content-Type": "application/json"})
         with urllib.request.urlopen(req, timeout=120) as resp:
             payload = json.loads(resp.read())
+        # A truncated result silently understates every aggregate built from it (this feeds the §2
+        # SMS/WA cost + funnel rows). Fail LOUD — never proceed on partial data. Unified with the
+        # daily-report wq() hard-fail guard [DR-7, 2026-07-03]: same bug class, one behavior.
         if payload.get("truncated"):
-            print(f"[warn] query truncated: {sql[:60]}...", file=sys.stderr)
+            raise RuntimeError(
+                f"warehouse query TRUNCATED at {payload.get('row_count')} rows — refusing partial "
+                f"data (sms_comms_performance_daily: {sql[:60]}...)")
         self.snapshot_id = payload.get("snapshot_id") or self.snapshot_id
         cols = payload["columns"]
         return [dict(zip(cols, r)) for r in payload["rows"]]
