@@ -1,0 +1,15 @@
+-- Retire core.meeting_campaign_attribution — dead orphan table. Version 1078.
+-- @gate: drop
+-- Depends on 1074 (v_campaign_scoreboard — last reference is a COMMENT only, no dependency)
+--
+-- WHY (DATA-8, reference_data_issues_registry_20260701 + the 2026-07-01 meeting-attribution
+-- reconciliation §4): core.meeting_campaign_attribution is a DEAD ORPHAN snapshot — last loaded
+-- 2026-06-12, NO builder in any entity/DDL, 32,760 rows (only 30,511 ever joined core.meeting). It is
+-- explicitly bypassed by scripts/portal_data.py (line 352: "CANONICAL: core.meeting (NOT the orphan
+-- meeting_campaign_attribution)") and flagged "STALE ORPHAN, never trust" in the warehouse read guide.
+-- Verified 2026-07-03 (git grep origin/main): NOTHING reads or writes it — the only three surviving
+-- references are COMMENTS (scripts/portal_data.py:352, sql/ddl/1074_v_campaign_scoreboard.sql:24,
+-- skills/data-warehouse/SKILL.md). core.meeting is the sole canonical meeting/attribution layer.
+-- Drop it so nothing new bolts onto a dead surface.
+-- REVERSIBLE: every retained prior warehouse snapshot still carries the table as a restore point.
+DROP TABLE IF EXISTS core.meeting_campaign_attribution;
