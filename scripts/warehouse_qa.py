@@ -267,6 +267,36 @@ def run_checks(con) -> tuple[list[str], list[str]]:
     except Exception as exc:  # noqa: BLE001
         warns.append(f"FAITHFULNESS: check errored ({exc})")
 
+    # 4b. MEETING-ATTR — a name-matched meeting must not predate its attributed campaign
+    # (norm-name collision tripwire; campaign-truth time-aware matcher fix 2026-07-03).
+    # WARN-only, THRESHOLDED at >250: the measured post-fix baseline is ≈200 —
+    # 89 by-design oldest-generation fallbacks (a meeting predating EVERY
+    # generation of a reused name) + 111 slack-era 'strict_auto' legacy rows
+    # carrying historical matcher behavior. A count above 250 indicates a
+    # norm-name-collision regression (an unthresholded warn fired every night
+    # and would be ignored precisely when it mattered).
+    try:
+        if _exists(con, "core.meeting") and _exists(con, "raw_pipeline_campaigns"):
+            n = con.execute(
+                """
+                SELECT count(*)
+                FROM core.meeting m
+                JOIN (SELECT campaign_id, max(instantly_created_at) AS created_at
+                      FROM raw_pipeline_campaigns GROUP BY 1) c USING (campaign_id)
+                WHERE m.campaign_id IS NOT NULL
+                  AND m.match_method IN ('sheet_norm', 'strict_auto')
+                  AND c.created_at IS NOT NULL
+                  AND m.posted_at < c.created_at
+                """
+            ).fetchone()[0]
+            if n > 250:
+                warns.append(
+                    f"MEETING-ATTR: {n} meetings predate their attributed campaign "
+                    f"(baseline ~200: 89 oldest-generation fallbacks + 111 "
+                    f"strict_auto legacy) — norm-name collision regression")
+    except Exception as exc:  # noqa: BLE001
+        warns.append(f"MEETING-ATTR: check errored ({exc})")
+
     # 5. Schema-gate graft B (Phase 1: WARN-ONLY). Two backstops:
     #   5a. catalog drift — core.schema_catalog (rebuilt nightly by schema_manifest) must
     #       match live information_schema. A gap = the manifest didn't run or a column
