@@ -15,6 +15,20 @@ Processes EVERYTHING pending (no per-run cap) so we stay caught up daily. Volume
 (~100-300 calls/day, ~1-1.5 audio-hours), so a full pass is minutes of compute. Idempotent:
 only calls with a recording and no transcript yet are picked up; re-running is safe.
 
+PERMANENTLY-UNAVAILABLE RECORDINGS (the 2026-07-02 W-3 fix):
+  core.call is rebuilt nightly from raw_close_call, which we NEVER delete. So a call that had
+  has_recording=true when we synced it stays in the pending set forever even after it is DELETED
+  in Close — its recording endpoint then 404s ("Activity not found") on every run, re-erroring
+  nightly and keeping the coverage watchdog's gap permanently open (this is exactly the "0/69,
+  all Close 404s" residue). We now TOMBSTONE such calls: on a recording 404 we probe the Close
+  activity endpoint — if the activity is gone (deleted), or the call is older than the grace
+  window and the recording still 404s (it never materialized), we write a sentinel row into
+  core.call_transcript (transcript='', model='unavailable_404'). That drops the call out of the
+  pending set (NOT IN call_transcript) and closes the watchdog gap, WITHOUT polluting downstream:
+  classify_call_outcomes.py filters `length(trim(transcript)) > 0`, so sentinels are skipped, and
+  the residue is auditable via `WHERE model = 'unavailable_404'`. A FRESH call whose recording is
+  merely still processing (activity present, age < grace) is left pending and retried next run.
+
 LOCK-ROBUSTNESS (the 2026-06-16 hardening — see handoffs/2026-06-16-call-transcription-backfill.md):
   DuckDB is single-writer (flock); in this build a *read-only* open ALSO fails while a writer
   holds the lock. The original job died on the very first flush when it collided with the
@@ -37,8 +51,10 @@ import os
 import sys
 import tempfile
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -53,6 +69,15 @@ logger = logging.getLogger("transcribe_calls")
 _MODEL = os.environ.get("CALL_TRANSCRIBE_MODEL", "base")
 # Flush in SHORT bursts so each write-lock hold is brief (good citizen vs other writers).
 _FLUSH_EVERY = int(os.environ.get("CALL_TRANSCRIBE_FLUSH_EVERY", "25"))
+
+# Sentinel for a recording that will NEVER transcribe (deleted in Close / never materialized).
+# Written as a call_transcript row with an EMPTY transcript so it drops out of the pending set
+# without being treated as real text downstream (classify filters length>0). Auditable via model.
+_UNAVAILABLE_MODEL = "unavailable_404"
+# A recording still 404ing this long after the call almost certainly never materialized (Close's
+# processing lag is minutes, not days) — tombstone it even if the activity itself still exists.
+_UNAVAILABLE_GRACE_H = int(os.environ.get("CALL_TRANSCRIBE_UNAVAILABLE_GRACE_H", "48"))
+_CLOSE_ACTIVITY_URL = "https://api.close.com/api/v1/activity/call/{call_id}/"
 
 # Lock-aware retry budget. Per read/flush we retry with exponential backoff up to this wall-clock
 # budget before giving up — generous enough to outlast any legitimate writer hold (the longest
@@ -78,7 +103,7 @@ _LOCK_MARKERS = (
 )
 
 _PENDING_SQL = """
-    SELECT call_id, recording_url, duration_seconds
+    SELECT call_id, recording_url, duration_seconds, occurred_at
     FROM core.call
     WHERE has_recording AND recording_url IS NOT NULL
       AND call_id NOT IN (SELECT call_id FROM core.call_transcript)
@@ -103,6 +128,41 @@ _INSERT = """
 def _is_lock_error(exc: Exception) -> bool:
     s = str(exc).lower()
     return any(m in s for m in _LOCK_MARKERS)
+
+
+def _permanently_gone_reason(api_key: str, call_id: str, occurred_at, exc: Exception) -> str | None:
+    """Return a tombstone reason if this recording will NEVER transcribe, else None.
+
+    Only a recording-endpoint 404 is a candidate (a network blip / timeout / whisper error is
+    transient — keep it pending). For a 404 we confirm PERMANENCE so we never tombstone a recording
+    that is merely still processing right after the call:
+      - 'deleted'      — the Close activity itself is gone (activity endpoint 404): unrecoverable.
+      - 'never_landed' — activity still there but the recording has 404'd for > grace hours: it
+                         never materialized (Close's processing lag is minutes, not days).
+    A fresh call (age < grace) whose activity still exists returns None → stays pending, retried.
+    """
+    resp = getattr(exc, "response", None)
+    if not isinstance(exc, httpx.HTTPStatusError) or resp is None or resp.status_code != 404:
+        return None
+    # Is the underlying Close activity gone entirely? (the dominant case — deleted-in-Close calls)
+    try:
+        with httpx.Client(auth=(api_key, ""), timeout=30.0,
+                          headers={"User-Agent": "renaissance-warehouse/1.0"}) as c:
+            a = c.get(_CLOSE_ACTIVITY_URL.format(call_id=call_id))
+        if a.status_code == 404:
+            return "deleted"
+    except Exception as probe_exc:  # noqa: BLE001 — probe failure must not crash the run
+        logger.info("activity-existence probe failed for %s (%s) — falling back to age rule",
+                    call_id, str(probe_exc)[:80])
+    # Activity present (or probe inconclusive) but the recording has been 404ing past the grace
+    # window → it never landed. Guard against a missing/naive occurred_at.
+    if occurred_at is None:
+        return None
+    if occurred_at.tzinfo is None:
+        occurred_at = occurred_at.replace(tzinfo=timezone.utc)
+    if datetime.now(timezone.utc) - occurred_at > timedelta(hours=_UNAVAILABLE_GRACE_H):
+        return "never_landed"
+    return None
 
 
 def _flush(rows: list) -> bool:
@@ -209,9 +269,9 @@ def main() -> int:
     model = WhisperModel(_MODEL, device="cpu", compute_type="int8")
 
     batch: list = []
-    done = failed = lost = 0
+    done = failed = lost = tombstoned = 0
     t0 = time.monotonic()
-    for i, (call_id, rec_url, dur) in enumerate(todo, 1):
+    for i, (call_id, rec_url, dur, occurred_at) in enumerate(todo, 1):
         fd, tmp_name = tempfile.mkstemp(suffix=".mp3")
         os.close(fd)
         tmp = Path(tmp_name)
@@ -225,8 +285,16 @@ def main() -> int:
             ])
             done += 1
         except Exception as exc:  # one bad call must never sink the run
-            failed += 1
-            logger.warning("transcribe failed call=%s: %s", call_id, str(exc)[:160])
+            reason = _permanently_gone_reason(api_key, call_id, occurred_at, exc)
+            if reason:
+                # Recording will never transcribe → sentinel row so it leaves the pending set
+                # (stops the nightly re-404 + closes the coverage watchdog's permanent gap).
+                batch.append([call_id, "", _UNAVAILABLE_MODEL, "xx", 0.0, datetime.now(timezone.utc)])
+                tombstoned += 1
+                logger.info("tombstoned call=%s (%s) — recording permanently unavailable", call_id, reason)
+            else:
+                failed += 1
+                logger.warning("transcribe failed call=%s: %s", call_id, str(exc)[:160])
         finally:
             try:
                 tmp.unlink()
@@ -244,8 +312,9 @@ def main() -> int:
 
     pending_after = _pending_count()
     logger.info(
-        "transcription complete: transcribed=%d failed=%d deferred(lock)=%d total=%d pending_after=%s",
-        done, failed, lost, len(todo),
+        "transcription complete: transcribed=%d tombstoned(unavailable)=%d failed=%d "
+        "deferred(lock)=%d total=%d pending_after=%s",
+        done, tombstoned, failed, lost, len(todo),
         "unknown" if pending_after is None else pending_after,
     )
     # Non-zero exit only if we deferred completed work to a writer-lock timeout (visible in cron mail).
