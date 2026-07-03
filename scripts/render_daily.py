@@ -571,8 +571,8 @@ def rg3_aim_sends(date):
                     JOIN comms.brand b ON b.id = c.brand_id
                     WHERE m.direction = 'outbound' AND m.source = 'ai'
                       AND coalesce(m.is_simulation, false) = false
-                      AND b.sub_account_id = 14603
-                      AND (m.created_at AT TIME ZONE 'America/New_York')::date = %s""", (date,))
+                      AND b.sub_account_id = %s
+                      AND (m.created_at AT TIME ZONE 'America/New_York')::date = %s""", (SUB_REN3, date))
                 return int(cur.fetchone()[0] or 0)
         finally:
             conn.close()

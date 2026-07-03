@@ -112,8 +112,7 @@
       "what": "Per-blast send truth for the day: blast/script name, brand (10DLC campaign), sub-account, lane (RG3 WARM=Financial Summits / COLD=rest), sent, delivered (carrier status), failed, flat cost ($0.0072×sent — doctrine per-blast rate; exact all-in $ = §2b). Plus the day's RG3 AIM-lane outbound line (comms.message outbound source='ai' non-simulation, sub 14603, ET day — safe for OUTBOUND counts). Per-blast replies/warm/links/fills/Ken-$ stay in the EOD lane's report (gap I5).",
       "source_type": "warehouse",
       "warehouse": { "relation": "main.v_sms_blast_performance", "key_columns": ["metric_date", "blast_id", "blast_name", "campaign_name", "sub_account_name", "sent", "delivered", "failed"], "lag": "D-1 (nightly /sms/logs) -> 'pending' note until loaded; 'no blasts this day' only when the day's campaign feed IS loaded but has no blast rows. Capped at 25 rows + aggregated overflow." },
-      "reconciliation": { "type": "sendivo_blast_dashboard", "rule": "rows == the Sendivo blast dashboard (verified Jul-1 R3: 23,877/23,821/23,776 sent; 99.2/98.9/98.9% delivered — exact). GET /blasts (discovered 07-03) returns the same columns incl. deals_won/blast_cost — candidate future live source." },
-      "reconciliation_note": null
+      "reconciliation": { "type": "sendivo_blast_dashboard", "rule": "rows == the Sendivo blast dashboard (verified Jul-1 R3: 23,877/23,821/23,776 sent; 99.2/98.9/98.9% delivered — exact). GET /blasts (discovered 07-03) returns the same columns incl. deals_won/blast_cost — candidate future live source." }
     },
 
     "r3_webform_funnel": {
