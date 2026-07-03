@@ -69,3 +69,14 @@
 - backups/warehouse-*.duckdb
 - serving/snapshots/**
 - serving/test_fixtures/**
+
+# ---- lead-mirror: back up the SERVING replica ONLY, never the PRIMARY (SYNC-8, 2026-07-02) ----
+# rclone reading the 34G primary (lead_mirror.duckdb, the delta-sync/enrichment WRITER target)
+# holds it open across the long Drive upload and trips the primary-lock guard / collides with the
+# mirror write path — caught FOREIGN at ~07:50Z on 06-30/07-01/07-02. lead_mirror_serving.duckdb is
+# an atomically-promoted static replica (refresh_lead_serving.sh cp->bake->mv at 03:50Z, hours before
+# this 07:30Z run), so it carries the SAME lead data (+ suppression tables) and is safe to read.
+# NOTE these patterns match the file's exact path element — lead_mirror_serving.duckdb is NOT matched.
+- lead-mirror/lead_mirror.duckdb
+- lead-mirror/lead_mirror.duckdb.wal
+- lead-mirror/lead_mirror.duckdb.tmp/**
