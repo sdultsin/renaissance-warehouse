@@ -254,13 +254,31 @@ else
 fi
 fi   # end: skip-promote-when-writer-busy guard
 
-# ---- 4) render the day's tab (reads the freshly promoted serving snapshot; ALWAYS runs) ----
-log "rendering tab '$TAB' for $REPORT_DATE ..."
-if $PY scripts/render_daily.py "$REPORT_DATE" "$TAB"; then
+# ---- 4) render (reads the freshly promoted serving snapshot; ALWAYS runs) ----
+# backfill re-renders D-1..D-3 [2026-07-03, SMS/WA funnel doctrine]: D-1 heals §2 Delivered/Fail +
+# the blast-reconcile split + §4 account-grain split + §6 (nightly D-1 sources); D-2/D-3 heal §2
+# Opps — the Qwen classifier lands in serving ~D+2 morning (09:00Z incremental -> seed -> next
+# nightly), so a D-1-only pass would leave Opps '—' forever. Renders are idempotent full-tab
+# rewrites. An explicit date arg (manual/pilot) keeps the single-day behavior.
+RENDER_DATES=("$REPORT_DATE")
+if [[ "$MODE" == "backfill" && -z "${2:-}" ]]; then
+    RENDER_DATES+=("$(TZ=America/New_York date -d '2 days ago' +%F)" "$(TZ=America/New_York date -d '3 days ago' +%F)")
+fi
+RENDER_FAILED=0
+for RD in "${RENDER_DATES[@]}"; do
+    TB="$(date -d "$RD" +'%b %-d')"
+    log "rendering tab '$TB' for $RD ..."
+    if $PY scripts/render_daily.py "$RD" "$TB"; then
+        log "rendered tab '$TB' OK"
+    else
+        rc=$?
+        RENDER_FAILED=1
+        log "ERROR render failed rc=$rc for $RD"
+        alert ":rotating_light: *daily_report_sync ($MODE)* — render FAILED for $RD (rc=$rc). Tab '$TB' may be stale. Box log: $REPO_DIR/logs/daily_report_sync.log"
+    fi
+done
+if [[ "$RENDER_FAILED" == "0" ]]; then
     log "================ daily_report_sync DONE MODE=$MODE tab='$TAB' ================"
 else
-    rc=$?
-    log "ERROR render failed rc=$rc"
-    alert ":rotating_light: *daily_report_sync ($MODE)* — render FAILED for $REPORT_DATE (rc=$rc). Tab '$TAB' may be stale. Box log: $REPO_DIR/logs/daily_report_sync.log"
     exit 1
 fi
