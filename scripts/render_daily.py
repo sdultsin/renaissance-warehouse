@@ -910,13 +910,106 @@ def get_partner():
     pr = sorted(cnt.items(), key=lambda x: (-x[1], x[0]))
     return pr, sum(n for _, n in pr)
 
-# §6 CLOCK MIGRATED [DR-7, 2026-07-03]: the business-minute clamp (_biz_minutes) + clock-open
-# bucket (_clock_open_date) now live in the WAREHOUSE — scripts/build_sla_reply_time.py materializes
-# core.sla_reply_time.biz_latency_minutes + .clock_open_date (the SAME validated §6 clamp, PR #151).
-# get_im_reply() below READS those columns (seq_in_thread=1) instead of recomputing, so the warehouse
-# and this report share ONE definition and can never drift. Verified equal to the digit at cutover.
+# §6 CLOCK MIGRATED [DR-7, 2026-07-03]: the business-minute clamp lives in the WAREHOUSE now —
+# scripts/build_sla_reply_time.py materializes core.sla_reply_time.biz_latency_minutes + .clock_open_date
+# (the SAME validated PR #151 clamp). get_im_reply() READS those columns (seq_in_thread=1) as the PRIMARY
+# path so warehouse + report share ONE definition. The two functions below are kept as the INLINE
+# FALLBACK: if the fact is unavailable (e.g. pre-promote at cutover, or a failed nightly SLA build),
+# §6 recomputes from core.email_message so the number is never blank — a permanent self-heal, and the
+# transitional bridge until the fact is live. They MUST stay bit-identical to build_sla_reply_time.py's
+# copy (both ported from PR #151); the build's _selfcheck() pins that.
 
-_IMREPLY_WARN = None  # (frontier_date, n_missing_window_biz_days) set by get_im_reply; read by imreply_table
+def _biz_minutes(p, r, tz):
+    """§6 SLA latency = BUSINESS MINUTES accrued only inside 12:00-20:00 ET Mon-Fri between aware
+    datetimes p (first prospect reply) and r (our first reply after it). DST-correct via zoneinfo."""
+    if r <= p:
+        return 0.0
+    d = p.astimezone(tz).date()
+    end = r.astimezone(tz).date()
+    tot = 0.0
+    while d <= end:
+        if d.isoweekday() <= 5:
+            o = datetime.datetime.combine(d, datetime.time(12), tzinfo=tz)
+            c = datetime.datetime.combine(d, datetime.time(20), tzinfo=tz)
+            lo = p if p > o else o
+            hi = r if r < c else c
+            if hi > lo:
+                tot += (hi - lo).total_seconds() / 60.0
+        d += datetime.timedelta(days=1)
+    return tot
+
+def _clock_open_date(p, tz):
+    """§6 report bucket = the ET date the thread's SLA clock OPENS. A weekday arrival before 20:00 ET
+    opens that day; a post-8pm or weekend arrival opens the next Mon-Fri day."""
+    e = p.astimezone(tz)
+    d = e.date()
+    if e.isoweekday() <= 5 and e < datetime.datetime.combine(d, datetime.time(20), tzinfo=tz):
+        return d
+    d += datetime.timedelta(days=1)
+    while d.isoweekday() > 5:
+        d += datetime.timedelta(days=1)
+    return d
+
+_IMREPLY_WARN = None    # (frontier_date, n_missing_window_biz_days) set by get_im_reply; read by imreply_table
+_IMREPLY_SOURCE = None  # human label of which path served §6 ("warehouse fact ..." | "inline fallback ...")
+
+def _im_pairs_from_fact(wk0, day0):
+    """PRIMARY §6 source (DR-7): read the materialized first-reply fact. Returns
+    [(ws, clock_open_date, biz_lat)]. Reads 4 days below wk0 so the sync frontier is detectable even
+    when the whole 7d window is eroded. RAISES if the fact/columns are absent (e.g. pre-promote at
+    cutover) -> caller falls back to the inline path. A built-but-empty fact returns [] (correct)."""
+    lo = (wk0 - datetime.timedelta(days=4)).isoformat()
+    rows = wq(f"""
+      SELECT workspace_slug AS ws, clock_open_date AS d, biz_latency_minutes AS lat
+      FROM core.sla_reply_time
+      WHERE seq_in_thread = 1
+        AND biz_latency_minutes IS NOT NULL
+        AND clock_open_date >= DATE '{lo}'
+        AND clock_open_date <= DATE '{day0.isoformat()}'
+        AND workspace_slug IN ({SLUGS_SQL})""")
+    out = []
+    for ws, d_val, lat in rows:
+        if lat is None:
+            continue
+        d = d_val if isinstance(d_val, datetime.date) else datetime.date.fromisoformat(str(d_val)[:10])
+        out.append((ws, d, float(lat)))
+    return out
+
+def _im_pairs_from_email(wk0, day0):
+    """FALLBACK §6 source (the pre-DR-7 inline path): pull first-reply pairs from core.email_message
+    and apply the business-minute clamp here. Returns [(ws, clock_open_date, biz_lat)]. Reconciled to
+    the fact to the digit (same clamp). Load-bearing query notes:
+      - seq ranks over the thread's FULL history; the pull window only limits which FIRSTS are fetched
+        (ranking inside the window would misclassify a follow-up in an older thread as its 'first').
+      - `ours` is matched on thread_id AND ws (thread_ids can span workspaces).
+      - unanswered filtered server-side (r IS NOT NULL) to stay under the read-API 100k truncation cap."""
+    tz = ET_TZ
+    utc = datetime.timezone.utc
+    pull = (wk0 - datetime.timedelta(days=4)).isoformat()
+    rows = wq(f"""
+      WITH inbound AS (
+        SELECT thread_id, workspace_id AS ws, message_at AS p_ts,
+               row_number() OVER (PARTITION BY thread_id, workspace_id
+                                  ORDER BY message_at, message_id) AS seq
+        FROM core.email_message
+        WHERE ue_type=2 AND thread_id IS NOT NULL),
+      ours AS (SELECT thread_id, workspace_id AS ws, message_at AS r_ts FROM core.email_message
+               WHERE ue_type=3 AND thread_id IS NOT NULL AND message_at >= DATE '{pull}')
+      SELECT * FROM (
+        SELECT i.ws AS ws, epoch_ms(i.p_ts) AS p,
+               epoch_ms((SELECT min(o.r_ts) FROM ours o
+                         WHERE o.thread_id=i.thread_id AND o.ws=i.ws AND o.r_ts > i.p_ts)) AS r
+        FROM inbound i
+        WHERE i.seq=1 AND i.p_ts >= DATE '{pull}' AND i.ws IN ({SLUGS_SQL}))
+      WHERE r IS NOT NULL""")
+    out = []
+    for ws, p_ms, r_ms in rows:
+        if r_ms is None:
+            continue
+        p = datetime.datetime.fromtimestamp(float(p_ms) / 1000.0, tz=utc)
+        r = datetime.datetime.fromtimestamp(float(r_ms) / 1000.0, tz=utc)
+        out.append((ws, _clock_open_date(p, tz), _biz_minutes(p, r, tz)))
+    return out
 
 def get_im_reply():
     """§6 IM reply-time — reads the CANONICAL warehouse fact core.sla_reply_time (DR-7, 2026-07-03).
@@ -936,31 +1029,30 @@ def get_im_reply():
     the weekly window back-fills as the SYNC-7 email-reply drain advances — the #177 WARN below flags
     a window still eroded by the drain. Do NOT 'fix' that by switching sources.
 
-    FAIL-SAFE: any read error (e.g. the fact not yet promoted, or empty) raises -> _safe renders §6
-    empty + WARN, never a wrong-but-plausible number (same protection as the old truncation guard)."""
+    CUTOVER SAFETY: the fact read is the PRIMARY path; if it is unavailable (columns/table not in the
+    serving snapshot yet — e.g. between the DDL apply and the first nightly build+promote — or a failed
+    nightly SLA build), §6 FALLS BACK to the inline core.email_message clamp (the pre-DR-7 validated
+    path, reconciled to the digit) so the number is never blank during transition and self-heals if the
+    build ever fails. A genuinely-empty fact (built, but the drain left the window bare) is NOT a
+    fallback trigger — that empty is the correct answer and is surfaced by the #177 WARN / empty note."""
+    global _IMREPLY_WARN, _IMREPLY_SOURCE
     wk = (_d - datetime.timedelta(days=6)).isoformat()
     day0, wk0 = _d, datetime.date.fromisoformat(wk)
-    # Read 4 days before wk0 so the sync frontier is detectable even when the WHOLE 7d window is
-    # eroded (the #177 WARN needs to see a frontier that can sit below wk0). We bucket on the
-    # materialized clock_open_date, so filtering on it is exact — the fact already carries the
-    # first-reply (seq=1) grain and the workspace-scoped pairing (no cross-workspace clock-close).
-    lo = (wk0 - datetime.timedelta(days=4)).isoformat()
-    rows = wq(f"""
-      SELECT workspace_slug AS ws, clock_open_date AS d, biz_latency_minutes AS lat
-      FROM core.sla_reply_time
-      WHERE seq_in_thread = 1
-        AND biz_latency_minutes IS NOT NULL
-        AND clock_open_date >= DATE '{lo}'
-        AND clock_open_date <= DATE '{day0}'
-        AND workspace_slug IN ({SLUGS_SQL})""")
+    try:
+        pairs = _im_pairs_from_fact(wk0, day0)              # PRIMARY: read the materialized fact
+        _IMREPLY_SOURCE = "warehouse fact core.sla_reply_time"
+    except Exception as e:                                  # fact absent (pre-cutover / build failed)
+        print(f"WARN §6 fact read failed ({e}); falling back to inline core.email_message clamp",
+              file=sys.stderr)
+        if ET_TZ is None:
+            raise RuntimeError("zoneinfo unavailable — refusing §6 SLA math in a wrong fixed offset")
+        pairs = _im_pairs_from_email(wk0, day0)             # FALLBACK: pre-DR-7 inline computation
+        _IMREPLY_SOURCE = "inline email_message (transitional fallback — fact unavailable)"
     lats = {}  # ws -> {"d"/"w": [business-minute latencies]}
     frontier = None  # max clock-open date that carries ANY answered pair = the sync frontier
-    for ws, d_val, lat in rows:
-        if lat is None:
-            continue  # belt+braces (SQL already filters answered)
-        d = d_val if isinstance(d_val, datetime.date) else datetime.date.fromisoformat(str(d_val)[:10])
-        if d > day0:
-            continue  # clock opens after the report day
+    for ws, d, lat in pairs:
+        if lat is None or d > day0:
+            continue
         if frontier is None or d > frontier:
             frontier = d
         b = lats.setdefault(ws, {"d": [], "w": []})
@@ -976,8 +1068,7 @@ def get_im_reply():
     # weekly rendered as if it were the signal. Count how many window business-days sit past the
     # frontier; ≥2 empty days = the weekly is eroded (1 empty = the normal D-1 daily lag, weekly
     # still intact). Surfaced as a WARN row so the number is never taken at face value.
-    global _IMREPLY_WARN
-    _IMREPLY_WARN = None
+    _IMREPLY_WARN = None   # (global already declared at the top of get_im_reply)
     if frontier is not None:
         missing = [dd for dd in (wk0 + datetime.timedelta(n) for n in range((day0 - wk0).days + 1))
                    if dd.isoweekday() <= 5 and dd > frontier]
@@ -1492,6 +1583,16 @@ def build_and_write(tab, build_fn):
                         "is deflated and the median reflects only the older synced days — NOT a "
                         "desk-speed change. Self-corrects as the drain advances.)" % (fr.isoformat(), nmiss)])
             data.append(warn); row_ncol[warn] = W
+        # Transitional-source note: §6 primarily reads the canonical fact core.sla_reply_time (DR-7);
+        # when that fact isn't in the serving snapshot yet (cutover) or a nightly SLA build failed, it
+        # falls back to the inline email_message clamp. Flag the fallback so a reader knows §6 is on the
+        # bridge path (same numbers, reconciled) — it disappears once the fact is live. No note on the
+        # normal fact path.
+        if _IMREPLY_SOURCE and "fallback" in _IMREPLY_SOURCE:
+            src = add(["(i §6 on transitional INLINE fallback — canonical fact not in serving yet; "
+                       "numbers are the reconciled §6 clamp, identical to the fact. Clears once "
+                       "core.sla_reply_time promotes.)"])
+            data.append(src); row_ncol[src] = W
         pend = add(["SMS · WhatsApp first-reply time", "pending", "pending", "pending"])
         data.append(pend); row_ncol[pend] = W
     def infra_table(infra, header_label):
