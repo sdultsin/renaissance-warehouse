@@ -790,12 +790,24 @@ def get_truth(infra_d=None):
     # 0 rows; 07-01 only ~42% loaded; 06-29 missing entirely). Actual TOTAL and §1 read a LIVE Instantly
     # fetch; §1b resolves the infra split LIVE (per-campaign -> tag -> infra, same Instantly source), so
     # it is complete same-day. We therefore waterfall per workspace:
-    #   1. core.sending_account_daily has day-D rows  -> use it (canonical account grain; captures
-    #      subsequence sends; survives deleted campaigns; this is what backfill re-renders heal onto).
-    #   2. else the live §1b infra split (infra_d.by_ws) if available -> reconciles to Actual total by
+    #   1. core.sending_account_daily has a COMPLETE day-D load -> use it (canonical account grain;
+    #      captures subsequence sends; survives deleted campaigns; this is what backfill re-renders heal
+    #      onto). "Complete" is NOT "has any row": the nightly writes this table account-by-account, so
+    #      mid-load a workspace can hold a tiny fraction of its sends (2026-07-01 was ~42% loaded), which
+    #      would render e.g. OTD~5 next to Actual total 500,000. We therefore require the sad split to
+    #      RECONCILE to most of the workspace's live actual total before trusting it (sad excludes Outlook
+    #      so it is legitimately <= actual; a genuine partial load is orders of magnitude below any Outlook
+    #      share). A partial/absent load falls through to branch 2, exactly like a churn day.
+    #   2. else the live §1b infra split (infra_d.by_ws) if it resolved >0 -> reconciles to Actual total by
     #      construction (shared instantly_daily source).
     #   3. else UNRESOLVED (None -> rendered "—") — NEVER a fake 0 [partial_data_100pct_or_wipe].
-    sad_present = {slug for slug, v in asplit.items() if (v[0] or v[1] or v[2])}
+    def _sad_complete(slug):
+        v = asplit.get(slug)
+        if not v:
+            return False
+        split_total = v[0] + v[1] + v[2]
+        act = inst.get(slug, (0, 0))[0] or 0
+        return split_total > 0 and (act == 0 or split_total >= 0.5 * act)
     live = {}   # slug -> (otd_live, goog_live) from the §1b live per-infra resolution
     for _s, _n, agg, *_rest in (infra_d or {}).get("by_ws", []):
         live[_s] = (float(agg.get("OTD", [0, 0, 0, 0])[0]), float(agg.get("Google", [0, 0, 0, 0])[0]))
@@ -804,20 +816,20 @@ def get_truth(infra_d=None):
     for slug, name in WS:
         otd = cap.get((slug, "OTD"), 0.0); goog = cap.get((slug, "Google"), 0.0)
         actual = inst.get(slug, (0, 0))[0]
-        if slug in sad_present:
+        if _sad_complete(slug):
             otd_a, goog_a, _un = asplit.get(slug, (0.0, 0.0, 0.0))
         elif slug in live and (live[slug][0] or live[slug][1]):
             otd_a, goog_a = live[slug]; used_live.append(name)   # live §1b split resolved >0
         else:
-            # sending_account_daily has no day-D rows AND §1b resolved neither infra (e.g. Ren1/Warm,
+            # sending_account_daily has no usable day-D load AND §1b resolved neither infra (e.g. Ren1/Warm,
             # whose sends don't tag-classify to OTD/Google) -> UNRESOLVED "—", never a fake 0. Heals to
             # the real account-grain split on the next backfill re-render.
             otd_a, goog_a = None, None
         out.append((name, otd, goog, otd + goog, actual, otd_a, goog_a))
     if used_live:
-        print(f"NOTE §4 per-infra actual: core.sending_account_daily has no report-day ({DAILY}) rows "
-              f"for {used_live} (nightly D-1 feed) — used the LIVE §1b infra split (reconciles to §1); "
-              f"the account-grain split heals on the next backfill re-render.", file=sys.stderr)
+        print(f"NOTE §4 per-infra actual: no usable report-day ({DAILY}) account split (absent or partial "
+              f"nightly load) for {used_live} — used the LIVE §1b infra split (reconciles to §1); the "
+              f"account-grain split heals on the next backfill re-render.", file=sys.stderr)
     census = max(used.values()) if used else None
     stale = sorted({str(d) for d in used.values() if d != census})
     if stale:
