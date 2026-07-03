@@ -806,10 +806,13 @@ def get_truth(infra_d=None):
         actual = inst.get(slug, (0, 0))[0]
         if slug in sad_present:
             otd_a, goog_a, _un = asplit.get(slug, (0.0, 0.0, 0.0))
-        elif slug in live:
-            otd_a, goog_a = live[slug]; used_live.append(name)
+        elif slug in live and (live[slug][0] or live[slug][1]):
+            otd_a, goog_a = live[slug]; used_live.append(name)   # live §1b split resolved >0
         else:
-            otd_a, goog_a = None, None   # unresolved -> "—" (never a fake 0)
+            # sending_account_daily has no day-D rows AND §1b resolved neither infra (e.g. Ren1/Warm,
+            # whose sends don't tag-classify to OTD/Google) -> UNRESOLVED "—", never a fake 0. Heals to
+            # the real account-grain split on the next backfill re-render.
+            otd_a, goog_a = None, None
         out.append((name, otd, goog, otd + goog, actual, otd_a, goog_a))
     if used_live:
         print(f"NOTE §4 per-infra actual: core.sending_account_daily has no report-day ({DAILY}) rows "
@@ -1458,42 +1461,27 @@ def build_and_write(tab, build_fn):
             ri = add([p, n]); data.append(ri); row_ncol[ri] = W
         ti = add(["TOTAL", total]); tot.append(ti); row_ncol[ti] = W
     def imreply_table(rows_data, label):
-        # Daily + Weekly-7d blocks ONLY [DR-10, Sam 07-01]: the Monthly (MTD) block (was cols H-J)
-        # is removed — no MTD anything on a daily tab (trailing windows like weekly-7d stay).
-        W = 7
+        # WEEKLY-7d ONLY [Sam 2026-07-02]: the Daily (trailing) block is REMOVED. §6's source
+        # (core.email_message) is nightly-fed (D-1 at best), so day-D's daily cell is STRUCTURALLY empty
+        # on day D — an always-empty block that reads as noise. The weekly-7d window carries the signal.
+        # (The Monthly/MTD block was already dropped [DR-10, Sam 07-01] — no MTD on a daily tab.)
+        W = 4
         si = add([label]); sec.append(si); row_ncol[si] = W
-        hr_top = add(["Workspace", "Daily (trailing — source is nightly-fed, D-1)", "", "", "Weekly (7d)", "", ""]); th.append(hr_top)
-        hr_sub = add(["", "n", "Median min", "Avg min", "n", "Median min", "Avg min"]); th.append(hr_sub)
-        merges.append((hr_top, 1, 4)); merges.append((hr_top, 4, 7)); th_ncol[hr_top] = th_ncol[hr_sub] = W
+        hr = add(["Workspace", "Weekly (7d) — n", "Median min", "Avg min"]); th.append(hr); th_ncol[hr] = W
         for name, dn, dmed, davg, wn, wmed, wavg in rows_data:
-            ri = add([name, dn, mins(dmed), mins(davg), wn, mins(wmed), mins(wavg)])
+            ri = add([name, wn, mins(wmed), mins(wavg)])
             data.append(ri); row_ncol[ri] = W
-        # Explicit empty-state so a legitimately-quiet day (or the nightly email_message sync lag)
-        # never reads as a clobbered/missing §6 — the header + a per-workspace shell ALWAYS render.
-        # TWO distinct notes: daily-only empty (weekly has data) = the NORMAL D-1 pattern;
-        # everything empty = the pull FAILED (_safe fallback) or a total source gap — say THAT, never
-        # print the benign by-design explanation over a broken query (wrong-but-plausible is the
-        # exact failure mode the wq truncation guard exists to prevent).
-        if not any((r[1] or 0) for r in rows_data):
-            if any((r[4] or 0) for r in rows_data):
-                # Only claim "weekly carries the signal" when the weekly ISN'T itself eroded by the
-                # drain — otherwise the WEEKLY-UNDERSTATED warn below is the authoritative note and
-                # this reassurance would contradict it (the exact confusion this whole guard fixes).
-                note = None if _IMREPLY_WARN else add([
-                            "(no answered first-reply pairs clocked to %s yet — core.email_message "
-                            "is nightly-fed (D-1 at best by design), so day-D's daily cell is "
-                            "structurally empty on day D and back-fills on later renders; weekly "
-                            "carries the signal)" % DAILY])
-            else:
-                note = add(["(!) §6 rendered EMPTY for %s — the warehouse pull failed or returned "
-                            "no pairs at all (see render stderr); this is NOT the normal D-1 "
-                            "sync-lag pattern" % DAILY])
-            if note is not None:                       # None = suppressed (weekly-understated warn owns the message)
-                data.append(note); row_ncol[note] = W
-        # WEEKLY-INCOMPLETENESS WARN (2026-07-02): fires when the email_message sync frontier lags
-        # ≥2 business-days into the trailing-7d window, so the weekly n/median are structurally
-        # deflated (not a real speed change). Distinct from the daily-empty note above, which only
-        # ever looked at the daily column and so silently passed a half-populated weekly as signal.
+        # Empty-state: the weekly window should essentially always carry pairs; if it's empty the pull
+        # FAILED (_safe fallback) or returned nothing — say THAT (the old benign D-1 lag line only ever
+        # explained the now-removed daily cell, so it's gone with the daily block).
+        if not any((r[4] or 0) for r in rows_data):
+            note = add(["(!) §6 rendered EMPTY for the trailing week — the warehouse pull failed or "
+                        "returned no first-reply pairs at all (see render stderr)"])
+            data.append(note); row_ncol[note] = W
+        # WEEKLY-INCOMPLETENESS WARN (SYNC-7, #177/#178, retained through the weekly-only rewrite): fires
+        # when the email_message sync frontier lags ≥2 business-days into the trailing-7d window, so the
+        # weekly n/median are structurally deflated (not a real speed change). This is about the WEEKLY
+        # window (the only §6 block now), so it stays load-bearing even with the daily block gone.
         if _IMREPLY_WARN:
             fr, nmiss = _IMREPLY_WARN
             warn = add(["(⚠ WEEKLY UNDERSTATED — email reply-history synced only through %s (SYNC-7 "
@@ -1501,7 +1489,7 @@ def build_and_write(tab, build_fn):
                         "is deflated and the median reflects only the older synced days — NOT a "
                         "desk-speed change. Self-corrects as the drain advances.)" % (fr.isoformat(), nmiss)])
             data.append(warn); row_ncol[warn] = W
-        pend = add(["SMS · WhatsApp first-reply time", "pending", "pending", "pending", "pending", "pending", "pending"])
+        pend = add(["SMS · WhatsApp first-reply time", "pending", "pending", "pending"])
         data.append(pend); row_ncol[pend] = W
     def infra_table(infra, header_label):
         # §1b — one row PER INFRASTRUCTURE, summed across ALL workspaces (Sam 2026-06-30; Google == reseller).
@@ -1534,11 +1522,22 @@ def build_and_write(tab, build_fn):
         tot.append(gi); infrows.append(gi); row_ncol[gi] = W
         um = infra.get("unattr_mtg", 0)
         if um:
-            ni = add(["(note: %s Funding meetings on %s had no resolvable email campaign - SMS/script/portal - not in any infra row)" % (um, DAILY)])
+            ni = add(["(note: %s Funding meetings on %s had no resolvable email campaign — MOSTLY non-email "
+                      "channels (SMS / Call / WhatsApp), correctly excluded from these EMAIL infra rows; on "
+                      "OTD-churn days a few real email meetings also land here (campaign created/deleted "
+                      "intraday → no live tagged campaign), so Email→meeting understates slightly — see §7 "
+                      "DATA CAVEATS)" % (um, DAILY)])
             data.append(ni); row_ncol[ni] = W
+    # §7 DATA CAVEATS — load-bearing "how to read this number" notes promoted OUT of per-section footnotes
+    # so nothing that changes a number's meaning stays buried [Sam 2026-07-02]. Text-only; one row/caveat.
+    def caveats_table(label, items):
+        W = 1
+        si = add([label]); sec.append(si); row_ncol[si] = W
+        for t in items:
+            ci = add(["• " + t]); data.append(ci); row_ncol[ci] = W
     build_fn(dict(add=add, email_table=email_table, sms_wa_table=sms_wa_table, truth_table=truth_table,
                   close_table=close_table, partner_table=partner_table, imreply_table=imreply_table,
-                  infra_table=infra_table, sms_kpi_table=sms_kpi_table))
+                  infra_table=infra_table, sms_kpi_table=sms_kpi_table, caveats_table=caveats_table))
 
     meta = api("GET", BASE + "?fields=sheets(properties(sheetId,title),bandedRanges(bandedRangeId),conditionalFormats)")
     sh = next((s for s in meta["sheets"] if s["properties"]["title"] == tab), None)
@@ -1654,20 +1653,25 @@ def write_summary_block(sid):
 def daily(ctx):
     add = ctx["add"]
     add([f"DAILY REVOPS REPORT — Business Funding · {DAILY}"])
-    add([os.environ.get("DAILY_SUBTITLE", f"Daily · {DAILY} · single-source-of-truth (warehouse + Instantly/sendivo live)")]); add()
+    add([os.environ.get("DAILY_SUBTITLE", f"Daily · {DAILY} · single-source-of-truth (warehouse + Instantly/sendivo live) · ⚠ read §7 DATA CAVEATS before citing")]); add()
     ctx["email_table"](EMAIL_D, f"1 · EMAIL + WARM LEADS — by workspace · day {DAILY}"); add()
     ctx["infra_table"](INFRA_D, f"1b · EMAIL KPIs BY INFRASTRUCTURE — {' / '.join(INFRA_RENDER_LABEL[i] for i in INFRA_RENDER_ROWS)} · all workspaces · day {DAILY} (Milkbox row wiped 2026-07-01 pending rebuild)"); add()
     ctx["sms_wa_table"](SMS_D, f"2 · SMS + WHATSAPP — by channel · day {DAILY}"); add()
-    # §2b header CARRIES its window explicitly ("7-day trailing …"), so it can never again read as a
-    # contradiction of §2's single-day numbers (06-30: §2 Ren3 94,796/day vs §2b 111,328/7d — both right).
-    _w = SMS_KPI_D.get("dates") or []
-    _win = (f"{len(_w)}-day TRAILING window {_w[0]}..{_w[-1]} — NOT the single day above"
-            if (_w and SMS_KPI_D.get("rows")) else "trailing fully-classified window")
-    ctx["sms_kpi_table"](SMS_KPI_D, f"2b · SMS KPI-to-opp — texts per opportunity by workspace · {_win} (the web-form-economics gate)"); add()
+    # §2b (7-day trailing SMS KPI-to-opp) REMOVED from the daily tab [Sam 2026-07-02]: nothing non-daily
+    # belongs on a daily report — a trailing window next to single-day rows invites the exact misread the
+    # window-label patch was fighting. The underlying views (v_sms_campaign_performance / KPI-to-opp) and
+    # get_sms_kpi_to_opp stay for other consumers; only this tab section is dropped.
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
     ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (CONNECTED active capacity; disconnected/paused inboxes excluded) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · split = account-grain sending_account_daily when the report day has loaded, else the live §1b infra split (unresolved shows '—', never 0) · no-lag · census {SENDING_CENSUS}"); add()
     ctx["partner_table"](PARTNER_D, PARTNER_D_TOTAL, f"5 · BOOKINGS BY PARTNER · day {DAILY}"); add()
-    ctx["imreply_table"](IMREPLY_D, f"6 · IM REPLY-TIME — business minutes to first reply, by workspace · clock runs 12-8pm ET Mon-Fri only (all arrivals count; off-hours clock opens next window) · daily / weekly · email (SMS+WA pending) · BLENDED IM+AIM: AIM (AI-drafted) replies ship through the same Instantly inboxes and carry NO distinguishing flag in the data, so a fast median reflects AI-assisted answering, not desk speed (a workspace with little/no AIM — e.g. Renaissance 1 DFY — reads slower for that reason, not because the desk is broken) · Grace & Sam")
+    ctx["imreply_table"](IMREPLY_D, f"6 · IM REPLY-TIME — business minutes to first reply, by workspace · clock runs 12-8pm ET Mon-Fri only (all arrivals count; off-hours clock opens next window) · WEEKLY (7d) only — daily block removed 2026-07-02 (source is nightly-fed D-1, so day-D daily is structurally empty) · email (SMS+WA pending) · BLENDED IM+AIM: AIM (AI-drafted) replies ship through the same Instantly inboxes and carry NO distinguishing flag in the data, so a fast median reflects AI-assisted answering, not desk speed (a workspace with little/no AIM — e.g. Renaissance 1 DFY — reads slower for that reason, not because the desk is broken) · Grace & Sam"); add()
+    ctx["caveats_table"]("7 · DATA CAVEATS — how to read these numbers (load-bearing; promoted from footnotes)", [
+        "§1b EMAIL infra rows exclude non-email bookings: SMS / Call / WhatsApp Funding meetings (the bulk of §1b's 'no resolvable email campaign' note) are correctly NOT in the OTD/Google rows. On OTD-churn days a few genuine EMAIL meetings also fall into 'unattributed' — their campaign was created or deleted intraday, so it doesn't map to a live tagged campaign — so §1b Email→meeting understates slightly that day. Not a data error.",
+        f"§4 Actual OTD/Google split: on the ~10pm-ET evening render the report-day account feed (core.sending_account_daily) has not loaded yet, so the split is the LIVE §1b infra resolution (same Instantly source as Actual total). Subsequence + deleted-campaign sends fall to an unsplit residual, so OTD+Google can be LESS than Actual total; '—' means the split was unresolvable for that workspace on {DAILY} (never a fake 0). It heals to the complete account-grain split at the 12:45Z backfill re-render. Actual total includes Outlook, which is excluded from the split and from Expected.",
+        "§6 reply-time is BLENDED human + AIM (AI-drafted): AIM replies ship through the same inboxes with no distinguishing flag, so a fast median reflects AI-assisted answering, not desk speed — a workspace with little/no AIM (e.g. Renaissance 1 DFY) reads slower for that reason. WEEKLY-only: the daily window is nightly-fed (D-1) and structurally empty on day D. When the email-reply sync frontier lags into the 7-day window, the weekly n/median are structurally deflated (SYNC-7 drain) — a '⚠ WEEKLY UNDERSTATED' row flags that when it happens; it is not a desk-speed change.",
+        "§2 SMS: Renaissance 3 (webform) sends route via the AIM API, which is NOT in the campaign feed, so Ren3 Sent (and any Sent-derived ratio) undercounts. A '—' cost cell means the all-in Sendivo billing row back-fills after the nightly.",
+        "Evening-render timing: meetings read LOW on the ~10pm-ET render — the IM booking backlog clears ~midnight and bookings after the ~9pm snapshot miss it. The tab trues up at the 12:45Z backfill re-render the next day.",
+    ])
 
 def _alert(text):
     """Best-effort drift alert via the established scripts/alert_slack.py path; never raises (the tab
