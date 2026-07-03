@@ -8,6 +8,9 @@
                                    ONE definition (DR-7).
   2. core.sla_reply_time_daily   — daily SNAPSHOT keyed on CLOCK_OPEN_DATE (count + avg +
                                    median + q25/q50/q75 of business-minute latency).
+  3. core.sla_reply_time_smswa   — the SMS + WhatsApp siblings (DDL 1077, ITEM-3): same
+                                   clock per SMS desk / WA, + raw wall-clock latency
+                                   alongside. See build_smswa() for sources + rules.
 
 WIRED into nightly.sh (runs AFTER the orchestrator releases the writer lock; core/db.py's
 in-process writer flock serializes it). Reads core.email_message (nightly-synced).
@@ -55,7 +58,12 @@ from core.config import REPO_ROOT
 logger = logging.getLogger("scripts.build_sla_reply_time")
 
 _DDL = REPO_ROOT / "sql" / "ddl" / "1070_sla_reply_time_bizminutes.sql"
+_DDL_SMSWA = REPO_ROOT / "sql" / "ddl" / "1077_sla_reply_time_smswa.sql"
 _EMAIL = "core.email_message"
+# SMS reply-type capture era (ITEM3-SLA coverage audit, 2026-07-03): Sendivo-log recovery of
+# conversational (blast_id-NULL) sends jumped 4-10x on this date; earlier reply capture is
+# partial (~22-24%) -> SMS first-replies before the floor are WIPED, never blended.
+_SMS_CAPTURE_ERA_START = "2026-06-27"
 
 # ── THE validated §6 SLA clock (ported verbatim from render_daily.py, PR #151). ──────────────
 # core.sla_reply_time is now the single home for this clamp; render_daily.py §6 reads the
@@ -249,6 +257,131 @@ def build(db, snapshot_days: int | None, run_id: str) -> None:
     logger.info("core.sla_reply_time_daily: %d (workspace x clock-open-day) snapshot rows", snap_rows)
 
 
+def build_smswa(db, run_id: str) -> None:
+    """SMS + WhatsApp siblings of the §6 clock (DDL 1077, ITEM-3 2026-07-03) —
+    core.sla_reply_time_smswa: one row per conversation's FIRST qualifying prospect reply,
+    same verbatim business-minute clamp, plus the raw wall-clock latency Sam ruled must be
+    reported alongside (SMS/WA answering runs ~24/7, so the clamped median alone can read 0.0).
+
+    SOURCES + rules (measured/validated in deliverables/2026-07-02-smswa-program/ITEM3-SLA/):
+      * SMS population = first NON-OPT-OUT inbound per (sub_account, phone10) from
+        raw_sendivo_inbound (webhook-complete; comms.message drops suppressed STOPs).
+        STOP-class inbounds owe no response by design -> excluded from the population.
+      * SMS response = first reply-type send after it from v_sendivo_outbound_recovered
+        (blast_id IS NULL = conversational send; blast steps are never a "response").
+        ONE pairing for all three desks: AIM sends and manual IM sends both land in the
+        recovered log (verified 1,087/1,087 AIM sends; 97.6% of bookings show one), so the
+        metric stays valid as AIM expands across desks.
+      * SMS capture-era floor: reply-type recovery capture jumped 4-10x on 2026-06-27;
+        before that it is partial (~22-24%-era) -> first-replies earlier than the floor are
+        WIPED, not blended (100%-or-wipe).
+      * WA population = first inbound per Iskra conversation_id; response = first outbound
+        after it (raw_iskra_messages, integrity-anchored ingest).
+      * Unanswered firsts are KEPT (NULL latencies): answered-rate is load-bearing for
+        SMS/WA (~23-35% SMS / ~12% WA — most non-opt-out replies are hostile/junk the desk
+        correctly declines to answer).
+    """
+    if ET_TZ is None:
+        raise RuntimeError("zoneinfo unavailable — refusing to build the SLA clock in a wrong fixed offset")
+    tz = ET_TZ
+    utc = dt.timezone.utc
+    _selfcheck(tz)
+
+    ddl_text = _DDL_SMSWA.read_text()
+    table_ddl, _, index_and_rest = ddl_text.partition("-- @@INDEXES@@")
+    db.execute(table_ddl)      # raw mirror DDL (idempotent) + DROP+CREATE the unindexed fact
+
+    lanes = []  # (channel, desk, conv_key, p_ms, r_ms)
+    for sub, phone10, p_ms, r_ms in db.execute(
+        f"""
+        WITH inb AS (
+          SELECT sub_account_name AS sub,
+                 right(regexp_replace(prospect_number, '[^0-9]', '', 'g'), 10) AS phone10,
+                 min(received_at) AS p_ts
+          FROM raw_sendivo_inbound
+          WHERE NOT is_opt_out
+            AND sub_account_name IN ('Renaissance 1', 'Renaissance 2', 'Renaissance 3')
+          GROUP BY 1, 2
+          HAVING min(received_at) >= TIMESTAMP '{_SMS_CAPTURE_ERA_START} 00:00:00+00'),
+        resp AS (
+          SELECT i.sub, i.phone10, min(o.sent_at) AS r_ts
+          FROM inb i
+          JOIN v_sendivo_outbound_recovered o
+            ON o.phone10 = i.phone10 AND o.sub_account_name = i.sub
+          WHERE o.blast_id IS NULL AND o.sent_at > i.p_ts
+          GROUP BY 1, 2)
+        SELECT i.sub, i.phone10, epoch_ms(i.p_ts) AS p_ms, epoch_ms(r.r_ts) AS r_ms
+        FROM inb i LEFT JOIN resp r ON r.sub = i.sub AND r.phone10 = i.phone10
+        """
+    ).fetchall():
+        lanes.append(("sms", sub, phone10, p_ms, r_ms))
+    for cid, p_ms, r_ms in db.execute(
+        """
+        WITH inb AS (
+          SELECT conversation_id AS cid, min(created_at) AS p_ts
+          FROM raw_iskra_messages
+          WHERE direction = 'inbound' AND channel = 'whatsapp'
+          GROUP BY 1),
+        resp AS (
+          SELECT i.cid, min(o.created_at) AS r_ts
+          FROM inb i
+          JOIN raw_iskra_messages o ON o.conversation_id = i.cid
+          WHERE o.direction = 'outbound' AND o.created_at > i.p_ts
+          GROUP BY 1)
+        SELECT i.cid, epoch_ms(i.p_ts) AS p_ms, epoch_ms(r.r_ts) AS r_ms
+        FROM inb i LEFT JOIN resp r ON r.cid = i.cid
+        """
+    ).fetchall():
+        lanes.append(("whatsapp", "WhatsApp (ISKRA)", cid, p_ms, r_ms))
+
+    now_ts = dt.datetime.now(tz=utc)
+    rows = []
+    for channel, desk, conv_key, p_ms, r_ms in lanes:
+        if p_ms is None:
+            continue
+        p = dt.datetime.fromtimestamp(float(p_ms) / 1000.0, tz=utc)
+        clock_open = _clock_open_date(p, tz)
+        if r_ms is None:
+            our_ts = biz_lat = raw_lat = None
+        else:
+            r = dt.datetime.fromtimestamp(float(r_ms) / 1000.0, tz=utc)
+            our_ts = r
+            biz_lat = _biz_minutes(p, r, tz)
+            raw_lat = (r - p).total_seconds() / 60.0
+        rid = f"sms|{desk}|{conv_key}" if channel == "sms" else f"wa|{conv_key}"
+        rows.append((rid, channel, desk, conv_key, p, our_ts, biz_lat, raw_lat,
+                     clock_open, now_ts, run_id))
+
+    db.executemany(
+        """INSERT INTO core.sla_reply_time_smswa
+           (response_id, channel, desk, conversation_key, prospect_msg_ts, our_reply_ts,
+            biz_latency_minutes, raw_latency_minutes, clock_open_date, _built_at, _run_id)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        rows,
+    )
+    db.execute(index_and_rest)   # fact indexes + rollup macro
+
+    # HARD floor assertion (gate finding, 2026-07-03): a pre-capture-era SMS row in the fact
+    # means the HAVING floor above was edited/broken -> the SMS median would silently blend the
+    # partial-capture era. Fail the build, never a quiet wrong number (100%-or-wipe).
+    n_prefloor = db.execute(
+        f"SELECT count(*) FROM core.sla_reply_time_smswa "
+        f"WHERE channel = 'sms' AND prospect_msg_ts < TIMESTAMP '{_SMS_CAPTURE_ERA_START} 00:00:00+00'"
+    ).fetchone()[0]
+    if n_prefloor:
+        raise RuntimeError(
+            f"sla_reply_time_smswa: {n_prefloor} SMS first-reply rows predate the "
+            f"{_SMS_CAPTURE_ERA_START} reply-capture era floor — the population filter is broken; "
+            f"refusing to ship a partial-capture-blended SMS SLA.")
+
+    for channel, desk, total, answered in db.execute(
+        "SELECT channel, desk, count(*), count(biz_latency_minutes) "
+        "FROM core.sla_reply_time_smswa GROUP BY 1, 2 ORDER BY 1, 2"
+    ).fetchall():
+        logger.info("core.sla_reply_time_smswa[%s/%s]: %d first-reply rows (%d answered)",
+                    channel, desk, total, answered)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=None, help="warehouse.duckdb path (default = config)")
@@ -266,13 +399,26 @@ def main(argv=None) -> int:
     snapshot_days = None if args.snapshot_all else args.snapshot_days
 
     conn = db_module.connect(Path(args.db) if args.db else None)
-    conn.execute("BEGIN")
     try:
-        build(conn, snapshot_days, run_id)
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+        conn.execute("BEGIN")
+        try:
+            build(conn, snapshot_days, run_id)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        # SMS/WA siblings (DDL 1077) — own transaction, FAIL-ISOLATED from the email fact:
+        # a broken SMS mirror must never take down the §6 email SLA (and vice versa). A
+        # failure here logs LOUD (greppable by the nightly watchdog) and the renderer's
+        # SMS/WA block degrades to its empty-state WARN, never a silent wrong number.
+        try:
+            conn.execute("BEGIN")
+            build_smswa(conn, run_id)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            logger.exception("ERROR sla_smswa_build_failed (email fact committed OK; "
+                             "§6 SMS/WA block will render empty + WARN)")
     finally:
         conn.close()
     return 0
