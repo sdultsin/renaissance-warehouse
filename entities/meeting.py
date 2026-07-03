@@ -18,7 +18,8 @@ Campaign attribution for sheet rows = main.norm_campaign_name() join to the camp
 non-campaign labels / truncated names) land with campaign_id NULL and match_method='unmatched'.
 The real match_method vocabulary (no "4-tier matcher" exists — DATA-2 docstring fix 2026-07-01):
 sheet-era: 'sheet_norm' (norm-name join) | 'unmatched' | 'partner_sheet' (step 2.5) |
-'email_reply_backfill' (step 2b) | 'sms_phone_sendivo' (step 2e); slack-era rows carry the legacy
+'email_reply_backfill' (step 2b) | 'lead_event_backfill' (step 2b2) | 'sms_phone_sendivo' (step 2e);
+slack-era rows carry the legacy
 matcher values ('exact' | 'alias' | 'normalized' | 'manual*' | 'llm_*' | ..., see 20_meeting.sql).
 
 WS5 v3 [2026-06-21] — canonical business-date + workspace-normalized D6 attribution + D7 SMS split:
@@ -394,19 +395,41 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
           SELECT * FROM ff_keyed
           QUALIFY ROW_NUMBER() OVER (PARTITION BY meeting_id ORDER BY posted_ts) = 1
         ),
-        camp AS (  -- one campaign per normalized name: most-recent, fully deterministic tiebreak
-          SELECT nk, campaign_id FROM (
-            SELECT main.norm_campaign_name(name) AS nk, campaign_id,
-                   ROW_NUMBER() OVER (PARTITION BY main.norm_campaign_name(name)
-                                      ORDER BY instantly_created_at DESC NULLS LAST, campaign_id DESC) AS rn
-            FROM main.raw_pipeline_campaigns
-            WHERE name IS NOT NULL AND name <> ''
-          ) WHERE rn = 1
+        camp AS (  -- ALL generations per normalized name (+ created_at); the per-meeting
+                   -- TIME-AWARE pick happens in `matched` below (campaign-truth fix, 2026-07-03)
+          SELECT main.norm_campaign_name(name) AS nk, campaign_id,
+                 max(instantly_created_at) AS created_at
+          FROM main.raw_pipeline_campaigns
+          WHERE name IS NOT NULL AND name <> ''
+          GROUP BY 1, 2
         ),
         matched AS (
+          -- TIME-AWARE norm-name resolution (campaign-truth root fix, 2026-07-03): 192
+          -- normalized names collide across 442 campaign_ids, and the old one-winner-per-name
+          -- pick (ROW_NUMBER ... instantly_created_at DESC) sent EVERY meeting for a reused
+          -- name to the NEWEST generation — including meetings posted BEFORE it existed. Now
+          -- each meeting takes the generation with the greatest instantly_created_at AT/BEFORE
+          -- its posted timestamp; a meeting predating every generation falls back to the
+          -- OLDEST; campaign_id DESC keeps equal-timestamp ties deterministic.
+          -- Verified read-only (snapshot warehouse_20260703_043558_874.duckdb):
+          --   * non-colliding names resolve EXACTLY as before (1,534 sheet_norm meetings, 0
+          --     changed); 394 colliding-name meetings reassigned.
+          --   * 'ON - GOOGLE - BEN CHEAP 3/4 - BTC/GQ - (EYVER)': 38 meetings 06-02..06-07 ->
+          --     fddd5089 (created 05-28), 57 meetings 06-09..06-19 -> e8f4018c (created
+          --     06-08 15:45) — previously all 95 on e8f4018c.
+          --   * 'ON - GOOGLE - ISAAC - BTC/GQ': 172 meetings 06-19..07-01 stay on 33f41f26
+          --     (created 06-19); only 7 (posted 07-02+) on the 07-01 generation 9e0b7156 —
+          --     previously all 179 on the 07-01 generation.
           SELECT f.*, c.campaign_id AS matched_cid
           FROM ff_dedup f
           LEFT JOIN camp c ON c.nk = main.norm_campaign_name(f.campaign_name)
+          QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY f.meeting_id
+            ORDER BY (c.created_at IS NOT NULL AND c.created_at <= f.posted_ts) DESC,
+                     CASE WHEN c.created_at <= f.posted_ts THEN c.created_at END DESC,
+                     c.created_at ASC NULLS LAST,
+                     c.campaign_id DESC
+          ) = 1
         ),
         ws_resolved AS (
           -- D6: resolve the raw col-O label -> canonical workspace via core.workspace_alias
@@ -500,19 +523,34 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
             AND deleted_at IS NULL                  -- cancelled bookings excluded (never count a dead booking)
             AND TRY_CAST("date" AS DATE) >= DATE '{IMB_CUTOVER}'
         ),
-        camp AS (  -- one campaign per normalized name: most-recent, fully deterministic tiebreak (== step 2)
-          SELECT nk, campaign_id FROM (
-            SELECT main.norm_campaign_name(name) AS nk, campaign_id,
-                   ROW_NUMBER() OVER (PARTITION BY main.norm_campaign_name(name)
-                                      ORDER BY instantly_created_at DESC NULLS LAST, campaign_id DESC) AS rn
-            FROM main.raw_pipeline_campaigns
-            WHERE name IS NOT NULL AND name <> ''
-          ) WHERE rn = 1
+        camp AS (  -- ALL generations per normalized name (+ created_at) — TIME-AWARE per-meeting
+                   -- pick in `matched` below (== step 2; see the full rationale + verification
+                   -- numbers there, campaign-truth fix 2026-07-03)
+          SELECT main.norm_campaign_name(name) AS nk, campaign_id,
+                 max(instantly_created_at) AS created_at
+          FROM main.raw_pipeline_campaigns
+          WHERE name IS NOT NULL AND name <> ''
+          GROUP BY 1, 2
         ),
         matched AS (
+          -- Same time-aware rule as step 2, binding the imb posted timestamp = meeting_date
+          -- at midnight (the portal carries no time-of-day; == the inserted posted_at). A
+          -- generation created LATER the same day is deliberately not picked — the previous
+          -- generation was the one actually sending (e.g. ISAAC imb meetings dated 07-01 stay
+          -- on the 06-19 generation, not the one created 07-01 07:10; verified in step 2's
+          -- comment). Meetings predating every generation fall back to the OLDEST.
           SELECT f.*, c.campaign_id AS matched_cid
           FROM imb f
           LEFT JOIN camp c ON c.nk = main.norm_campaign_name(f.campaign_name)
+          QUALIFY ROW_NUMBER() OVER (
+            PARTITION BY f.id
+            ORDER BY (c.created_at IS NOT NULL
+                      AND c.created_at <= CAST(f.meeting_date AS TIMESTAMP)) DESC,
+                     CASE WHEN c.created_at <= CAST(f.meeting_date AS TIMESTAMP)
+                          THEN c.created_at END DESC,
+                     c.created_at ASC NULLS LAST,
+                     c.campaign_id DESC
+          ) = 1
         ),
         ws_resolved AS (
           -- D6 workspace_alias resolution + D7 Sendivo sub-account — identical mechanism to step 2.
@@ -692,6 +730,77 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
         """
     )
 
+    # -- 2a2. posted_at/meeting_date YEAR-TYPO guard (campaign-truth WS3, 2026-07-03). Portal (and
+    #        sheet) operators occasionally type next year's date on a booking — e.g. 7 im_bookings
+    #        rows (imb:2466031..2466037, all created 2026-07-02) carry date 2027-05-28, which is
+    #        2026-05-28 typo'd. Left alone they pollute every forward-dated day-bucket and sit in
+    #        the projection for a year. Rule: a Funding row ('sheet:%'/'imb:%') whose posted_at is
+    #        > now()+45d AND whose (posted_at - 1 year) lands in the plausible window
+    #        [2026-01-01, now()+45d] gets 1 year subtracted from posted_at (+ submission_ts /
+    #        meeting_date where they exhibit the same typo). Rows within the plausible window are
+    #        NEVER touched; an implausible far-future date that -1y does NOT fix is left as-is (it
+    #        would surface in QA rather than be silently guessed). Runs BEFORE the matchers (2b/
+    #        2b2/2e) so nearest-at/before-posted_at ranking sees the corrected dates.
+    #        Verified read-only on serving snapshot warehouse_20260703_043558_874.duckdb:
+    #        7 rows with posted_at > now()+45d (all 'imb:', 2027-05-28), all 7 in-window after -1y;
+    #        0 'sheet:' rows affected; 0 rows in the guarded-but-unfixable bucket.
+    typo_n = db.execute(
+        """
+        SELECT count(*) FROM core.meeting
+        WHERE (meeting_id LIKE 'sheet:%' OR meeting_id LIKE 'imb:%')
+          AND posted_at > now() + INTERVAL 45 DAY
+          AND (posted_at - INTERVAL 1 YEAR)
+              BETWEEN TIMESTAMP '2026-01-01' AND now() + INTERVAL 45 DAY
+        """
+    ).fetchone()[0]
+    db.execute(
+        """
+        UPDATE core.meeting
+        SET posted_at     = posted_at - INTERVAL 1 YEAR,
+            submission_ts = CASE WHEN submission_ts > now() + INTERVAL 45 DAY
+                                 THEN submission_ts - INTERVAL 1 YEAR ELSE submission_ts END,
+            meeting_date  = CASE WHEN meeting_date > CAST(now() + INTERVAL 45 DAY AS DATE)
+                                 THEN CAST(meeting_date - INTERVAL 1 YEAR AS DATE)
+                                 ELSE meeting_date END
+        WHERE (meeting_id LIKE 'sheet:%' OR meeting_id LIKE 'imb:%')
+          AND posted_at > now() + INTERVAL 45 DAY
+          AND (posted_at - INTERVAL 1 YEAR)
+              BETWEEN TIMESTAMP '2026-01-01' AND now() + INTERVAL 45 DAY
+        """
+    )
+    logger.info("core.meeting year-typo guard: %d rows normalized (posted_at -1 year)", typo_n)
+
+    # -- 2a3. imb OUT-OF-WINDOW exclusion (campaign-truth, 2026-07-03 — runs immediately AFTER
+    #        the 2a2 year-typo guard). The three Funding sources are DATE-DISJOINT by design:
+    #        [2026-06-01, IMB_CUTOVER) is owned by the frozen Funding-Form sheet ('sheet:%'),
+    #        >= IMB_CUTOVER by im_bookings ('imb:%'). A year-typo-corrected imb row whose
+    #        meeting_date now lands BEFORE the cutover (the 7 known 2027-05-28 -> 2026-05-28
+    #        rows, verified on snapshot warehouse_20260703_043558_874.duckdb: all 7 corrected
+    #        rows fall out-of-window) would sit inside the frozen-sheet/slack era and risk
+    #        double-counting — so imb rows may NEVER sit before IMB_CUTOVER. Projection-level
+    #        only: core.meeting is rebuilt nightly from raw; nothing is deleted from the portal.
+    #        Ordering safety: runs BEFORE the matchers (2b/2b2/2e); the 2-IMB union-find dedup
+    #        (which already ran) is unaffected — it groups by the RAW booking date, and all rows
+    #        sharing a raw date are corrected (or not) together, so a surviving row can never
+    #        hold an is_duplicate_of pointing at a deleted canonical.
+    imb_oow_n = db.execute(
+        f"""
+        SELECT count(*) FROM core.meeting
+        WHERE meeting_id LIKE 'imb:%' AND meeting_date < DATE '{IMB_CUTOVER}'
+        """
+    ).fetchone()[0]
+    if imb_oow_n:
+        db.execute(
+            f"""
+            DELETE FROM core.meeting
+            WHERE meeting_id LIKE 'imb:%' AND meeting_date < DATE '{IMB_CUTOVER}'
+            """
+        )
+        logger.warning(
+            "imb out-of-window after year-typo fix: %d rows excluded (portal dates need fixing)",
+            imb_oow_n,
+        )
+
     # -- 2b. Campaign-id BACKFILL for sheet email rows the norm-name join missed (handoff B2).
     #        The sheet's Campaign Name is sometimes truncated ("... - (EYVE" with no closing paren,
     #        which defeats norm_campaign_name's trailing "- (Name)" strip), renamed, or a genuine
@@ -730,6 +839,53 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
         WHERE m.meeting_id = b.meeting_id
         """
     )
+
+    # -- 2b2. LEAD-EVENT campaign-id backfill (campaign-truth WS3 residual, 2026-07-03; the DESIGN's
+    #        "step 2c" — numbered 2b2 here because 2c is already the email-offer step below). For
+    #        Funding email rows STILL campaign_id-NULL after 2b (lead never appears in
+    #        raw_pipeline_reply_data), recover the campaign from main.raw_pipeline_lead_events —
+    #        any event type ties lead->campaign (membership, not causation, hence the lower 0.8
+    #        confidence vs 2b's 0.9). SAME ROW_NUMBER shape as 2b: events at/before posted_at
+    #        nearest-first, then nearest after; deterministic id tiebreak. Runs AFTER the 2a2
+    #        year-typo guard so ranking uses corrected posted_at.
+    #        Verified read-only on serving snapshot warehouse_20260703_043558_874.duckdb:
+    #        17 residual unattributed Funding email rows (15 June + 2 July; the design's "21" is
+    #        now 17 post-portal-repoint), all 17 with lead_email — but 0/17 emails exist in
+    #        raw_pipeline_lead_events AT ALL (1,766,983 events / 1,091,750 distinct emails, 100%
+    #        campaign-bearing, 2026-03-26..07-03). Expected lift TODAY = 0; this is a go-forward
+    #        matcher for leads whose events land after this snapshot (idempotent full rebuild).
+    db.execute(
+        """
+        UPDATE core.meeting AS m
+        SET campaign_id = b.campaign_id,
+            match_method = 'lead_event_backfill',
+            match_confidence = 0.8
+        FROM (
+          SELECT meeting_id, campaign_id FROM (
+            SELECT m2.meeting_id, e.campaign_id,
+                   ROW_NUMBER() OVER (
+                     PARTITION BY m2.meeting_id
+                     ORDER BY (e.event_timestamp <= m2.posted_at) DESC,                 -- events at/before the meeting first
+                              CASE WHEN e.event_timestamp <= m2.posted_at
+                                   THEN m2.posted_at - e.event_timestamp END ASC NULLS LAST,  -- then nearest before
+                              e.event_timestamp ASC,                                    -- else nearest after
+                              e.id                                                      -- deterministic tiebreak
+                   ) AS rn
+            FROM core.meeting m2
+            JOIN main.raw_pipeline_lead_events e ON lower(e.lead_email) = m2.lead_email
+            WHERE m2.source = 'sheet' AND m2.channel = 'Email' AND m2.campaign_id IS NULL
+              AND (m2.meeting_id LIKE 'sheet:%' OR m2.meeting_id LIKE 'imb:%')   -- Funding rows only; partner Pre-IPO rows exempt (same gate as 2b)
+              AND m2.lead_email IS NOT NULL AND m2.lead_email <> ''
+              AND e.campaign_id IS NOT NULL
+          ) WHERE rn = 1
+        ) AS b
+        WHERE m.meeting_id = b.meeting_id
+        """
+    )
+    lead_event_n = db.execute(
+        "SELECT count(*) FROM core.meeting WHERE match_method='lead_event_backfill'"
+    ).fetchone()[0]
+    logger.info("core.meeting lead-event backfill (2b2): %d row(s) lifted", lead_event_n)
 
     # -- 2e. SMS phone -> Sendivo send-log -> campaign_name + sub_account (DATA-2, 2026-07-01).
     #        Funding SMS meetings booked off a Sendivo blast have NO Instantly campaign, so the
@@ -1056,5 +1212,8 @@ def run_meeting(ctx: RunContext) -> PhaseResult:
                "partner_preipo_meetings": partner_total,
                "partner_preipo_by_channel": dict(partner_by_channel),
                "sms_phone_sendivo_matched": sms_phone_matched,
-               "slack_ws_backfilled": slack_ws_backfilled},
+               "slack_ws_backfilled": slack_ws_backfilled,
+               "year_typo_normalized": typo_n,
+               "imb_out_of_window_excluded": imb_oow_n,
+               "lead_event_backfilled": lead_event_n},
     )
