@@ -547,12 +547,15 @@ def sms_opps_by_sub(date):
             FROM main.raw_sendivo_inbound
             WHERE CAST(received_at AS DATE) = DATE '{date}' GROUP BY 1),
           cls AS (
+            -- day filter on the RECEIPT timestamp (i) + non-opt-out numerator, so the >=90% gate's
+            -- numerator/denominator share one population even if the Qwen seed ever includes
+            -- opt-outs or q.received_at drifts at day boundaries [code-review 07-03 hardening]
             SELECT i.sub_account_name AS sub,
-                   count(*) AS classified,
-                   count(*) FILTER (WHERE q.is_positive) AS opps
+                   count(*) FILTER (WHERE NOT i.is_opt_out) AS classified,
+                   count(*) FILTER (WHERE q.is_positive AND NOT i.is_opt_out) AS opps
             FROM derived.sms_reply_is_positive_qwen q
             JOIN main.raw_sendivo_inbound i ON i.inbound_message_id = q.reply_id
-            WHERE CAST(q.received_at AS DATE) = DATE '{date}' GROUP BY 1)
+            WHERE CAST(i.received_at AS DATE) = DATE '{date}' GROUP BY 1)
           SELECT h.sub, h.human, COALESCE(c.classified, 0), COALESCE(c.opps, 0)
           FROM human h LEFT JOIN cls c ON c.sub = h.sub""")
         for sub, human, classified, opps in rows:
@@ -1572,7 +1575,7 @@ def build_and_write(tab, build_fn):
         hr = add(["Channel / workspace", "Opt-outs", "Opt-out %", "KPI (deliv/mtg·form)",
                   "Cost $", "Cost basis", "Cost / mtg·form"]); th.append(hr); th_ncol[hr] = W
         dash = "\u2014"
-        toptout = 0; treps = 0; sms_costs = []
+        toptout = 0; treps = 0; seen_oo = False; sms_costs = []
         for label, sent, deliv, failed, reps, oo, opp, m, cost in rows_data:
             is_wa = "WhatsApp" in label
             basis = ("model $0.072×delivered" if is_wa else "actual (Sendivo billing, all-in)")
@@ -1584,14 +1587,15 @@ def build_and_write(tab, build_fn):
                       (round(cost / m, 2) if (cost is not None and m) else dash)])
             data.append(ri); row_ncol[ri] = W
             pctcells.append((ri, 2)); usdcells.append((ri, 4, 5)); usdcells.append((ri, 6, 7))
-            if oo is not None: toptout += oo; treps += reps
+            if oo is not None: toptout += oo; treps += reps; seen_oo = True
             if not is_wa: sms_costs.append(cost)
         tcost = round(sum(sms_costs), 2) if (sms_costs and all(c is not None for c in sms_costs)) else dash
-        ti = add(["TOTAL", toptout, ((float(toptout) / float(treps)) if treps else dash), dash,
+        ti = add(["TOTAL", (toptout if seen_oo else dash),
+                  ((float(toptout) / float(treps)) if treps else dash), dash,
                   tcost, ("actual, SMS rows only (WA model kept separate)" if tcost != dash else dash),
                   dash]); tot.append(ti); row_ncol[ti] = W
         pctcells.append((ti, 2)); usdcells.append((ti, 4, 5))
-        ni = add(["Cost $ (SMS rows) = ALL-IN Sendivo billing for the day (raw_sendivo_billing_daily total_spend: SMS fees + carrier fees + any setup/renewal/brand/phone fees; carrier fees bill per SEGMENT so carrier-fee qty > messages); '—' = no fully-loaded billing row yet (back-fills after the nightly). WhatsApp Cost $ = MODEL $0.072 × delivered (paid on delivery only; no Iskra billing feed — vendor ask open); excluded from the actual TOTAL. Opt-out % = opt-outs ÷ total replies. KPI = delivered ÷ mtgs/webforms ('—' until Delivered lands). NO client-facing price exists; margin-math flat rates: SMS $0.0072/msg sent-or-not · WA $0.072/msg on delivery."])
+        ni = add(["Cost $ (SMS rows) = ALL-IN Sendivo billing for the day (raw_sendivo_billing_daily total_spend: SMS fees + carrier fees + any setup/renewal/brand/phone fees; carrier fees bill per SEGMENT so carrier-fee qty > messages); '—' = no fully-loaded billing row yet (back-fills after the nightly). WhatsApp Cost $ = MODEL $0.072 × delivered (paid on delivery only; no Iskra billing feed — vendor ask open); excluded from the actual TOTAL. Opt-out % = opt-outs ÷ total replies (TOTAL row: SMS rows only — WA opt-outs unmeasured). KPI = delivered ÷ mtgs/webforms ('—' until Delivered lands). NO client-facing price exists; margin-math flat rates: SMS $0.0072/msg sent-or-not · WA $0.072/msg on delivery."])
         data.append(ni); row_ncol[ni] = W
     def sms_kpi_table(kpi_d, header_label):
         # §2b — SMS KPI-to-opp (texts per opportunity) per workspace over the trailing fully-classified
