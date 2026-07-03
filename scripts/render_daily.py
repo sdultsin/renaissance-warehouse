@@ -367,7 +367,28 @@ def preipo_by_desk(date):
     return _preipo_cache[date]
 
 def preipo_meetings(date):
-    """Total Pre-IPO meetings = SUM of the additive desks (Collins + Summit)."""
+    """Total Pre-IPO meetings for `date` — PORTAL is authoritative [repoint 2026-07-03, WS3
+    portal-single-source migration; TKT-2/DR-9 fork resolved]. Reads the portal mirror
+    (main.raw_im_bookings, offer='Pre-IPO', ALL channels, email|phone dedup) with the SAME
+    conventions as every other booking read (latest snapshot, non-deleted, ET business `date`).
+    The Collins/Summit desk sheets are DEMOTED to a nightly reconcile-CHECK (preipo_by_desk, surfaced
+    in --verify) + a fail-soft FALLBACK: if the portal carries 0 Pre-IPO for the day but a desk has
+    rows, use the desk sum (a portal outage can't silently zero the row). The desks migrated INTO the
+    portal 2026-06-30 (portal==desks 28/28, 17/17, 26/26 for 06-30/07-01/07-02) and 06-29 (34) was
+    backfilled 2026-07-03, so the portal is complete for Pre-IPO across the portal era; the desks stay
+    ~2 weeks as a drift alarm, then retire."""
+    portal = wq(f"""
+      SELECT count(DISTINCT lower(coalesce(nullif(email,''), phone)))
+      FROM main.raw_im_bookings
+      WHERE _snapshot_date=(SELECT max(_snapshot_date) FROM main.raw_im_bookings)
+        AND offer='Pre-IPO'
+        AND substr(coalesce(date,''),1,10)=DATE '{date}'::VARCHAR
+        AND (deleted_at IS NULL OR deleted_at='' OR lower(deleted_at)='null')
+        AND coalesce(nullif(email,''), phone) <> ''""")
+    n_portal = int(portal[0][0] or 0) if portal else 0
+    if n_portal > 0:
+        return n_portal
+    # portal carries nothing for this day -> fall back to the desk sheets (never silent-zero)
     return sum(preipo_by_desk(date)["by_desk"].values())
 
 # WhatsApp PRE-IPO meetings (yellow-block row) — registry DR-9. Reads the SAME portal source with
@@ -1037,6 +1058,25 @@ def reconcile_preipo(report_date):
     is drift on its own, regardless of whether the Slack anchor is reachable."""
     info = preipo_by_desk(report_date); sheet = info["by_desk"]; health = info["health"]
     drift = [f"{d} desk source unhealthy: {h}" for d, h in health.items() if h != "OK"]
+    # PORTAL-vs-DESK reconcile [2026-07-03 repoint]: the rendered Pre-IPO number now comes from the
+    # portal (preipo_meetings). The desks are a reconcile-CHECK: portal all-channel Pre-IPO (deduped)
+    # should equal the additive desk sum on a portal-era day. Divergence -> DRIFT (a desk booking not
+    # captured in the portal, or a portal-only Pre-IPO the desks lack) -> surfaces, never silent.
+    try:
+        _pp = wq(f"""
+          SELECT count(DISTINCT lower(coalesce(nullif(email,''), phone)))
+          FROM main.raw_im_bookings
+          WHERE _snapshot_date=(SELECT max(_snapshot_date) FROM main.raw_im_bookings)
+            AND offer='Pre-IPO' AND substr(coalesce(date,''),1,10)=DATE '{report_date}'::VARCHAR
+            AND (deleted_at IS NULL OR deleted_at='' OR lower(deleted_at)='null')
+            AND coalesce(nullif(email,''), phone) <> ''""")
+        n_portal = int(_pp[0][0] or 0) if _pp else 0
+        n_desk = sum(sheet.values())
+        if report_date >= "2026-06-30" and n_portal != n_desk:
+            drift.append(f"portal Pre-IPO={n_portal} vs desk sum={n_desk} (Collins+Summit) — "
+                         f"desk booking(s) missing from the portal, or portal-only Pre-IPO the desks lack")
+    except Exception as e:
+        print(f"WARN preipo portal-vs-desk reconcile failed: {e}", file=sys.stderr)
     slack = None
     try:
         slack = REG.fetch_preipo_slack_tally(report_date)
