@@ -36,10 +36,16 @@
 # still finishing), one alert per outage (deduped by the set of reasons), plus a single RECOVERED ping.
 # State in $STATE. A healthy nightly NEVER pings.
 #
-# Cron (UTC) — after the 06:30Z snapshot publish; re-checks catch a late-finishing nightly. These two
-# lines live in the warehouse-ops block of root's crontab and MUST be preserved by any crontab edit:
+# Cron (UTC) — the two checks STRADDLE the ~05:30Z+5-7h nightly so one runs while it is still in
+# flight and one runs AFTER it has promoted (2026-07-03): 07:15Z is the early check (the nightly is
+# normally still running, so expected mid-run staleness is SUPPRESSED — see the in-progress guard
+# below — while a genuinely missed nightly / overrun / stale serving snapshot still fires), and 14:00Z
+# is the post-promote check (the serving snapshot has been re-promoted, so the full per-table freshness
+# sweep runs against FRESH data and catches the 2026-06-18 "nightly succeeded but a table is stale"
+# class). These two lines live in the warehouse-ops block of root's crontab and MUST be preserved by
+# any crontab edit:
 #   15 7  * * * /root/renaissance-warehouse/scripts/nightly_success_watchdog.sh >> /root/renaissance-warehouse/logs/nightly_success_watchdog.log 2>&1
-#   0  9  * * * /root/renaissance-warehouse/scripts/nightly_success_watchdog.sh >> /root/renaissance-warehouse/logs/nightly_success_watchdog.log 2>&1
+#   0  14 * * * /root/renaissance-warehouse/scripts/nightly_success_watchdog.sh >> /root/renaissance-warehouse/logs/nightly_success_watchdog.log 2>&1
 set -u
 
 DUCKDB="${DUCKDB:-/usr/local/bin/duckdb}"
@@ -64,6 +70,8 @@ CRIT_STALE_DAYS="${CRIT_STALE_DAYS:-1}"          # HARD FLOOR (calendar days) fo
 # Headline tables that must ALWAYS be fresh after a nightly, floored independent of the registry.
 # (sync_registry itself is floored too — a frozen registry means the nightly stopped advancing.)
 CRITICAL_TABLES="${CRITICAL_TABLES:-core.campaign_daily main.raw_cc_daily_snapshots core.sync_registry}"
+NIGHTLY_SCHED_HM="${NIGHTLY_SCHED_HM:-05:30}"     # UTC HH:MM the full nightly is scheduled (cron: 30 5)
+EXPECTED_NIGHTLY_HRS="${EXPECTED_NIGHTLY_HRS:-8}" # a healthy full nightly PROMOTES within this of its start
 NOW_TS="$(date -u +%FT%TZ)"
 
 # Heartbeat first thing: even if a check below dies, this file proves the cron fired this run.
@@ -84,24 +92,24 @@ echo "$NOW_TS" > "$HEARTBEAT" 2>/dev/null || true
 SELF_HEAL_CRON="${SELF_HEAL_CRON:-1}"
 CANON_PATH="${CANON_PATH:-/root/renaissance-warehouse/scripts/nightly_success_watchdog.sh}"
 CRON_07="15 7 * * * ${CANON_PATH} >> /root/renaissance-warehouse/logs/nightly_success_watchdog.log 2>&1"
-CRON_09="0 9 * * * ${CANON_PATH} >> /root/renaissance-warehouse/logs/nightly_success_watchdog.log 2>&1"
+CRON_14="0 14 * * * ${CANON_PATH} >> /root/renaissance-warehouse/logs/nightly_success_watchdog.log 2>&1"
 if [ "$SELF_HEAL_CRON" = "1" ] && [ "$0" = "$CANON_PATH" ] && command -v crontab >/dev/null 2>&1; then
   CUR_CRON="$(crontab -l 2>/dev/null)"
   if [ -n "$CUR_CRON" ]; then  # never act on an empty/unreadable crontab (would risk clobbering)
-    NEED_07=1; NEED_09=1
+    NEED_07=1; NEED_14=1
     printf '%s\n' "$CUR_CRON" | grep -Fq "${CANON_PATH}" && {
-      printf '%s\n' "$CUR_CRON" | grep -E '^[[:space:]]*15[[:space:]]+7[[:space:]]' | grep -Fq "${CANON_PATH}" && NEED_07=0
-      printf '%s\n' "$CUR_CRON" | grep -E '^[[:space:]]*0[[:space:]]+9[[:space:]]'  | grep -Fq "${CANON_PATH}" && NEED_09=0
+      printf '%s\n' "$CUR_CRON" | grep -E '^[[:space:]]*15[[:space:]]+7[[:space:]]'  | grep -Fq "${CANON_PATH}" && NEED_07=0
+      printf '%s\n' "$CUR_CRON" | grep -E '^[[:space:]]*0[[:space:]]+14[[:space:]]' | grep -Fq "${CANON_PATH}" && NEED_14=0
     }
-    if [ "$NEED_07" = 1 ] || [ "$NEED_09" = 1 ]; then
+    if [ "$NEED_07" = 1 ] || [ "$NEED_14" = 1 ]; then
       cp -p /var/spool/cron/crontabs/root "/root/crontab.bak.selfheal.$(date -u +%Y%m%dT%H%M%SZ)" 2>/dev/null || true
       {
         printf '%s\n' "$CUR_CRON"
         echo "# nightly-success watchdog (self-healed $(date -u +%FT%TZ) — do not drop these 2 lines)"
         [ "$NEED_07" = 1 ] && echo "$CRON_07"
-        [ "$NEED_09" = 1 ] && echo "$CRON_09"
+        [ "$NEED_14" = 1 ] && echo "$CRON_14"
       } | crontab - 2>/dev/null \
-        && echo "[$NOW_TS] SELF-HEAL: re-added missing watchdog cron line(s) (07:15=$([ $NEED_07 = 1 ] && echo re-added || echo ok), 09:00=$([ $NEED_09 = 1 ] && echo re-added || echo ok))" \
+        && echo "[$NOW_TS] SELF-HEAL: re-added missing watchdog cron line(s) (07:15=$([ $NEED_07 = 1 ] && echo re-added || echo ok), 14:00=$([ $NEED_14 = 1 ] && echo re-added || echo ok))" \
         || echo "[$NOW_TS] WARN: self-heal crontab write failed"
     fi
   fi
@@ -120,6 +128,49 @@ post_slack() {
 
 REASONS=""      # accumulates failure reasons (newline-separated)
 add_reason() { REASONS="${REASONS:+$REASONS$'\n'}- $1"; }
+
+# --- Nightly-IN-PROGRESS guard (do not alarm on staleness that is just "today's promote hasn't
+# happened yet") ---------------------------------------------------------------------------------
+# This watchdog reads the SERVING snapshot, which is only re-promoted at nightly-END (~${NIGHTLY_SCHED_HM}Z
+# start + 5-7h). At the 07:15/09:00Z crons the nightly is normally STILL RUNNING, so the snapshot
+# legitimately still shows yesterday's data and a freshness sweep against it looks stale — a false
+# alarm (fired "UNHEALTHY consecutive=24" 2026-07-02 during a perfectly healthy in-progress run).
+# Fix (Sam, 2026-07-03): suppress the EXPECTED mid-run staleness reasons (freshness sweep + nightly-ran)
+# ONLY while (a) the serving snapshot has not been re-promoted since the most recent scheduled nightly
+# start (SNAP_MTIME < SCHED) AND (b) we are still within the expected run window (now < SCHED +
+# EXPECTED_NIGHTLY_HRS). TWO guards stay UNSUPPRESSED so a genuinely failed/overran nightly still fires:
+#   * Check 3's serving-snapshot age floor (SNAPSHOT_STALE_HRS) catches a promote that never happened;
+#   * if we are PAST the expected window with the snapshot still not advanced, an explicit overrun
+#     reason is added right here.
+# After the promote (snapshot advanced) the sweep is fully active again, so stale-data-after-a-
+# SUCCESSFUL-nightly (the 2026-06-18 false-confidence case) still alarms exactly as before.
+WD_SCHED_EPOCH="$(date -u -d "today $NIGHTLY_SCHED_HM" +%s 2>/dev/null || echo 0)"
+[ "${WD_SCHED_EPOCH:-0}" -gt 0 ] && [ "$(date -u +%s)" -lt "$WD_SCHED_EPOCH" ] \
+  && WD_SCHED_EPOCH="$(date -u -d "yesterday $NIGHTLY_SCHED_HM" +%s 2>/dev/null || echo 0)"
+WD_SNAP_MTIME=""
+[ -e "$SNAPSHOT" ] && WD_SNAP_MTIME="$(stat -c %Y "$SNAPSHOT" 2>/dev/null || stat -f %m "$SNAPSHOT" 2>/dev/null)"
+WD_NOW_EPOCH="$(date -u +%s)"
+IN_PROGRESS=0    # 1 = today's nightly has not re-promoted the serving snapshot yet
+[ -n "$WD_SNAP_MTIME" ] && [ "${WD_SCHED_EPOCH:-0}" -gt 0 ] && [ "$WD_SNAP_MTIME" -lt "$WD_SCHED_EPOCH" ] && IN_PROGRESS=1
+PAST_WINDOW=0    # 1 = past the point a healthy nightly should already have promoted
+[ "${WD_SCHED_EPOCH:-0}" -gt 0 ] && [ "$WD_NOW_EPOCH" -ge $(( WD_SCHED_EPOCH + EXPECTED_NIGHTLY_HRS*3600 )) ] && PAST_WINDOW=1
+SUPPRESS_STALE=0 # 1 = expected-mid-run staleness; log but do not count as unhealthy
+[ "$IN_PROGRESS" = 1 ] && [ "$PAST_WINDOW" = 0 ] && SUPPRESS_STALE=1
+
+# add a reason that is EXPECTED while the nightly is still promoting: logged-only when it is just
+# "not done yet", but promoted straight to a real reason once we are past the window (below) or the
+# snapshot has advanced (SUPPRESS_STALE=0).
+add_stale_reason() {
+  if [ "$SUPPRESS_STALE" = 1 ]; then
+    echo "[$NOW_TS] IN-PROGRESS (serving snapshot not yet re-promoted since ${NIGHTLY_SCHED_HM}Z; suppressing expected-staleness) — $1"
+  else
+    add_reason "$1"
+  fi
+}
+# Overran/failed-to-publish: in-progress but already PAST the expected window — this is a real fault.
+if [ "$IN_PROGRESS" = 1 ] && [ "$PAST_WINDOW" = 1 ]; then
+  add_reason "Nightly has NOT promoted a fresh serving snapshot within ${EXPECTED_NIGHTLY_HRS}h of its ${NIGHTLY_SCHED_HM}Z start (serving snapshot still predates today's run) — the nightly overran or failed to publish."
+fi
 
 # --- Check 1: OUTCOME — per-table freshness sweep (the deliverable) ----------------------------
 # One read-only query returns: the registry-SLA violations, the hard-floor violations for the
@@ -161,7 +212,7 @@ else
       ORDER BY (epoch(CAST(now() AS TIMESTAMPTZ)) - epoch(coalesce(last_synced_at, TIMESTAMPTZ '1970-01-01'))) DESC
       LIMIT 6;" 2>/dev/null | tr '\n' ' ')"
     SLA_TABLES="$SAMPLE"
-    add_reason "STALE LOADS: ${SLA_N} of ${ACTIVE_N} active tables past their load SLA — the nightly is not producing fresh data. Worst: ${SAMPLE}"
+    add_stale_reason "STALE LOADS: ${SLA_N} of ${ACTIVE_N} active tables past their load SLA — the nightly is not producing fresh data. Worst: ${SAMPLE}"
   fi
   if [ "$BIZ_N" -gt 0 ]; then
     SAMPLE_B="$("$DUCKDB" -readonly -noheader -list -separator ' ' "$SNAPSHOT" "
@@ -169,7 +220,7 @@ else
       SELECT name FROM core.sync_registry
       WHERE status='active' AND ($BIZ_PRED)
       ORDER BY (current_date - last_biz_date) DESC LIMIT 6;" 2>/dev/null | tr '\n' ' ')"
-    add_reason "STALE BUSINESS-DATES: ${BIZ_N} of ${ACTIVE_N} active tables missing their newest day(s). Worst: ${SAMPLE_B}"
+    add_stale_reason "STALE BUSINESS-DATES: ${BIZ_N} of ${ACTIVE_N} active tables missing their newest day(s). Worst: ${SAMPLE_B}"
   fi
 fi
 
@@ -195,7 +246,7 @@ else
     # Only suppress if check 1a's STALE-LOADS sample already named campaign_daily exactly.
     case " ${SLA_TABLES:-} " in
       *" core.campaign_daily "*) : ;;
-      *) add_reason "STALE (hard floor): core.campaign_daily max(date)=${CD_MAX} is more than ${CRIT_STALE_DAYS}d behind today (UTC) — the headline fact did not advance." ;;
+      *) add_stale_reason "STALE (hard floor): core.campaign_daily max(date)=${CD_MAX} is more than ${CRIT_STALE_DAYS}d behind today (UTC) — the headline fact did not advance." ;;
     esac
   fi
 fi
@@ -209,7 +260,7 @@ RC_REG=$?
 if [ "$RC_REG" -ne 0 ] || ! printf '%s' "$REG_OUT" | grep -Eq '^[01]$'; then
   add_reason "Cannot read core.sync_registry self-freshness from $SNAPSHOT (duckdb rc=$RC_REG): ${REG_OUT//$'\n'/ }."
 elif [ "$REG_OUT" = "1" ] && [ "${SLA_N:-0}" = "0" ]; then
-  add_reason "STALE (hard floor): core.sync_registry has not advanced any active table's last_synced_at in > ${CRIT_STALE_HRS}h — the nightly is not committing."
+  add_stale_reason "STALE (hard floor): core.sync_registry has not advanced any active table's last_synced_at in > ${CRIT_STALE_HRS}h — the nightly is not committing."
 fi
 
 # --- Check 2: nightly actually ran (corroborating proxy) --------------------------------------
@@ -231,7 +282,7 @@ if [ $? -ne 0 ]; then
 else
   FRESH_FULL="$(echo "$RUN_OUT" | cut -d'|' -f1)"
   LAST_FULL="$(echo "$RUN_OUT"  | cut -d'|' -f2)"
-  [ "${FRESH_FULL:-0}" -ge 1 ] 2>/dev/null || add_reason "No FULL nightly committed since ${SCHED_ISO} (last full nightly: ${LAST_FULL}). The 03:30Z nightly did not finish/commit."
+  [ "${FRESH_FULL:-0}" -ge 1 ] 2>/dev/null || add_stale_reason "No FULL nightly committed since ${SCHED_ISO} (last full nightly: ${LAST_FULL}). The nightly did not finish/commit yet."
 fi
 
 # --- Check 3: serving snapshot file freshness -------------------------------------------------
