@@ -190,10 +190,19 @@ if [ "$PRIOR_ROWS" -gt 0 ] 2>/dev/null; then
 fi
 
 # ── 5. PROMOTE the serving snapshot ──────────────────────────────────────────
-# publish_serving.sh has its own #cc-sam fail-loud alert + channel; just run it.
-log "promoting serving snapshot ..."
-"$REPO/scripts/publish_serving.sh" \
-  || die "publish_serving.sh failed (tables loaded OK but serving snapshot not refreshed)"
+# Modern promote = /opt/duckdb publisher (same invocation as nightly.sh's completion
+# promote): copies the writer DB to a timestamped snapshot on the 2TB volume and flips
+# warehouse_current. The old publish_serving.sh path is DEAD for this job — it copied
+# to /root/core/warehouse_serving.duckdb.tmp on the ~90%-full ROOT disk and ENOSPC'd
+# on the first v2 run [2026-07-03]; its target file no longer exists on the box.
+log "promoting serving snapshot (publisher.py) ..."
+PUBLISHER_BIN="${PUBLISHER_BIN:-/opt/duckdb/bin/publisher.py}"
+PUBLISHER_PY="${PUBLISHER_PY:-/opt/duckdb/venv/bin/python}"
+PROMOTE_TIMEOUT_S="${PROMOTE_TIMEOUT_S:-1800}"
+SERVING_PROFILE=prod SERVING_CONFIG=/opt/duckdb/bin/config.yaml \
+  timeout --signal=TERM --kill-after=60 "$PROMOTE_TIMEOUT_S" \
+  "$PUBLISHER_PY" "$PUBLISHER_BIN" --reason infra-batch-weekly-refresh \
+  || die "serving promote (publisher.py) failed (tables loaded OK but serving snapshot not refreshed; the next daily promote will ship them)"
 
 # ── 6. Healthy completion: ONE line to #cc-sam ───────────────────────────────
 log "=== infra-batch v2 weekly refresh OK ==="
