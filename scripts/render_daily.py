@@ -550,6 +550,77 @@ def r3_webform_funnel(date):
         print(f"WARN r3_webform_funnel failed {date}: {e}", file=sys.stderr)
         return None
 
+def rg3_aim_sends(date):
+    """Day-total AIM-lane outbound for the RG3 sub (14603), ET day — the ITEM6-EOD spec's
+    '+ AIM sends' line: comms.message direction='outbound', source='ai', non-simulation, joined
+    conversation -> brand (sub_account_id=14603). comms.message is safe for OUTBOUND counts (its
+    suppressed-STOP drop affects INBOUND only). Live comms read; fail-soft -> None."""
+    url = _CREDS.optional("COMMS_SUPABASE_DB_URL") if _CREDS else None
+    if not url:
+        return None
+    try:
+        import psycopg2
+        conn = psycopg2.connect(url, connect_timeout=15)
+        try:
+            conn.set_session(readonly=True)
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT count(*)
+                    FROM comms.message m
+                    JOIN comms.conversation c ON c.id = m.conversation_id
+                    JOIN comms.brand b ON b.id = c.brand_id
+                    WHERE m.direction = 'outbound' AND m.source = 'ai'
+                      AND coalesce(m.is_simulation, false) = false
+                      AND b.sub_account_id = 14603
+                      AND (m.created_at AT TIME ZONE 'America/New_York')::date = %s""", (date,))
+                return int(cur.fetchone()[0] or 0)
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"WARN rg3_aim_sends failed {date}: {e}", file=sys.stderr)
+        return None
+
+def get_blast_eod(max_rows=25):
+    """§2c per-blast send truth for the day (ITEM6-EOD standing-section spec, the
+    warehouse-derivable subset): one row per blast from main.v_sms_blast_performance
+    (= the Sendivo blast dashboard, row-for-row — verified Jul-1 R3: 23,877/23,821/23,776 sent,
+    99.2/98.9/98.9% delivered == the dashboard exactly). D-1 source (nightly /sms/logs):
+    state='pending' until the day loads; 'noblasts' when the day's campaign feed IS loaded but
+    carries no blast rows (a genuine no-blast day, distinguishable from lag). Lane per the spec:
+    RG3 warm = Financial Summits, cold = the rest; R1/R2 lanes untagged. Capped at `max_rows`
+    by sent with an aggregated overflow row (heavy days ran 60+ blasts). Fail-soft -> pending."""
+    try:
+        rows = wq(f"""SELECT blast_id, any_value(blast_name), any_value(campaign_name),
+                             any_value(sub_account_name), sum(sent), sum(delivered), sum(failed)
+                      FROM main.v_sms_blast_performance
+                      WHERE metric_date = DATE '{DAILY}' AND blast_id IS NOT NULL
+                      GROUP BY 1 ORDER BY 5 DESC"""
+                  )
+    except Exception as e:
+        print(f"WARN get_blast_eod failed: {e}; §2c renders pending", file=sys.stderr)
+        return {"state": "pending", "rows": [], "overflow": None}
+    if not rows:
+        try:
+            loaded = wq(f"""SELECT count(*) FROM main.v_sms_campaign_performance
+                            WHERE metric_date = DATE '{DAILY}' AND sent > 0""")
+            day_loaded = bool(loaded and int(loaded[0][0] or 0) > 0)
+        except Exception:
+            day_loaded = False
+        return {"state": ("noblasts" if day_loaded else "pending"), "rows": [], "overflow": None}
+    out = []
+    for bid, bname, cname, sub, s, d, f in rows:
+        lane = "—"
+        if sub == "Renaissance 3":
+            lane = "WARM" if "SUMMIT" in (cname or "").upper() else "COLD"
+        out.append((bname or f"(blast {bid})", cname or "(unknown)", sub or "(unmapped)", lane,
+                    int(s or 0), int(d or 0), int(f or 0)))
+    overflow = None
+    if len(out) > max_rows:
+        rest = out[max_rows:]
+        overflow = (len(rest), sum(r[4] for r in rest), sum(r[5] for r in rest), sum(r[6] for r in rest))
+        out = out[:max_rows]
+    return {"state": "loaded", "rows": out, "overflow": overflow}
+
 def sms_opps_by_sub(date):
     """{sub_account_name: opps|None} for `date` — the doctrine OPPORTUNITIES stage
     [feedback_funnel_metrics_simplify_20260702]. Opps = Qwen positive-intent verdicts
@@ -1506,6 +1577,8 @@ EMAIL_D = _safe("email", get_email, _EMAIL_FB)
 SMS_D = _safe("sms_wa", get_sms_wa, _SMS_FB)
 BLAST_SPLIT_D = _safe("blast_split", lambda: sendivo_blast_split(DAILY), {})
 R3_FUNNEL_D = _safe("r3_funnel", lambda: r3_webform_funnel(DAILY), None)
+BLAST_EOD_D = _safe("blast_eod", get_blast_eod, {"state": "pending", "rows": [], "overflow": None})
+RG3_AIM_D = _safe("rg3_aim", lambda: rg3_aim_sends(DAILY), None)
 SMS_KPI_D = _safe("sms_kpi_to_opp", get_sms_kpi_to_opp, {"dates": [], "rows": []})
 CLOSE_D = _safe("close", get_close, _CLOSE_FB)
 # §1b infra resolution is collected BEFORE §4 so §4's Actual OTD/Google split can fall back to the LIVE
@@ -1544,6 +1617,8 @@ if DRY:
     print("§2 SMS/WA (label,sent,deliv,fail,replies,optouts,opps,mtg,cost):");   [print("  ", x) for x in SMS_D]
     print("§2 blast split {sub: (blast_sent, blast_deliv, other_sent)}:", BLAST_SPLIT_D)
     print("§2 R3 webform funnel (repliers,warm,links,fills):", R3_FUNNEL_D)
+    print(f"§2c blast EOD state={BLAST_EOD_D.get('state')} rows={len(BLAST_EOD_D.get('rows', []))} overflow={BLAST_EOD_D.get('overflow')} rg3_aim={RG3_AIM_D}")
+    [print("   ", r) for r in BLAST_EOD_D.get("rows", [])[:6]]
     print(f"§2b SMS KPI-to-opp (window {SMS_KPI_D.get('dates')}):"); [print("   ", r, "sent/opp=", (round(r[1]/r[2]) if r[1] and r[2] else '—')) for r in SMS_KPI_D.get("rows", [])]
     print("§3 CLOSE:", CLOSE_D)
     print("§4 TRUTH (ws, otd_exp, goog_exp, tot_exp, actual, otd_actual, goog_actual):"); [print("  ", x) for x in SENDING_TRUTH]
@@ -1718,6 +1793,46 @@ def build_and_write(tab, build_fn):
                 f"brand/phone fees; carrier fees bill per segment) — the same basis as §2's Cost $ (actual), "
                 f"windowed; Cost/opp = window cost ÷ window opps.")
         ni = add([note]); data.append(ni); row_ncol[ni] = W
+    def blast_eod_table(eod, header_label):
+        # §2c — standing BLAST EOD section (ITEM6-EOD STANDING-SECTION-SPEC.md): per-blast SEND
+        # truth from the /sms/logs blast mirror (== the Sendivo blast dashboard row-for-row).
+        # Warehouse-derivable subset only: per-blast replies/warm/links/fills/Ken-$ economics stay
+        # in the EOD lane's report until its comms-side machinery is croned (gap-listed I5). Cost
+        # here = the doctrine FLAT rate ($0.0072 × sent, paid sent-or-not) for per-blast math —
+        # exact all-in $ lives in §2b (never blended).
+        W = 9
+        si = add([header_label]); sec.append(si); row_ncol[si] = W
+        hr = add(["Blast (script)", "Brand / 10DLC campaign", "Sub-account", "Lane", "Sent",
+                  "Delivered", "Deliv %", "Failed", "Cost $ (flat)"]); th.append(hr); th_ncol[hr] = W
+        dash = "\u2014"
+        state = eod.get("state")
+        if state != "loaded":
+            msg = ("(no blasts this day)" if state == "noblasts" else
+                   "(per-blast rows PENDING the nightly /sms/logs pull (D-1) — back-fills at the 12:45Z re-render)")
+            ni = add([msg]); data.append(ni); row_ncol[ni] = W
+        else:
+            ts = td = tf = 0
+            for bname, cname, sub, lane, s, d, f in eod["rows"]:
+                ri = add([bname, cname, sub, lane, s, d, (float(d) / float(s)) if s else dash, f,
+                          round(0.0072 * s, 2)])
+                data.append(ri); row_ncol[ri] = W
+                pctcells.append((ri, 6)); usdcells.append((ri, 8, 9))
+                ts += s; td += d; tf += f
+            if eod.get("overflow"):
+                n, s, d, f = eod["overflow"]
+                ri = add([f"(+{n} more blasts)", "", "", "", s, d, (float(d) / float(s)) if s else dash,
+                          f, round(0.0072 * s, 2)])
+                data.append(ri); row_ncol[ri] = W
+                pctcells.append((ri, 6)); usdcells.append((ri, 8, 9))
+                ts += s; td += d; tf += f
+            ti = add(["TOTAL (blasts)", "", "", "", ts, td, (float(td) / float(ts)) if ts else dash,
+                      tf, round(0.0072 * ts, 2)]); tot.append(ti); row_ncol[ti] = W
+            pctcells.append((ti, 6)); usdcells.append((ti, 8, 9))
+        aim_txt = (f"{RG3_AIM_D:,}" if RG3_AIM_D is not None else "—")
+        n1 = add([f"+ non-blast sends (follow-ups + AIM + system) per sub = §2's reconcile line; RG3 AIM-lane outbound (comms, source='ai', non-simulation, ET day): {aim_txt}."])
+        data.append(n1); row_ncol[n1] = W
+        n2 = add(["Per-blast Sent/Delivered = Sendivo /sms/logs per-message carrier statuses (D-1; reconciles the Sendivo blast dashboard exactly — the dashboard UI shows blasts only and hides AIM API sends). Real-time delivery webhook dead since 06-09 (vendor ask open). Lane: RG3 WARM = Financial Summits re-touch lists, COLD = fresh/cherry-pick (spec rule). NO positive-replies metric. Economics (warm/cold rates · Ken $ tiers · margin · cohort-vs-same-day) = the blast-EOD report (ITEM6-EOD): same-day understates — the tail converts over days; true per-campaign margin = cohort basis."])
+        data.append(n2); row_ncol[n2] = W
     def truth_table(header_label):
         W = 8
         si = add([header_label]); sec.append(si); row_ncol[si] = W
@@ -1844,9 +1959,9 @@ def build_and_write(tab, build_fn):
         for t in items:
             ci = add(["• " + t]); data.append(ci); row_ncol[ci] = 1
     build_fn(dict(add=add, email_table=email_table, sms_wa_table=sms_wa_table, sms_cost_table=sms_cost_table,
-                  truth_table=truth_table, close_table=close_table, partner_table=partner_table,
-                  imreply_table=imreply_table, infra_table=infra_table, sms_kpi_table=sms_kpi_table,
-                  caveats_table=caveats_table))
+                  blast_eod_table=blast_eod_table, truth_table=truth_table, close_table=close_table,
+                  partner_table=partner_table, imreply_table=imreply_table, infra_table=infra_table,
+                  sms_kpi_table=sms_kpi_table, caveats_table=caveats_table))
 
     meta = api("GET", BASE + "?fields=sheets(properties(sheetId,title),bandedRanges(bandedRangeId),conditionalFormats)")
     sh = next((s for s in meta["sheets"] if s["properties"]["title"] == tab), None)
@@ -1971,6 +2086,7 @@ def daily(ctx):
     ctx["infra_table"](INFRA_D, f"1b · EMAIL KPIs BY INFRASTRUCTURE — {' / '.join(INFRA_RENDER_LABEL[i] for i in INFRA_RENDER_ROWS)} · all workspaces · day {DAILY} (Milkbox row wiped 2026-07-01 pending rebuild)"); add()
     ctx["sms_wa_table"](SMS_D, f"2 · SMS + WHATSAPP — funnel by sub-account · sent → delivered → replies → opps → meetings · day {DAILY}"); add()
     ctx["sms_cost_table"](SMS_D, f"2b · SMS + WHATSAPP — opt-outs · KPI · cost · day {DAILY}"); add()
+    ctx["blast_eod_table"](BLAST_EOD_D, f"2c · SMS BLAST EOD — per-blast send truth · day {DAILY} (standing section per ITEM6-EOD spec)"); add()
     # The OLD §2b (7-day trailing SMS KPI-to-opp) stays REMOVED [Sam 2026-07-02, DR-10]: nothing
     # non-daily belongs on a daily report. The §2b slot above is a SAME-DAY companion table (every
     # column = the report day). get_sms_kpi_to_opp / sms_kpi_table stay for other consumers.
