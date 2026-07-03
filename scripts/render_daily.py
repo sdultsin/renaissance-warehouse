@@ -1531,10 +1531,11 @@ def build_and_write(tab, build_fn):
     # §7 DATA CAVEATS — load-bearing "how to read this number" notes promoted OUT of per-section footnotes
     # so nothing that changes a number's meaning stays buried [Sam 2026-07-02]. Text-only; one row/caveat.
     def caveats_table(label, items):
-        W = 1
-        si = add([label]); sec.append(si); row_ncol[si] = W
+        # Section header spans the full tab width (like every other §) so its blue band matches; the
+        # caveat rows themselves are single long text cells (W=1) that overflow visually to the right.
+        si = add([label]); sec.append(si); row_ncol[si] = 8
         for t in items:
-            ci = add(["• " + t]); data.append(ci); row_ncol[ci] = W
+            ci = add(["• " + t]); data.append(ci); row_ncol[ci] = 1
     build_fn(dict(add=add, email_table=email_table, sms_wa_table=sms_wa_table, truth_table=truth_table,
                   close_table=close_table, partner_table=partner_table, imreply_table=imreply_table,
                   infra_table=infra_table, sms_kpi_table=sms_kpi_table, caveats_table=caveats_table))
