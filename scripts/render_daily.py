@@ -1293,6 +1293,81 @@ def get_im_reply():
         out.append((name,) + _stats(b["d"]) + _stats(b["w"]))
     return (DAILY, wk), out
 
+# ---- §6 SMS/WA first-reply time (ITEM-3, 2026-07-03 — Sam's decided clock) ----------------------
+_SMSWA_WARNS = []  # [(channel_label, frontier_date, n_missing_biz_days)] set by get_smswa_reply
+
+# §2-consistent desk labels, in render order. R1/R2 are manual (IM) desks, R3 is AIM-served (AI
+# responder live 06-29) — but ALL THREE read ONE pairing (recovered reply-type sends carry both AIM
+# and manual answers), so the number stays valid as AIM expands: each SMS row is BLENDED AIM+manual
+# for that desk, the exact §6 email BLENDED IM+AIM semantic.
+_SMSWA_DESKS = [("Renaissance 1", "Renaissance 1 (SMS)", "sms"),
+                ("Renaissance 2", "Renaissance 2 (SMS · Pre-IPO)", "sms"),
+                ("Renaissance 3", "Renaissance 3 (SMS · webform)", "sms"),
+                ("WhatsApp (ISKRA)", "WhatsApp (ISKRA)", "whatsapp")]
+
+def get_smswa_reply():
+    """§6 SMS/WA first-reply time — reads the canonical fact core.sla_reply_time_smswa (DDL 1077,
+    the channel sibling of core.sla_reply_time; built by scripts/build_sla_reply_time.py with the
+    IDENTICAL validated §6 clamp). Weekly-7d only, same clock (12-8pm ET Mon-Fri, clock-open
+    bucketing). Per Sam [2026-07-03] the RAW wall-clock median ships alongside: SMS/WA answering
+    runs ~24/7, so an off-window reply answered before next noon-ET clock-open is biz 0.0 —
+    legitimate, but only readable next to the raw minutes.
+
+    Population = first NON-OPT-OUT inbound per conversation ((sub, phone10) for SMS via the
+    complete webhook mirror; Iskra conversation for WA). STOP-class inbounds are suppressed by
+    design and owe no response -> excluded. Unanswered firsts carry NULL latency: dropped from the
+    median but counted in Answered% — LOAD-BEARING here (only ~23-35% of SMS / ~12% of WA
+    non-opt-out first replies get any response; most are hostile/junk the desk correctly declines
+    to answer — a median without the answered-rate reads as "we answer everything fast").
+
+    FRESHNESS (structural, unlike email's incident-drain): the SMS response side is nightly-
+    recovered Sendivo logs (worker 08:15/13:30Z -> warehouse next 03:45Z) = ~D-2 at render; WA is
+    ~D-1. The newest window days read as unanswered and BACK-FILL — per-channel UNDERSTATED warns
+    fire only past the structural lag (SMS >2, WA >=2 missing biz-days). SMS history is floored at
+    2026-06-27 (reply-capture era — earlier capture was partial and is wiped, never blended;
+    see deliverables/2026-07-02-smswa-program/ITEM3-SLA/COVERAGE-AUDIT.md).
+
+    Returns rows in _SMSWA_DESKS order: (label, population, n_answered, med_biz, avg_biz, med_raw).
+    No inline fallback path (unlike email §6 there is no second source): pre-first-build the table
+    is empty/absent -> _safe fallback zeros + the sub-block's empty-state note."""
+    global _SMSWA_WARNS
+    _SMSWA_WARNS = []
+    wk0 = _d - datetime.timedelta(days=6)
+    lo = (wk0 - datetime.timedelta(days=4)).isoformat()   # pull below wk0 so the frontier is detectable
+    rows = wq(f"""
+      SELECT desk, channel, clock_open_date, biz_latency_minutes, raw_latency_minutes
+      FROM core.sla_reply_time_smswa
+      WHERE clock_open_date >= DATE '{lo}' AND clock_open_date <= DATE '{_d.isoformat()}'""")
+    per = {}        # desk -> {"pop": int, "biz": [..], "raw": [..]}
+    frontier = {}   # channel -> max clock-open date with >=1 ANSWERED pair
+    for desk, channel, d_val, biz, raw in rows:
+        d = d_val if isinstance(d_val, datetime.date) else datetime.date.fromisoformat(str(d_val)[:10])
+        if biz is not None and (channel not in frontier or d > frontier[channel]):
+            frontier[channel] = d
+        if d < wk0 or d > _d:
+            continue
+        b = per.setdefault(desk, {"pop": 0, "biz": [], "raw": []})
+        b["pop"] += 1
+        if biz is not None:
+            b["biz"].append(float(biz)); b["raw"].append(float(raw))
+    for channel, label, thresh in (("sms", "SMS", 3), ("whatsapp", "WhatsApp", 2)):
+        fr = frontier.get(channel)
+        if fr is None:
+            continue   # no answered pairs at all -> the empty-state note covers it
+        missing = [dd for dd in (wk0 + datetime.timedelta(n) for n in range((_d - wk0).days + 1))
+                   if dd.isoweekday() <= 5 and dd > fr]
+        if len(missing) >= thresh:
+            _SMSWA_WARNS.append((label, fr, len(missing)))
+    out = []
+    for desk, label, _ch in _SMSWA_DESKS:
+        b = per.get(desk, {"pop": 0, "biz": [], "raw": []})
+        v = b["biz"]
+        out.append((label, b["pop"], len(v),
+                    statistics.median(v) if v else None,
+                    sum(v) / len(v) if v else None,
+                    statistics.median(b["raw"]) if b["raw"] else None))
+    return out
+
 # ============================ source self-verify (the DATA-TICKET fix) ============================
 # A chat / the SLA watchdog can confirm "am I sourcing the right thing for every metric?" with ZERO
 # human hand-feeding: probe each registered source is reachable + correctly-shaped, and reconcile
@@ -1589,6 +1664,10 @@ INFRA_D = _safe("infra", get_infra_kpis, {"by_ws": [], "mtg_by": {}, "unattr_mtg
 SENDING_CENSUS, SENDING_TRUTH = _safe("truth", lambda: get_truth(INFRA_D), _TRUTH_FB)
 PARTNER_D, PARTNER_D_TOTAL = _safe("partner", get_partner, ([], 0))
 IMREPLY_PERIODS, IMREPLY_D = _safe("imreply", get_im_reply, _IMREPLY_FB)
+# §6 SMS/WA sibling rows (ITEM-3): fallback = all-zero rows -> the sub-block renders its empty-state
+# note (fact absent pre-first-nightly-build, or the pull failed), never a silent blank/fake 0.
+_SMSWA_FB = [(label, 0, 0, None, None, None) for _desk, label, _ch in _SMSWA_DESKS]
+SMSWA_D = _safe("smswa_reply", get_smswa_reply, _SMSWA_FB)
 PREIPO_MTG = _safe("preipo", lambda: preipo_meetings(DAILY), 0)
 WA_PREIPO_MTG = _safe("wa_preipo", lambda: wa_preipo_meetings(DAILY), 0)
 
@@ -1872,7 +1951,7 @@ def build_and_write(tab, build_fn):
         for p, n in rows_data:
             ri = add([p, n]); data.append(ri); row_ncol[ri] = W
         ti = add(["TOTAL", total]); tot.append(ti); row_ncol[ti] = W
-    def imreply_table(rows_data, label):
+    def imreply_table(rows_data, smswa_rows, label):
         # WEEKLY-7d ONLY [Sam 2026-07-02]: the Daily (trailing) block is REMOVED. §6's source
         # (core.email_message) is nightly-fed (D-1 at best), so day-D's daily cell is STRUCTURALLY empty
         # on day D — an always-empty block that reads as noise. The weekly-7d window carries the signal.
@@ -1911,8 +1990,39 @@ def build_and_write(tab, build_fn):
                        "numbers are the reconciled §6 clamp, identical to the fact. Clears once "
                        "core.sla_reply_time promotes.)"])
             data.append(src); row_ncol[src] = W
-        pend = add(["SMS · WhatsApp first-reply time", "pending", "pending", "pending"])
-        data.append(pend); row_ncol[pend] = W
+        # ---- SMS · WhatsApp sub-block (ITEM-3, 2026-07-03 — replaces the 'pending' row) ----
+        # Same clock as the email block above (12-8pm ET Mon-Fri, first reply -> first response,
+        # weekly-7d) + the RAW wall-clock median alongside [Sam 2026-07-03: SMS/WA answering runs
+        # ~24/7, so biz-median 0.0 is legitimate and only readable next to raw minutes] + Answered%
+        # [load-bearing: most non-opt-out SMS/WA replies are junk/hostile and correctly get no
+        # answer — a median alone would read as "we answer everything fast"]. Source:
+        # core.sla_reply_time_smswa (DDL 1077); definition + validation (22/22 hand-checked
+        # timelines): deliverables/2026-07-02-smswa-program/ITEM3-SLA/.
+        W2 = 6
+        hr2 = add(["SMS · WhatsApp (same clock; non-opt-out first replies)",
+                   "Weekly (7d) — n answered", "Median biz-min", "Avg biz-min",
+                   "Median RAW min", "Answered %"])
+        th.append(hr2); th_ncol[hr2] = W2
+        for label2, pop, n_ans, med_b, avg_b, med_r in smswa_rows:
+            pct = (float(n_ans) / float(pop)) if pop else "—"
+            ri = add([label2, n_ans, mins(med_b), mins(avg_b), mins(med_r), pct])
+            data.append(ri); row_ncol[ri] = W2
+            pctcells.append((ri, 5))
+        if not any((r[2] or 0) for r in smswa_rows):
+            note = add(["(!) SMS/WA reply-time rendered EMPTY — core.sla_reply_time_smswa is absent "
+                        "(pre-first-nightly-build) or the pull failed (see render stderr); back-fills "
+                        "on the next nightly"])
+            data.append(note); row_ncol[note] = W2
+        # Per-channel UNDERSTATED warn — same semantic as the email SYNC-7 warn above, but the lag
+        # here is STRUCTURAL (SMS response side = nightly-recovered Sendivo logs, ~D-2 at render;
+        # WA ~D-1), so thresholds sit past the structural norm (SMS >2, WA >=2 missing biz-days)
+        # and the newest window days back-fill by design.
+        for ch_label, fr, nmiss in _SMSWA_WARNS:
+            warn = add(["(⚠ %s WEEKLY UNDERSTATED — responses synced only through %s; %d of the 7 "
+                        "window business-days have zero synced responses, so n/Answered%% are "
+                        "deflated on the newest days — structural sync lag, NOT a desk-speed "
+                        "change. Back-fills on the next nightly.)" % (ch_label, fr.isoformat(), nmiss)])
+            data.append(warn); row_ncol[warn] = W2
     def infra_table(infra, header_label):
         # §1b — one row PER INFRASTRUCTURE, summed across ALL workspaces (Sam 2026-06-30; Google == reseller).
         # RR=(human+auto)/sent, HumanRR=human/sent, PositiveRR=opp/replies [opp/(human+auto)], Email->opp=sent/opp, Email->meeting=sent/mtg.
@@ -2093,11 +2203,12 @@ def daily(ctx):
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
     ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (CONNECTED active capacity; disconnected/paused inboxes excluded) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · split = account-grain sending_account_daily when the report day has loaded, else the live §1b infra split (unresolved shows '—', never 0) · no-lag · census {SENDING_CENSUS}"); add()
     ctx["partner_table"](PARTNER_D, PARTNER_D_TOTAL, f"5 · BOOKINGS BY PARTNER · day {DAILY}"); add()
-    ctx["imreply_table"](IMREPLY_D, f"6 · IM REPLY-TIME — business minutes to first reply, by workspace · clock runs 12-8pm ET Mon-Fri only (all arrivals count; off-hours clock opens next window) · WEEKLY (7d) only — daily block removed 2026-07-02 (source is nightly-fed D-1, so day-D daily is structurally empty) · email (SMS+WA pending) · BLENDED IM+AIM: AIM (AI-drafted) replies ship through the same Instantly inboxes and carry NO distinguishing flag in the data, so a fast median reflects AI-assisted answering, not desk speed (a workspace with little/no AIM — e.g. Renaissance 1 DFY — reads slower for that reason, not because the desk is broken) · Grace & Sam"); add()
+    ctx["imreply_table"](IMREPLY_D, SMSWA_D, f"6 · REPLY-TIME — business minutes to first reply · clock runs 12-8pm ET Mon-Fri only (all arrivals count; off-hours clock opens next window) · WEEKLY (7d) only — daily block removed 2026-07-02 (sources are nightly-fed, so day-D daily is structurally empty) · EMAIL by workspace + SMS by desk + WHATSAPP (SMS/WA also show the RAW wall-clock median — answering runs ~24/7, so a biz-median of 0 = answered before the next noon-ET clock-open — and Answered% of non-opt-out first replies, most of which are junk/hostile and correctly get no answer) · BLENDED human+AI on BOTH channels: email AIM replies ship through the same Instantly inboxes with no distinguishing flag (a low-AIM workspace like Renaissance 1 DFY reads slower for that reason, not because the desk is broken); SMS R3 is AIM-served while R1/R2 are manual desks on the same pairing · Grace & Sam"); add()
     ctx["caveats_table"]("7 · DATA CAVEATS — how to read these numbers (load-bearing; promoted from footnotes)", [
         "§1b EMAIL infra rows exclude non-email bookings: SMS / Call / WhatsApp Funding meetings (the bulk of §1b's 'no resolvable email campaign' note) are correctly NOT in the OTD/Google rows. On OTD-churn days a few genuine EMAIL meetings also fall into 'unattributed' — their campaign was created or deleted intraday, so it doesn't map to a live tagged campaign — so §1b Email→meeting understates slightly that day. Not a data error.",
         f"§4 Actual OTD/Google split: on the ~10pm-ET evening render the report-day account feed (core.sending_account_daily) has not loaded yet, so the split is the LIVE §1b infra resolution (same Instantly source as Actual total). Subsequence + deleted-campaign sends fall to an unsplit residual, so OTD+Google can be LESS than Actual total; '—' means the split was unresolvable for that workspace on {DAILY} (never a fake 0). It heals to the complete account-grain split at the 12:45Z backfill re-render. Actual total includes Outlook, which is excluded from the split and from Expected.",
         "§6 reply-time is BLENDED human + AIM (AI-drafted): AIM replies ship through the same inboxes with no distinguishing flag, so a fast median reflects AI-assisted answering, not desk speed — a workspace with little/no AIM (e.g. Renaissance 1 DFY) reads slower for that reason. WEEKLY-only: the daily window is nightly-fed (D-1) and structurally empty on day D. When the email-reply sync frontier lags into the 7-day window, the weekly n/median are structurally deflated (SYNC-7 drain) — a '⚠ WEEKLY UNDERSTATED' row flags that when it happens; it is not a desk-speed change.",
+        "§6 SMS/WA reply-time: population = first NON-OPT-OUT reply per conversation (STOP-class replies are suppressed by design and owe no response); the median counts ONLY answered conversations, so read it WITH Answered% (~23-35% SMS / ~12% WA — most non-opt-out replies are junk/hostile the desk/AI correctly declines). Median RAW min is the unclamped wall-clock sibling (answering runs ~24/7; biz-median 0 = answered before the next noon-ET clock-open, e.g. a Sunday-evening reply answered Monday 11am). SMS responses come from the nightly-recovered Sendivo log (~D-2 at render; newest days back-fill) and SMS history starts at the 2026-06-27 reply-capture era — earlier capture was partial and is wiped, never blended. Each SMS desk row blends AIM + manual answers on one pairing (R3 is AIM-served; R1/R2 manual).",
         "§2 Sent counts ALL messages — blasts + follow-ups + AIM conversational (ratified inclusive basis [Sam 07-02]: we pay for every message equally; TKT-3 REVERSED). The Sendivo dashboard is the narrower BLAST-ONLY view and its UI hides AIM API sends — reconcile via §2's blast-split line; never expect the dashboard to equal §2 Sent.",
         "§2 Delivered/Fail = per-message CARRIER status from the nightly Sendivo /sms/logs pull (D-1): '—' on the evening render, back-fills at the 12:45Z re-render. Delivered is NEVER approximated as sent, and Sendivo's '# contacts − SMS sent' gap = SKIPPED AT SEND (invalid numbers etc.), NOT undelivered. The real-time outbound-status webhook has been dead since 06-09 (vendor restore ask open) — the D-1 log pull is the delivery source until then.",
         "§2 Opps = Qwen positive-intent classifier over human (non-opt-out) replies — the ONLY SMS opp signal ('positive replies' is a BANNED misnomer: it counted ALL non-opt-out replies, ~8x inflation). Qwen lags ~2-3d → a day's Opps render '—' until ≥90% classified, healing on the D-2/D-3 backfill re-renders. WhatsApp replies have no classifier yet → WA Opps '—'.",
