@@ -377,18 +377,22 @@ def preipo_meetings(date):
     portal 2026-06-30 (portal==desks 28/28, 17/17, 26/26 for 06-30/07-01/07-02) and 06-29 (34) was
     backfilled 2026-07-03, so the portal is complete for Pre-IPO across the portal era; the desks stay
     ~2 weeks as a drift alarm, then retire."""
-    portal = wq(f"""
-      SELECT count(DISTINCT lower(coalesce(nullif(email,''), phone)))
-      FROM main.raw_im_bookings
-      WHERE _snapshot_date=(SELECT max(_snapshot_date) FROM main.raw_im_bookings)
-        AND offer='Pre-IPO'
-        AND substr(coalesce(date,''),1,10)=DATE '{date}'::VARCHAR
-        AND (deleted_at IS NULL OR deleted_at='' OR lower(deleted_at)='null')
-        AND coalesce(nullif(email,''), phone) <> ''""")
-    n_portal = int(portal[0][0] or 0) if portal else 0
+    try:
+        portal = wq(f"""
+          SELECT count(DISTINCT lower(coalesce(nullif(email,''), phone)))
+          FROM main.raw_im_bookings
+          WHERE _snapshot_date=(SELECT max(_snapshot_date) FROM main.raw_im_bookings)
+            AND offer='Pre-IPO'
+            AND substr(coalesce(date,''),1,10)=DATE '{date}'::VARCHAR
+            AND (deleted_at IS NULL OR deleted_at='' OR lower(deleted_at)='null')
+            AND coalesce(nullif(email,''), phone) <> ''""")
+        n_portal = int(portal[0][0] or 0) if portal else 0
+    except Exception as e:
+        print(f"WARN preipo_meetings portal read failed {date}: {e} — falling back to desks", file=sys.stderr)
+        n_portal = 0
     if n_portal > 0:
         return n_portal
-    # portal carries nothing for this day -> fall back to the desk sheets (never silent-zero)
+    # portal 0 (or a warehouse hiccup) -> fall back to the desk sheets (never silent-zero)
     return sum(preipo_by_desk(date)["by_desk"].values())
 
 # WhatsApp PRE-IPO meetings (yellow-block row) — registry DR-9. Reads the SAME portal source with
