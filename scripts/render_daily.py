@@ -15,19 +15,28 @@ Canonical sources (verified 2026-06-30; booking cutover 2026-06-30):
                           every meeting column; im_bookings is the live portal writer (Darcy's form).
                           channel -> §1 Email / §2 SMS+WhatsApp / §3 Call; workspace -> §1 by-workspace
                           (ws_alias); partner -> §5; lead_type -> §1 cheap/regular split.
- §2 SMS sent           -> sendivo billing_report.sms_fees.quantity (12720=Ren1, 13922=Ren2, 14603=Ren3 webform).
+ §2 = the RATIFIED SMS/WA funnel [Sam 07-02]: SENT -> DELIVERED -> TOTAL REPLIES -> OPPS (Qwen)
+                          -> MEETINGS + per-stage conversion, per sub-account. NO "positive replies"
+                          metric anywhere (banned misnomer).
+ §2 SMS sent           -> sendivo billing_report.sms_fees.quantity (12720=Ren1, 13922=Ren2, 14603=Ren3
+                          webform) — the INCLUSIVE total: blasts + follow-ups + AIM conversational
+                          (TKT-3 REVERSED [Sam 07-02]; the Sendivo dashboard is blast-only — §2
+                          carries a reconcile line from v_sms_blast_performance, D-1).
  §2 SMS Cost $ (actual)-> WAREHOUSE main.raw_sendivo_billing_daily.total_spend (nightly upsert; the
                           ALL-IN Sendivo $/day per sub: SMS fees + carrier fees + any setup/renewal/
                           brand/phone fees — sms_fee_usd ALONE understated ~3x by excluding carrier
                           fees, which bill per segment) + Cost/mtg·form = cost ÷ that row's meetings
                           (Ren3: web-form fills). Partial/missing day-row -> '—' + WARN
                           (100%-or-wipe), back-fills post-nightly. WhatsApp: no cost feed -> '—'.
- §2b SMS cost (window) -> raw_sendivo_billing_daily.total_spend (all-in $, SAME basis as §2) summed
-                          over the SAME trailing fully-classified window as §2b's opps; Cost/opp =
-                          cost ÷ opps. (Was funnel campaign-feed cost_usd = the carrier-fee component
-                          only — understated all-in spend ~1.6x; fixed 2026-07-01.)
+ §2 SMS delivered      -> v_sms_campaign_performance (nightly /sms/logs per-message CARRIER status;
+                          D-1) — '—' until loaded, NEVER delivered≈sent; WhatsApp = live Iskra statuses.
+ §2b (same-day)        -> opt-outs (webhook-receipt basis) · KPI · cost: SMS = billing total_spend
+                          (all-in, actual); WhatsApp = MODEL $0.072×delivered (no Iskra billing feed;
+                          labelled). The old trailing-window §2b was removed 2026-07-02 (DR-10).
  §1 Opp→mtg %          -> meetings ÷ opportunities, same same-day frame as §1's columns ('—' when opps=0).
- §2 SMS replies (human)-> raw_sendivo_inbound non-opt-out.
+ §2 SMS replies (total)-> raw_sendivo_inbound (ALL inbound incl. opt-outs; mirrors
+                          comms.webhook_receipt sendivo_inbound — the doctrine reply source).
+ §2 SMS opps           -> derived.sms_reply_is_positive_qwen ≥90%-classified gate (~2-3d lag).
  §2 WhatsApp           -> v_sms_dash_wa_daily (sent/delivered/failed/replies); meetings -> im_bookings.
  §3 Close             -> core.call (dials/leads/connects @>=60s, ET day) — Close API SoR, under-captures.
  §4 Sending truth      -> Expected = active accounts' configured daily_limit by infra (core.account_label,
@@ -489,27 +498,138 @@ def webform_submissions(date):
         print(f"WARN webform_submissions failed {date}: {e}", file=sys.stderr)
         return 0
 
+def sendivo_blast_split(date):
+    """{sub_account_name: (blast_sent, blast_delivered, other_sent)} for `date` from
+    main.v_sms_blast_performance (raw_sendivo_blast_daily = the nightly /sms/logs pull; blast_id
+    100%-populated on real sends since 2026-06-26). blast_id IS NOT NULL = the day's BLASTS — the
+    basis the Sendivo dashboard shows; blast_id IS NULL = everything else (follow-ups/nudges + AIM
+    conversational + system messages — the Sendivo UI hides AIM API sends). Feeds §2's
+    dashboard-reconcile line. TKT-3 REVERSED [Sam 07-02]: the §2 row stays the INCLUSIVE total
+    (blasts + follow-ups + AIM — we pay for every message equally); this split only LABELS the
+    narrower blast-only view so the two reconcile (verified Jul-1 Ren3: 71,474 blast == the Sendivo
+    dashboard's 3 blasts exactly; + 4,520 other == billing 75,992). D-1 source: {} until the
+    nightly lands the day -> the reconcile line renders 'pending'. Fail-soft -> {}."""
+    out = {}
+    try:
+        for r in wq(f"""SELECT sub_account_name,
+                               sum(sent) FILTER (WHERE blast_id IS NOT NULL),
+                               sum(delivered) FILTER (WHERE blast_id IS NOT NULL),
+                               sum(sent) FILTER (WHERE blast_id IS NULL)
+                        FROM main.v_sms_blast_performance
+                        WHERE metric_date = DATE '{date}' AND sub_account_name IS NOT NULL
+                        GROUP BY 1"""):
+            out[r[0]] = (int(r[1] or 0), int(r[2] or 0), int(r[3] or 0))
+    except Exception as e:
+        print(f"WARN sendivo_blast_split failed {date}: {e}; §2 blast-reconcile line renders pending",
+              file=sys.stderr)
+    return out
+
+def r3_webform_funnel(date):
+    """Ren3's web-form funnel for the ET day from the LIVE comms Supabase view
+    comms.v_r3_daily_funnel — the canonical R3 funnel (repliers -> warm positives -> app links ->
+    form fills) per reference_rg3_reply_metrics_read_webhook_receipt_20260702. Live read like
+    webform_submissions (the warehouse mirror lags). Fail-soft -> None (the §2 note line is
+    skipped, never crashes the render)."""
+    url = _CREDS.optional("COMMS_SUPABASE_DB_URL") if _CREDS else None
+    if not url:
+        print("WARN r3_webform_funnel: COMMS_SUPABASE_DB_URL unavailable -> note skipped", file=sys.stderr)
+        return None
+    try:
+        import psycopg2
+        conn = psycopg2.connect(url, connect_timeout=15)
+        try:
+            conn.set_session(readonly=True)
+            with conn.cursor() as cur:
+                cur.execute("SELECT repliers, warm_positives, app_links_sent, form_fills "
+                            "FROM comms.v_r3_daily_funnel WHERE et_day = %s", (date,))
+                row = cur.fetchone()
+                return tuple(int(x or 0) for x in row) if row else None
+        finally:
+            conn.close()
+    except Exception as e:
+        print(f"WARN r3_webform_funnel failed {date}: {e}", file=sys.stderr)
+        return None
+
+def sms_opps_by_sub(date):
+    """{sub_account_name: opps|None} for `date` — the doctrine OPPORTUNITIES stage
+    [feedback_funnel_metrics_simplify_20260702]. Opps = Qwen positive-intent verdicts
+    (derived.sms_reply_is_positive_qwen — the ONLY sanctioned SMS opp signal; the
+    v_sms_campaign_performance.positive_replies column is a BANNED misnomer: it counts ALL
+    non-opt-out replies, ~8x inflation, and must never be rendered). Attribution = the inbound
+    receipt's own sub_account_name (raw_sendivo_inbound mirrors comms.webhook_receipt
+    sendivo_inbound rows — the doctrine reply source; comms.message drops suppressed STOP
+    inbounds).
+    HONEST-LAG GATE (100%-or-wipe): the classifier runs ~2-3d behind (09:00Z incremental ->
+    seed -> next nightly), so a fresh day is mostly unclassified and a partial count would
+    massively UNDER-count opps (Jul-2 read 4% classified on Jul-3). A sub's opps render ONLY
+    when >=90% of its day's human (non-opt-out) replies carry a verdict; else None -> '—'
+    (heals on the D-2/D-3 backfill re-renders once classification lands). Fail-soft -> {}."""
+    out = {}
+    try:
+        rows = wq(f"""
+          WITH human AS (
+            SELECT sub_account_name AS sub, count(*) FILTER (WHERE NOT is_opt_out) AS human
+            FROM main.raw_sendivo_inbound
+            WHERE CAST(received_at AS DATE) = DATE '{date}' GROUP BY 1),
+          cls AS (
+            -- day filter on the RECEIPT timestamp (i) + non-opt-out numerator, so the >=90% gate's
+            -- numerator/denominator share one population even if the Qwen seed ever includes
+            -- opt-outs or q.received_at drifts at day boundaries [code-review 07-03 hardening]
+            SELECT i.sub_account_name AS sub,
+                   count(*) FILTER (WHERE NOT i.is_opt_out) AS classified,
+                   count(*) FILTER (WHERE q.is_positive AND NOT i.is_opt_out) AS opps
+            FROM derived.sms_reply_is_positive_qwen q
+            JOIN main.raw_sendivo_inbound i ON i.inbound_message_id = q.reply_id
+            WHERE CAST(i.received_at AS DATE) = DATE '{date}' GROUP BY 1)
+          SELECT h.sub, h.human, COALESCE(c.classified, 0), COALESCE(c.opps, 0)
+          FROM human h LEFT JOIN cls c ON c.sub = h.sub""")
+        for sub, human, classified, opps in rows:
+            human, classified, opps = int(human or 0), int(classified or 0), int(opps or 0)
+            if human == 0:
+                out[sub] = 0                      # no human replies -> genuinely 0 opps
+            elif classified >= 0.9 * human:
+                out[sub] = opps
+            else:
+                out[sub] = None                   # partial classification -> '—', never a low count
+                print(f"WARN sms_opps_by_sub: '{sub}' {date} only {classified}/{human} human replies "
+                      f"classified (<90%) — Opps renders '—' (Qwen lags ~2-3d; heals on the D-2/D-3 "
+                      "backfill re-render)", file=sys.stderr)
+    except Exception as e:
+        print(f"WARN sms_opps_by_sub failed {date}: {e}; §2 Opps render '—'", file=sys.stderr)
+    return out
+
 def get_sms_wa():
+    """§2 rows per the RATIFIED SMS/WA funnel doctrine [Sam 07-02,
+    feedback_funnel_metrics_simplify_20260702]: SENT (ALL messages: blasts + follow-ups + AIM
+    conversational — we pay for every message equally) -> DELIVERED (per-message CARRIER status,
+    never sent-minus-skipped) -> TOTAL REPLIES (all inbound incl. opt-outs, webhook-receipt basis)
+    -> OPPS (Qwen) -> MEETINGS, with the conversion between each stage rendered. There is NO
+    "positive replies" metric for SMS/WA anywhere (banned misnomer).
+
+    Row shape: (label, sent, delivered|None, failed|None, replies_total, opt_outs|None, opps|None,
+    meetings, cost|None).
+
+    DELIVERED honesty [doctrine]: v_sms_campaign_performance (nightly /sms/logs per-message
+    status_group — real carrier statuses, verified to reconcile the Sendivo dashboard delivery %)
+    is the ONLY SMS delivered/failed source; a missing/partial day renders '—' + WARN and
+    back-fills at the 12:45Z re-render. The old delivered≈sent fallback was a GUESSED value —
+    removed (100%-or-wipe). NB the real-time outbound-status webhook died 06-09 (vendor ask open);
+    the D-1 /sms/logs pull is the carrier-status source until restored. WhatsApp delivered/failed =
+    live Iskra message statuses (no lag). Sendivo "# contacts − SMS sent" = skipped at send, NOT
+    undelivered — never read it as delivery.
+
+    Meetings semantics unchanged [Sam 06-30]: Funding SMS meetings on Ren1 (im_bookings' SMS
+    channel carries no sub-account); Pre-IPO desks on Ren2; Ren3 = completed WEB-FORM FILLS (its
+    conversion event). ORDER MATTERS: Ren1 index 0, Ren2 index 1 (write_summary_block reads them).
+    """
     sms = sendivo_sms(DAILY)
     inb = {r[0]: (int(r[1]), int(r[2])) for r in wq(
-        f"""SELECT sub_account_name, count(*), count(*) FILTER (WHERE NOT is_opt_out)
+        f"""SELECT sub_account_name, count(*), count(*) FILTER (WHERE is_opt_out)
             FROM main.raw_sendivo_inbound WHERE CAST(received_at AS DATE)=DATE '{DAILY}' GROUP BY 1""")}
+    opps = sms_opps_by_sub(DAILY)
     book = consolidated_bookings(DAILY)
     sms_mtg = sum(1 for b in book if b["channel"].lower() == "sms")
     wa_mtg = sum(1 for b in book if b["channel"].lower() == "whatsapp")
-    # Row shape: (label, sent, delivered, failed|None, human_replies, meetings).  WhatsApp surfaces
-    # DELIVERED + FAIL% (ISKRA "sent" runs ~30-37% failed -> attempted is misleading); KPI=deliv/mtg
-    # (folds in #116). SMS delivered/failed come from main.v_sms_campaign_performance (raw sendivo
-    # campaign-daily rollup) per sub-account [Jun-30 accuracy pass 07-01]: SMS delivery is NOT ~100%
-    # (06-30 Ren1 ran 14% failed), so delivered=sent + Fail% "—" understated real failures. Sent stays
-    # the sendivo BILLING quantity (the calibrated §2 source; the view's own sent tracks it within
-    # ~0.01%). Fail-soft: no view row for a sub/day (same-day sync lag) -> legacy (delivered≈sent,
-    # failed=None -> Fail% "—"), never a crash. Funding SMS meetings on Ren1; Pre-IPO on Ren2.
-    # Ren3 (webform): the "meetings" column shows completed WEB-FORM FILLS (Lumara apply-now), NOT
-    # meetings — Ren3 is a form-conversion line [Sam 06-30]. KPI = sent / webforms (same sent/x formula
-    # as the other rows). SMS-sourced MEETINGS stay on the Ren1 row (im_bookings' SMS channel carries no
-    # sub-account) — Ren3 does not double-count them. The shared column is headed "Meetings/Webform".
-    # ORDER MATTERS: Ren1 must stay index 0 and Ren2 index 1 (write_summary_block reads SMS_D[0]/[1]).
     perf = {}
     try:
         for r in wq(f"""SELECT sub_account_name, sum(sent), sum(delivered), sum(failed)
@@ -525,18 +645,21 @@ def get_sms_wa():
         if p is None:
             if billed_sent:
                 print(f"WARN get_sms_wa: no v_sms_campaign_performance row for '{sub_name}' on {DAILY} "
-                      f"(billed {billed_sent}); rendering delivered≈sent, Fail% '—'", file=sys.stderr)
-            return billed_sent, None
+                      f"(billed {billed_sent}); Delivered/Fail render '—' (pending the nightly "
+                      "/sms/logs pull — back-fills at the 12:45Z re-render)", file=sys.stderr)
+            return None, None
         vsent, vdeliv, vfail = p
         # Tripwire [code-review 07-01]: on a FULLY-loaded day the view's own sent tracks billing
         # within ~0.03%. A mid-load partial day would silently UNDERSTATE delivered/failed behind a
-        # plausible Fail% — worse than the '—' it replaces (100%-or-wipe rule). >5% divergence ->
-        # treat the view's day as partial and fall back to legacy.
+        # plausible Fail% (100%-or-wipe rule). >5% divergence -> treat the day as partial -> '—'.
+        # [2026-07-03 doctrine] BOTH paths now return (None, None): delivered≈sent was a guessed
+        # value (TRUE delivered = carrier status only), so a pending/partial day renders an honest
+        # blank, never an approximation.
         if billed_sent and abs(vsent - billed_sent) > 0.05 * billed_sent:
             print(f"WARN get_sms_wa: v_sms_campaign_performance sent={vsent} diverges >5% from billed "
-                  f"{billed_sent} for '{sub_name}' on {DAILY} (partial day-load?); rendering "
-                  "delivered≈sent, Fail% '—'", file=sys.stderr)
-            return billed_sent, None
+                  f"{billed_sent} for '{sub_name}' on {DAILY} (partial day-load?); Delivered/Fail "
+                  "render '—' (back-fills at the 12:45Z re-render)", file=sys.stderr)
+            return None, None
         return vdeliv, vfail
     # §2 Cost $ (actual) [backlog A1] = warehouse raw_sendivo_billing_daily.total_spend for the day
     # (all-in Sendivo $: SMS fees + carrier fees + setup/renewal/brand/phone fees — NOT sms_fee_usd,
@@ -563,22 +686,39 @@ def get_sms_wa():
                   file=sys.stderr)
             return None
         return usd
-    rows = []
-    s1 = sms.get(SUB_REN1, 0); d1, f1 = deliv_failed("Renaissance 1", s1); rows.append(("Renaissance 1 (SMS)", s1, d1, f1, inb.get("Renaissance 1", (0, 0))[1], sms_mtg, cost_usd(SUB_REN1, "Renaissance 1", s1)))
-    s2 = sms.get(SUB_REN2, 0); d2, f2 = deliv_failed("Renaissance 2", s2); rows.append(("Renaissance 2 (SMS · Pre-IPO)", s2, d2, f2, inb.get("Renaissance 2", (0, 0))[1], preipo_meetings(DAILY), cost_usd(SUB_REN2, "Renaissance 2", s2)))
-    s3 = sms.get(SUB_REN3, 0); d3, f3 = deliv_failed("Renaissance 3", s3); rows.append(("Renaissance 3 (SMS · webform)", s3, d3, f3, inb.get("Renaissance 3", (0, 0))[1], webform_submissions(DAILY), cost_usd(SUB_REN3, "Renaissance 3", s3)))
+    def sub_row(label, sub_name, sub_id, mtgs):
+        s = sms.get(sub_id, 0)
+        d, f = deliv_failed(sub_name, s)
+        rt, ro = inb.get(sub_name, (0, 0))
+        # opps: missing key with zero inbound = genuine 0; missing key with inbound = gate/attribution
+        # failure -> None ('—'), never a fake 0.
+        o = opps.get(sub_name, 0 if rt == 0 else None)
+        return (label, s, d, f, rt, ro, o, mtgs, cost_usd(sub_id, sub_name, s))
+    rows = [
+        sub_row("Renaissance 1 (SMS)", "Renaissance 1", SUB_REN1, sms_mtg),
+        sub_row("Renaissance 2 (SMS · Pre-IPO)", "Renaissance 2", SUB_REN2, preipo_meetings(DAILY)),
+        sub_row("Renaissance 3 (SMS · webform)", "Renaissance 3", SUB_REN3, webform_submissions(DAILY)),
+    ]
     wa = wq(f"""SELECT sent, delivered, failed, replies_total FROM main.v_sms_dash_wa_daily
                 WHERE channel='whatsapp' AND metric_date=DATE '{DAILY}'""")
     if wa:
         ws_, wd, wf, wr = (int(wa[0][i] or 0) for i in range(4))
     else:
         ws_, wd, wf, wr = 0, 0, 0, 0
-    # WhatsApp cost = None ALWAYS: no actual WA cost feed exists (cost_usd 100% NULL) and the $0.07/msg
-    # model is explicitly GATED (no modeled numbers on the report) [backlog B3/A6, Sam 07-01].
-    rows.append(("WhatsApp (ISKRA)", ws_, wd, wf, wr, wa_mtg, None))
+    # WhatsApp cost = MODEL [Sam 07-02, FINAL]: $0.072/message paid ONLY on delivery. No Iskra
+    # billing feed exists (raw cost 100% NULL) -> modelled from delivered and LABELLED as model in
+    # §2b, never summed into the SMS actual total (vendor ask: Arseny billing feed). There is NO
+    # client-facing price concept — the older "$0.07×delivered client-facing" framing is DEAD.
+    # WA opt-outs: no reliable Iskra opt-out signal in the mirror -> None ('—'). WA opps: no Qwen
+    # classifier over Iskra replies yet -> None ('—'; gap-listed).
+    rows.append(("WhatsApp (ISKRA)", ws_, wd, wf, wr, None, None, wa_mtg,
+                 (round(0.072 * wd, 2) if wd else None)))
     return rows
 
-# ---------------------------- §2b SMS KPI-to-opp ----------------------------
+# ------------- (legacy) trailing-window SMS KPI-to-opp — NOT rendered -------------
+# The trailing-window §2b was REMOVED from the daily tab 2026-07-02 (DR-10: nothing non-daily on a
+# daily report). The §2b SLOT is now a same-day companion table (opt-outs · KPI · cost — see
+# sms_cost_table). get_sms_kpi_to_opp + sms_kpi_table stay for other consumers / --dry.
 # The SMS "opp" (opportunity) = a POSITIVE-INTENT inbound reply, per the CURRENT-native notion:
 # derived.sms_reply_is_positive_qwen.is_positive (the Qwen classifier already shipped as the warehouse's
 # SMS positive-reply signal — we surface it, we do NOT build a bespoke reclassifier [Sam 2026-06-30]).
@@ -1354,13 +1494,18 @@ def _safe(label, fn, default):
         print(f"WARN section '{label}' FAILED ({e}); rendering it empty", file=sys.stderr)
         return default
 _EMAIL_FB = [(name, 0, 0, 0, 0, 0, 0) for _, name in WS]
-_SMS_FB = [("Renaissance 1 (SMS)", 0, 0, None, 0, 0, None), ("Renaissance 2 (SMS · Pre-IPO)", 0, 0, None, 0, 0, None), ("Renaissance 3 (SMS · webform)", 0, 0, None, 0, 0, None), ("WhatsApp (ISKRA)", 0, 0, 0, 0, 0, None)]
+_SMS_FB = [("Renaissance 1 (SMS)", 0, None, None, 0, None, None, 0, None),
+           ("Renaissance 2 (SMS · Pre-IPO)", 0, None, None, 0, None, None, 0, None),
+           ("Renaissance 3 (SMS · webform)", 0, None, None, 0, None, None, 0, None),
+           ("WhatsApp (ISKRA)", 0, None, None, 0, None, None, 0, None)]
 _CLOSE_FB = {"dials": 0, "leads": 0, "connects": 0, "meetings": 0}
 _TRUTH_FB = (None, [(name, 0, 0, 0, 0, None, None) for _, name in WS])  # split None -> "—", never fake 0
 _IMREPLY_FB = ((DAILY, DAILY), [(name, 0, None, None, 0, None, None) for _, name in WS])
 
 EMAIL_D = _safe("email", get_email, _EMAIL_FB)
 SMS_D = _safe("sms_wa", get_sms_wa, _SMS_FB)
+BLAST_SPLIT_D = _safe("blast_split", lambda: sendivo_blast_split(DAILY), {})
+R3_FUNNEL_D = _safe("r3_funnel", lambda: r3_webform_funnel(DAILY), None)
 SMS_KPI_D = _safe("sms_kpi_to_opp", get_sms_kpi_to_opp, {"dates": [], "rows": []})
 CLOSE_D = _safe("close", get_close, _CLOSE_FB)
 # §1b infra resolution is collected BEFORE §4 so §4's Actual OTD/Google split can fall back to the LIVE
@@ -1396,7 +1541,9 @@ if DRY:
             if inf in _im: _im[inf] += n
         print("§1b INFRA (sent,opp,human,auto | mtg):"); [print("  ", inf, _ia[inf], "|", _im[inf]) for inf in _ia]
     print("§1 EMAIL:");    [print("  ", x) for x in EMAIL_D]
-    print("§2 SMS/WA:");   [print("  ", x) for x in SMS_D]
+    print("§2 SMS/WA (label,sent,deliv,fail,replies,optouts,opps,mtg,cost):");   [print("  ", x) for x in SMS_D]
+    print("§2 blast split {sub: (blast_sent, blast_deliv, other_sent)}:", BLAST_SPLIT_D)
+    print("§2 R3 webform funnel (repliers,warm,links,fills):", R3_FUNNEL_D)
     print(f"§2b SMS KPI-to-opp (window {SMS_KPI_D.get('dates')}):"); [print("   ", r, "sent/opp=", (round(r[1]/r[2]) if r[1] and r[2] else '—')) for r in SMS_KPI_D.get("rows", [])]
     print("§3 CLOSE:", CLOSE_D)
     print("§4 TRUTH (ws, otd_exp, goog_exp, tot_exp, actual, otd_actual, goog_actual):"); [print("  ", x) for x in SENDING_TRUTH]
@@ -1424,7 +1571,7 @@ def mins(v): return "—" if v is None else round(_f(v))
 def rgb(r, g, b): return {"red": r, "green": g, "blue": b}
 
 def build_and_write(tab, build_fn):
-    rows = []; sec = []; th = []; tot = []; rrrows = []; merges = []; strows = []; data = []; infrows = []
+    rows = []; sec = []; th = []; tot = []; pctcells = []; merges = []; strows = []; data = []; infrows = []
     usdcells = []   # (row_idx, col_start, col_end) -> CURRENCY "$#,##0.00" (§2 / §2b cost columns)
     th_ncol = {}; row_ncol = {}
     def add(r=None): rows.append(r or []); return len(rows) - 1
@@ -1446,35 +1593,91 @@ def build_and_write(tab, build_fn):
             ts += sent; topp += opps; tm += m; tc_ += c; tr_ += r
         ti = add(["TOTAL", ts, topp, tm, kpi(ts, tm), tc_, pctstr(tc_, tm), tr_, pctstr(tr_, tm), o2m(tm, topp)]); tot.append(ti); row_ncol[ti] = W
     def sms_wa_table(rows_data, header_label):
-        # WhatsApp shows DELIVERED + FAIL% (ISKRA "sent" runs ~30-37% failed -> attempted misleads);
-        # KPI = delivered/mtg. SMS: failed=None -> Fail% "—", delivered≈sent. (folds in #116)
-        # Cost columns [backlog A1/A3/A4, 2026-07-01]: Cost $ (actual) = the day's Sendivo BILLING
-        # total_spend from warehouse raw_sendivo_billing_daily (ALL-IN $: SMS fees + carrier fees +
-        # any setup/renewal/brand/phone fees that day); Cost/mtg·form = that cost ÷ the SAME row's
-        # Meetings/Webform value (Ren1/Ren2: meetings; Ren3: web-form fills) — '—' when the unit
-        # count is 0 (never divide-by-zero) or when cost is None (missing/partial billing row, already
-        # WARNed loud in get_sms_wa). WhatsApp cost is ALWAYS '—' (no actual feed; $0.07 model gated).
-        # TOTAL cost renders ONLY when every SMS row has a cost (partial sum would silently
-        # understate — 100%-or-wipe); TOTAL Cost/mtg·form stays '—' (meetings+webforms don't blend).
-        W = 9
+        # §2 = the RATIFIED funnel [Sam 07-02, feedback_funnel_metrics_simplify_20260702]:
+        # SENT -> DELIVERED -> TOTAL REPLIES -> OPPS (Qwen) -> MEETINGS + the conversion between each
+        # stage. Exactly 10 columns (A..J — stays inside the health window). Opt-outs / KPI / cost
+        # live in the §2b companion table (sms_cost_table). '—' = honestly unmeasured at render time
+        # (delivered + blast split land D-1; opps land ~D+2) — back-filled by the extended backfill
+        # re-render, NEVER approximated (100%-or-wipe).
+        W = 10
         si = add([header_label]); sec.append(si); row_ncol[si] = W
-        hr = add(["Channel / workspace", "Sent", "Delivered", "Fail %", "Human RR", "Meetings/Webform", "KPI", "Cost $ (actual)", "Cost / mtg·form"]); th.append(hr); th_ncol[hr] = W
-        def failpct(failed, sent): return (f"'{round(100.0*failed/sent)}%" if sent else "'0%") if failed is not None else "—"
-        def costcell(c): return round(c, 2) if c is not None else "—"
-        def costper(c, m): return round(c / m, 2) if (c is not None and m) else "—"
-        ts = td = tf = thr = tm = 0; any_fail = False
-        sms_costs = []   # cost of every NON-WhatsApp row (None = missing) -> gates the TOTAL
-        for label, sent, deliv, failed, reps, m, cost in rows_data:
-            ri = add([label, sent, deliv, failpct(failed, sent), rr(reps, deliv), m, kpi(deliv, m),
-                      costcell(cost), costper(cost, m)]); rrrows.append(ri); data.append(ri); row_ncol[ri] = W
-            usdcells.append((ri, 7, 9))
-            ts += sent; td += deliv; thr += reps; tm += m
-            if failed is not None: tf += failed; any_fail = True
-            if "WhatsApp" not in label: sms_costs.append(cost)
-        tcost = round(sum(sms_costs), 2) if (sms_costs and all(c is not None for c in sms_costs)) else "—"
-        ti = add(["TOTAL", ts, td, (f"'{round(100.0*tf/ts)}%" if (any_fail and ts) else "—"), rr(thr, td), tm, kpi(td, tm), tcost, "—"]); tot.append(ti); rrrows.append(ti); row_ncol[ti] = W
-        usdcells.append((ti, 7, 9))
-        ni = add(["Cost $ (actual) = ALL-IN Sendivo spend for the day (warehouse raw_sendivo_billing_daily total_spend: SMS fees + carrier fees + any setup/renewal/brand/phone fees that day; carrier fees bill per segment, so carrier-fee qty > message count; WhatsApp has no cost feed). Cost/mtg·form = cost ÷ that row's meetings (Ren3: web-form fills). '—' cost = no fully-loaded billing row yet (back-fills after the nightly)."])
+        hr = add(["Channel / workspace", "Sent", "Delivered", "Deliv %", "Replies (total)", "Reply %",
+                  "Opps (Qwen)", "Opp %", "Mtgs / Webform", "Opp→mtg %"]); th.append(hr); th_ncol[hr] = W
+        dash = "\u2014"
+        def cell(v): return dash if v is None else v
+        def div(n, d): return (float(n) / float(d)) if (n is not None and d) else dash
+        ts = tr = tm = 0
+        deliv_vals = []; opps_vals = []   # None-aware TOTAL gates (a partial sum lies; 100%-or-wipe)
+        for label, sent, deliv, failed, reps, oo, opp, m, cost in rows_data:
+            ri = add([label, sent, cell(deliv), div(deliv, sent), reps, div(reps, deliv),
+                      cell(opp), div(opp, reps), m, div(m, opp)])
+            data.append(ri); row_ncol[ri] = W
+            for c in (3, 5, 7, 9): pctcells.append((ri, c))
+            ts += sent; tr += reps; tm += m
+            deliv_vals.append(deliv)
+            if "WhatsApp" not in label: opps_vals.append(opp)   # WA has no classifier — excluded
+        tdeliv = sum(deliv_vals) if (deliv_vals and all(v is not None for v in deliv_vals)) else None
+        topp = sum(opps_vals) if (opps_vals and all(v is not None for v in opps_vals)) else None
+        # TOTAL Opp% / Opp→mtg% stay '—': Replies/Meetings totals include WhatsApp but Opps is
+        # SMS-only — a blended conversion would be a wrong-but-plausible number.
+        ti = add(["TOTAL", ts, cell(tdeliv), div(tdeliv, ts), tr, div(tr, tdeliv),
+                  cell(topp), dash, tm, dash]); tot.append(ti); row_ncol[ti] = W
+        for c in (3, 5): pctcells.append((ti, c))
+        n1 = add(["Sent = ALL messages (blasts + follow-ups + AIM conversational; Sendivo billing qty — the ratified inclusive basis, we pay per message [Sam 07-02]; WhatsApp = Iskra outbound) · Delivered = per-message CARRIER status (Sendivo /sms/logs, lands with the nightly → '—' until the 12:45Z back-fill; WhatsApp = live Iskra statuses; never approximated as sent) · Replies (total) = ALL inbound incl. opt-outs (Sendivo webhook receipts; opt-outs split in §2b) · Opps = Qwen positive-intent over human replies (~2-3d lag → '—' until ≥90% classified; heals on D-2/D-3 re-renders; WhatsApp has NO classifier yet) · TOTAL Opps = SMS rows only."])
+        data.append(n1); row_ncol[n1] = W
+        bs = BLAST_SPLIT_D or {}
+        if bs:
+            parts = []
+            for sub in ("Renaissance 1", "Renaissance 2", "Renaissance 3"):
+                if sub in bs:
+                    b, bd, o = bs[sub]
+                    parts.append(f"{sub}: {b:,} blast ({bd:,} delivered) + {o:,} follow-up/AIM/system")
+            txt = ("Sendivo-dashboard reconcile — the dashboard shows BLAST-ONLY and its UI hides AIM API "
+                   "sends; §2 Sent is deliberately the larger inclusive total [TKT-3 REVERSED, Sam 07-02]: "
+                   + " · ".join(parts))
+        else:
+            txt = ("Sendivo-dashboard reconcile: blast vs follow-up/AIM split PENDING the nightly /sms/logs "
+                   "pull (D-1; back-fills at the 12:45Z re-render). The dashboard shows blast-only; §2 Sent "
+                   "is the inclusive total (blasts + follow-ups + AIM) per the ratified definition "
+                   "[TKT-3 REVERSED, Sam 07-02].")
+        n2 = add([txt]); data.append(n2); row_ncol[n2] = W
+        if R3_FUNNEL_D:
+            rp, wm, lk, ff = R3_FUNNEL_D
+            n3 = add([f"Ren3 web-form funnel (comms.v_r3_daily_funnel, live): {rp:,} repliers → {wm:,} warm → {lk:,} app links → {ff:,} form fills."])
+            data.append(n3); row_ncol[n3] = W
+    def sms_cost_table(rows_data, header_label):
+        # §2b (same-day companion; DR-10-compliant — every column is the report day): opt-outs ·
+        # KPI · the COST layer. SMS Cost $ = ACTUAL all-in Sendivo billing (total_spend). WhatsApp
+        # Cost $ = MODEL $0.072 × delivered (paid on delivery only; NO Iskra billing feed exists) —
+        # labelled via the Cost-basis column and NEVER summed into the SMS actual TOTAL. There is NO
+        # client-facing price [Sam 07-02]. Doctrine flat rates for per-blast/margin math: SMS
+        # $0.0072/msg paid sent-or-not · WA $0.072/msg paid on delivery.
+        W = 7
+        si = add([header_label]); sec.append(si); row_ncol[si] = W
+        hr = add(["Channel / workspace", "Opt-outs", "Opt-out %", "KPI (deliv/mtg·form)",
+                  "Cost $", "Cost basis", "Cost / mtg·form"]); th.append(hr); th_ncol[hr] = W
+        dash = "\u2014"
+        toptout = 0; treps = 0; seen_oo = False; sms_costs = []
+        for label, sent, deliv, failed, reps, oo, opp, m, cost in rows_data:
+            is_wa = "WhatsApp" in label
+            basis = ("model $0.072×delivered" if is_wa else "actual (Sendivo billing, all-in)")
+            ri = add([label, (oo if oo is not None else dash),
+                      ((float(oo) / float(reps)) if (oo is not None and reps) else dash),
+                      (kpi(deliv, m) if deliv is not None else dash),
+                      (round(cost, 2) if cost is not None else dash),
+                      (basis if cost is not None else dash),
+                      (round(cost / m, 2) if (cost is not None and m) else dash)])
+            data.append(ri); row_ncol[ri] = W
+            pctcells.append((ri, 2)); usdcells.append((ri, 4, 5)); usdcells.append((ri, 6, 7))
+            if oo is not None: toptout += oo; treps += reps; seen_oo = True
+            if not is_wa: sms_costs.append(cost)
+        tcost = round(sum(sms_costs), 2) if (sms_costs and all(c is not None for c in sms_costs)) else dash
+        ti = add(["TOTAL", (toptout if seen_oo else dash),
+                  ((float(toptout) / float(treps)) if treps else dash), dash,
+                  tcost, ("actual, SMS rows only (WA model kept separate)" if tcost != dash else dash),
+                  dash]); tot.append(ti); row_ncol[ti] = W
+        pctcells.append((ti, 2)); usdcells.append((ti, 4, 5))
+        ni = add(["Cost $ (SMS rows) = ALL-IN Sendivo billing for the day (raw_sendivo_billing_daily total_spend: SMS fees + carrier fees + any setup/renewal/brand/phone fees; carrier fees bill per SEGMENT so carrier-fee qty > messages); '—' = no fully-loaded billing row yet (back-fills after the nightly). WhatsApp Cost $ = MODEL $0.072 × delivered (paid on delivery only; no Iskra billing feed — vendor ask open); excluded from the actual TOTAL. Opt-out % = opt-outs ÷ total replies (TOTAL row: SMS rows only — WA opt-outs unmeasured). KPI = delivered ÷ mtgs/webforms ('—' until Delivered lands). NO client-facing price exists; margin-math flat rates: SMS $0.0072/msg sent-or-not · WA $0.072/msg on delivery."])
         data.append(ni); row_ncol[ni] = W
     def sms_kpi_table(kpi_d, header_label):
         # §2b — SMS KPI-to-opp (texts per opportunity) per workspace over the trailing fully-classified
@@ -1640,9 +1843,10 @@ def build_and_write(tab, build_fn):
         si = add([label]); sec.append(si); row_ncol[si] = 8
         for t in items:
             ci = add(["• " + t]); data.append(ci); row_ncol[ci] = 1
-    build_fn(dict(add=add, email_table=email_table, sms_wa_table=sms_wa_table, truth_table=truth_table,
-                  close_table=close_table, partner_table=partner_table, imreply_table=imreply_table,
-                  infra_table=infra_table, sms_kpi_table=sms_kpi_table, caveats_table=caveats_table))
+    build_fn(dict(add=add, email_table=email_table, sms_wa_table=sms_wa_table, sms_cost_table=sms_cost_table,
+                  truth_table=truth_table, close_table=close_table, partner_table=partner_table,
+                  imreply_table=imreply_table, infra_table=infra_table, sms_kpi_table=sms_kpi_table,
+                  caveats_table=caveats_table))
 
     meta = api("GET", BASE + "?fields=sheets(properties(sheetId,title),bandedRanges(bandedRangeId),conditionalFormats)")
     sh = next((s for s in meta["sheets"] if s["properties"]["title"] == tab), None)
@@ -1665,8 +1869,8 @@ def build_and_write(tab, build_fn):
     reqs.append({"updateDimensionProperties": {"range": {"sheetId": sid, "dimension": "ROWS", "startIndex": 0, "endIndex": WIDE}, "properties": {"pixelSize": 21}, "fields": "pixelSize"}})
     reqs.append({"repeatCell": {"range": rng(0, NROW, 1, NCOL), "cell": {"userEnteredFormat": {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}}, "fields": "userEnteredFormat.numberFormat"}})
     reqs.append({"repeatCell": {"range": rng(0, NROW, 0, 1), "cell": {"userEnteredFormat": {"numberFormat": {"type": "TEXT"}}}, "fields": "userEnteredFormat.numberFormat"}})
-    for i in rrrows:  # §2 Human RR (col 4) as a percent
-        reqs.append({"repeatCell": {"range": rng(i, i + 1, 4, 5), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}}}, "fields": "userEnteredFormat.numberFormat"}})
+    for i, c in pctcells:  # §2/§2b conversion + rate cells as percents
+        reqs.append({"repeatCell": {"range": rng(i, i + 1, c, c + 1), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.00%"}}}, "fields": "userEnteredFormat.numberFormat"}})
     for i in strows:  # §4 Fulfillment % — col 7 (shifted +2 by the Actual OTD/Google columns)
         reqs.append({"repeatCell": {"range": rng(i, i + 1, 7, 8), "cell": {"userEnteredFormat": {"numberFormat": {"type": "PERCENT", "pattern": "0.0%"}}}, "fields": "userEnteredFormat.numberFormat"}})
     for i in infrows:  # §1b RR / Human RR / Positive RR (cols 2,3,4) as percents
@@ -1701,11 +1905,14 @@ def build_and_write(tab, build_fn):
 
 def write_summary_block(sid):
     """Cream right-side 'Business / Funding' summary block (cols L-O), GENERATED from section data."""
-    def ratio(a, b): return round(a / b) if b else ""
-    # SMS_D rows: (label, sent, delivered, failed, replies, meetings, cost_usd|None)
-    sms1 = SMS_D[0] if len(SMS_D) > 0 else ("", 0, 0, None, 0, 0, None)
-    sms2 = SMS_D[1] if len(SMS_D) > 1 else ("", 0, 0, None, 0, 0, None)
-    wa = next((x for x in SMS_D if "WhatsApp" in x[0]), ("", 0, 0, 0, 0, 0, None))
+    def ratio(a, b): return round(a / b) if (b and a is not None) else ""
+    # SMS_D rows: (label, sent, delivered|None, failed|None, replies_total, opt_outs|None,
+    # opps|None, meetings, cost|None) [doctrine funnel 2026-07-03] — meetings moved 5 -> 7,
+    # delivered stays 2 (may be None on the evening render -> ratio degrades to "").
+    _SMS_EMPTY = ("", 0, None, None, 0, None, None, 0, None)
+    sms1 = SMS_D[0] if len(SMS_D) > 0 else _SMS_EMPTY
+    sms2 = SMS_D[1] if len(SMS_D) > 1 else _SMS_EMPTY
+    wa = next((x for x in SMS_D if "WhatsApp" in x[0]), _SMS_EMPTY)
     warm = next((r for r in EMAIL_D if r[0].lower().startswith("warm")), ("Warm leads", 0, 0, 0, 0, 0, 0))
     wsrows = [r for r in EMAIL_D if not r[0].lower().startswith("warm")]
     blk = [[f"{DAILY_TAB} — Business / Funding · {DAILY}", "", "", ""],
@@ -1720,8 +1927,9 @@ def write_summary_block(sid):
     blk.append(["Total (incl. Warm)", ts, tm, ratio(ts, tm)]); blk.append(["", "", "", ""])
     # NO "SDR (Close)" row here: Close's 388 were DIALS, not emails — an Email-Sent block must not
     # carry dial counts [Jun-30 accuracy pass 07-01]. Close lives in §3 only.
-    for lbl, s, m in [("SMS Funding", sms1[1], sms1[5]),
-                      ("Warm Leads", warm[1], warm[4]), ("WhatsApp Funding (delivered)", wa[2], wa[5])]:
+    for lbl, s, m in [("SMS Funding", sms1[1], sms1[7]),
+                      ("Warm Leads", warm[1], warm[4]),
+                      ("WhatsApp Funding (delivered)", (wa[2] if wa[2] is not None else 0), wa[7])]:
         blk.append([lbl, s, m, ratio(s, m)])
     blk.append(["", "", "", ""])
     blk.append(["SMS IPO", sms2[1], PREIPO_MTG, ratio(sms2[1], PREIPO_MTG)])
@@ -1761,11 +1969,11 @@ def daily(ctx):
     add([os.environ.get("DAILY_SUBTITLE", f"Daily · {DAILY} · single-source-of-truth (warehouse + Instantly/sendivo live) · ⚠ read §7 DATA CAVEATS before citing")]); add()
     ctx["email_table"](EMAIL_D, f"1 · EMAIL + WARM LEADS — by workspace · day {DAILY}"); add()
     ctx["infra_table"](INFRA_D, f"1b · EMAIL KPIs BY INFRASTRUCTURE — {' / '.join(INFRA_RENDER_LABEL[i] for i in INFRA_RENDER_ROWS)} · all workspaces · day {DAILY} (Milkbox row wiped 2026-07-01 pending rebuild)"); add()
-    ctx["sms_wa_table"](SMS_D, f"2 · SMS + WHATSAPP — by channel · day {DAILY}"); add()
-    # §2b (7-day trailing SMS KPI-to-opp) REMOVED from the daily tab [Sam 2026-07-02]: nothing non-daily
-    # belongs on a daily report — a trailing window next to single-day rows invites the exact misread the
-    # window-label patch was fighting. The underlying views (v_sms_campaign_performance / KPI-to-opp) and
-    # get_sms_kpi_to_opp stay for other consumers; only this tab section is dropped.
+    ctx["sms_wa_table"](SMS_D, f"2 · SMS + WHATSAPP — funnel by sub-account · sent → delivered → replies → opps → meetings · day {DAILY}"); add()
+    ctx["sms_cost_table"](SMS_D, f"2b · SMS + WHATSAPP — opt-outs · KPI · cost · day {DAILY}"); add()
+    # The OLD §2b (7-day trailing SMS KPI-to-opp) stays REMOVED [Sam 2026-07-02, DR-10]: nothing
+    # non-daily belongs on a daily report. The §2b slot above is a SAME-DAY companion table (every
+    # column = the report day). get_sms_kpi_to_opp / sms_kpi_table stay for other consumers.
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
     ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (CONNECTED active capacity; disconnected/paused inboxes excluded) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · split = account-grain sending_account_daily when the report day has loaded, else the live §1b infra split (unresolved shows '—', never 0) · no-lag · census {SENDING_CENSUS}"); add()
     ctx["partner_table"](PARTNER_D, PARTNER_D_TOTAL, f"5 · BOOKINGS BY PARTNER · day {DAILY}"); add()
@@ -1774,7 +1982,10 @@ def daily(ctx):
         "§1b EMAIL infra rows exclude non-email bookings: SMS / Call / WhatsApp Funding meetings (the bulk of §1b's 'no resolvable email campaign' note) are correctly NOT in the OTD/Google rows. On OTD-churn days a few genuine EMAIL meetings also fall into 'unattributed' — their campaign was created or deleted intraday, so it doesn't map to a live tagged campaign — so §1b Email→meeting understates slightly that day. Not a data error.",
         f"§4 Actual OTD/Google split: on the ~10pm-ET evening render the report-day account feed (core.sending_account_daily) has not loaded yet, so the split is the LIVE §1b infra resolution (same Instantly source as Actual total). Subsequence + deleted-campaign sends fall to an unsplit residual, so OTD+Google can be LESS than Actual total; '—' means the split was unresolvable for that workspace on {DAILY} (never a fake 0). It heals to the complete account-grain split at the 12:45Z backfill re-render. Actual total includes Outlook, which is excluded from the split and from Expected.",
         "§6 reply-time is BLENDED human + AIM (AI-drafted): AIM replies ship through the same inboxes with no distinguishing flag, so a fast median reflects AI-assisted answering, not desk speed — a workspace with little/no AIM (e.g. Renaissance 1 DFY) reads slower for that reason. WEEKLY-only: the daily window is nightly-fed (D-1) and structurally empty on day D. When the email-reply sync frontier lags into the 7-day window, the weekly n/median are structurally deflated (SYNC-7 drain) — a '⚠ WEEKLY UNDERSTATED' row flags that when it happens; it is not a desk-speed change.",
-        "§2 SMS: Renaissance 3 (webform) sends route via the AIM API, which is NOT in the campaign feed, so Ren3 Sent (and any Sent-derived ratio) undercounts. A '—' cost cell means the all-in Sendivo billing row back-fills after the nightly.",
+        "§2 Sent counts ALL messages — blasts + follow-ups + AIM conversational (ratified inclusive basis [Sam 07-02]: we pay for every message equally; TKT-3 REVERSED). The Sendivo dashboard is the narrower BLAST-ONLY view and its UI hides AIM API sends — reconcile via §2's blast-split line; never expect the dashboard to equal §2 Sent.",
+        "§2 Delivered/Fail = per-message CARRIER status from the nightly Sendivo /sms/logs pull (D-1): '—' on the evening render, back-fills at the 12:45Z re-render. Delivered is NEVER approximated as sent, and Sendivo's '# contacts − SMS sent' gap = SKIPPED AT SEND (invalid numbers etc.), NOT undelivered. The real-time outbound-status webhook has been dead since 06-09 (vendor restore ask open) — the D-1 log pull is the delivery source until then.",
+        "§2 Opps = Qwen positive-intent classifier over human (non-opt-out) replies — the ONLY SMS opp signal ('positive replies' is a BANNED misnomer: it counted ALL non-opt-out replies, ~8x inflation). Qwen lags ~2-3d → a day's Opps render '—' until ≥90% classified, healing on the D-2/D-3 backfill re-renders. WhatsApp replies have no classifier yet → WA Opps '—'.",
+        "§2b Cost: SMS = ACTUAL all-in Sendivo billing (total_spend). WhatsApp = MODEL $0.072 × delivered (paid on delivery only; no Iskra billing feed exists) — labelled and never summed into the SMS actual total. NO client-facing price concept exists. Margin-math flat rates: SMS $0.0072/msg paid sent-or-not · WA $0.072/msg paid on delivery.",
         "Evening-render timing: meetings read LOW on the ~10pm-ET render — the IM booking backlog clears ~midnight and bookings after the ~9pm snapshot miss it. The tab trues up at the 12:45Z backfill re-render the next day.",
     ])
 

@@ -85,14 +85,40 @@
           { "id": 14603, "label": "RG3 webform",                  "channel": "RG3 webform" }
         ]
       },
-      "wrong_sources": ["sendivo delivery_metrics returns the DEFAULT account (~178) regardless of sub_account_id — NOT the SMS-sent source"],
-      "delivered_failed": "§2 SMS Delivered + Fail% [added 2026-07-01, Jun-30 accuracy pass] = warehouse main.v_sms_campaign_performance summed per sub_account_name ('Renaissance 1/2/3') for the day (SMS delivery is NOT ~100% — 06-30 Ren1 ran 14% failed). Sent stays this billing quantity. Fail-soft: no view row for a sub/day (same-day sync lag) -> delivered≈sent, Fail% '—' (the pre-07-01 behavior).",
+      "wrong_sources": ["sendivo delivery_metrics returns the DEFAULT account (~178) regardless of sub_account_id — NOT the SMS-sent source", "the Sendivo dashboard/UI: BLAST-ONLY and hides AIM API sends — never expect it to equal §2 Sent (reconcile via the §2 blast-split line)"],
+      "inclusive_basis": "RATIFIED [Sam 07-02, TKT-3 REVERSED]: §2 Sent = the day's TOTAL messages — blasts + follow-ups + AIM conversational (we pay for every message equally; billing quantity is exactly this total, verified Jul-1 Ren3: 71,474 blast + 4,520 other = 75,992 billed). The fix lives in the SYNC/renderer, never a hand-edit.",
+      "delivered_failed": "§2 SMS Delivered + Fail% = warehouse main.v_sms_campaign_performance per sub_account_name for the day — per-message CARRIER status from the nightly /sms/logs pull (statuses final at pull time; verified to reconcile the Sendivo dashboard delivery %). D-1: no/partial view row -> Delivered/Fail render '—' + WARN and back-fill at the 12:45Z re-render [2026-07-03 doctrine — the old delivered≈sent fallback was a guessed value, removed]. Sendivo '# contacts − SMS sent' = skipped at send, NOT undelivered. Real-time outbound-status webhook dead since 06-09 (vendor restore ask open).",
+      "reconciliation": null
+    },
+
+    "sms_blast_reconcile": {
+      "section": "§2 blast-split reconcile line",
+      "what": "Blast-only vs follow-up/AIM split per sub-account for the day, so §2's inclusive Sent reconciles to the Sendivo dashboard's blast-only view (TKT-3 REVERSED [Sam 07-02]). blast_id populated on real sends since 2026-06-26.",
+      "source_type": "warehouse",
+      "warehouse": { "relation": "main.v_sms_blast_performance", "key_columns": ["metric_date", "sub_account_name", "blast_id", "sent", "delivered"], "rule": "blast_id IS NOT NULL = blasts (dashboard basis); NULL = follow-ups/nudges + AIM conversational + system. D-1 (nightly /sms/logs) -> 'pending' until loaded." },
+      "reconciliation": null
+    },
+
+    "sms_opps_daily": {
+      "section": "§2 Opps (Qwen) + Opp % + Opp→mtg %",
+      "what": "Daily OPPORTUNITIES stage of the ratified funnel = Qwen positive-intent verdicts over the day's human (non-opt-out) replies, attributed to the sub-account via the inbound receipt's own sub_account_name. The ONLY SMS opp signal — v_sms_campaign_performance.positive_replies is a BANNED misnomer (ALL non-opt-out replies, ~8x inflation) and must never be rendered.",
+      "source_type": "warehouse",
+      "warehouse": { "relation": "derived.sms_reply_is_positive_qwen", "key_columns": ["reply_id", "received_at", "is_positive"], "join": "reply_id -> main.raw_sendivo_inbound.inbound_message_id -> sub_account_name", "honest_lag_gate": "Qwen runs ~2-3d behind (09:00Z incremental -> seed -> next nightly): a sub's day renders ONLY when >=90% of its human replies carry a verdict, else '—' (100%-or-wipe); heals on the D-2/D-3 backfill re-renders. WhatsApp replies have NO classifier -> WA Opps always '—' (gap-listed)." },
+      "reconciliation": null
+    },
+
+    "r3_webform_funnel": {
+      "section": "§2 Ren3 web-form funnel note",
+      "what": "Ren3's canonical web-form funnel for the ET day: repliers -> warm positives -> app links -> form fills.",
+      "source_type": "api",
+      "api": { "service": "comms supabase (LIVE)", "endpoint": "SELECT ... FROM comms.v_r3_daily_funnel WHERE et_day = <report day>", "key_ref": "COMMS_SUPABASE_DB_URL" },
+      "wrong_sources": ["comms.message (drops suppressed STOP inbounds since 07-01, ~34% of raw — reply/opt-out totals must read webhook_receipt-based sources)"],
       "reconciliation": null
     },
 
     "sms_cost_daily": {
       "section": "§2 SMS Cost $ (actual) + Cost/mtg·form",
-      "what": "Actual carrier-billed SMS-fee $ per sub-account per day [backlog A1/A3/A4, added 2026-07-01]. Cost/mtg·form = day cost ÷ that row's Meetings/Webform (Ren1/Ren2: meetings; Ren3: web-form fills); '—' when the unit count is 0 (never divide-by-zero). WhatsApp has NO cost feed (iskra cost_usd 100% NULL; the $0.07/msg model is GATED, no modeled numbers on the report) -> always '—'.",
+      "what": "Actual all-in Sendivo $ (total_spend) per sub-account per day [DR-3 basis]. Cost/mtg·form = day cost ÷ that row's Mtgs/Webform; '—' when the unit count is 0. WhatsApp = MODEL $0.072 × delivered (paid on delivery only; NO Iskra billing feed exists — rendered WITH an explicit model label [Sam 07-02], never summed into the SMS actual total). NO client-facing price concept exists (the older client-facing $0.07×delivered framing is DEAD). Doctrine flat rates for per-blast/margin math: SMS $0.0072/msg paid sent-or-not · WA $0.072/msg paid on delivery.",
       "source_type": "warehouse",
       "warehouse": {
         "relation": "main.raw_sendivo_billing_daily",
@@ -103,16 +129,16 @@
       "reconciliation": null
     },
 
-    "sms_replies_human": {
-      "section": "§2 SMS Human RR",
-      "what": "Human (non-opt-out) inbound SMS replies per sub-account.",
+    "sms_replies_total": {
+      "section": "§2 Replies (total) + §2b Opt-outs",
+      "what": "TOTAL inbound SMS replies (incl. opt-outs) + opt-out count per sub-account [doctrine 07-02: the funnel stage is TOTAL replies; there is NO positive-reply metric for SMS/WA]. Source basis = comms.webhook_receipt sendivo_inbound receipts (raw_sendivo_inbound mirrors them) — NOT comms.message, which drops suppressed STOP inbounds (~34% of raw since 07-01).",
       "source_type": "warehouse",
       "warehouse": { "relation": "main.raw_sendivo_inbound", "key_columns": ["sub_account_name", "received_at", "is_opt_out"] },
       "reconciliation": null
     },
 
     "sms_kpi_to_opp": {
-      "section": "§2b SMS KPI-to-opp (texts per opportunity, by workspace)",
+      "section": "(NOT RENDERED — the trailing-window §2b was removed from the daily tab 2026-07-02 [DR-10]; §2b is now a same-day opt-outs·KPI·cost table. This entry + view stay for other consumers/--dry.)",
       "what": "SMS sent / opps / sent-per-opp per workspace (Ren1 Funding / Ren2 Pre-IPO / Ren3 webform). Sent/opp is THE number gating the web-form-vs-meeting economics decision (Ido: '~5,000 and web apps don't pencil'). opp = positive-intent inbound SMS reply = the CURRENT-native notion derived.sms_reply_is_positive_qwen.is_positive (do NOT build a bespoke reclassifier [Sam 2026-06-30]).",
       "source_type": "warehouse",
       "warehouse": {
@@ -146,6 +172,8 @@
       "source_type": "warehouse",
       "warehouse": { "relation": "main.v_sms_dash_wa_daily", "filter": "channel='whatsapp'", "key_columns": ["sent", "delivered", "failed", "replies_total", "metric_date"] },
       "meetings_source": "main.raw_im_bookings, channel == 'WhatsApp' [cutover 2026-06-30; was the Funding-Form sheet]",
+      "cost_model": "MODEL $0.072 × delivered [Sam 07-02, FINAL: WA is paid ONLY on delivery] — no Iskra billing feed exists (raw cost 100% NULL); labelled 'model' in §2b, excluded from the SMS actual TOTAL. Vendor ask (Arseny): a real Iskra billing/cost feed.",
+      "opps": "NO Qwen classifier over Iskra/WA replies yet -> §2 WA Opps renders '—' (gap-listed; internal build).",
       "reconciliation": null
     },
 
