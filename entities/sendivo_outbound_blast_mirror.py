@@ -29,6 +29,21 @@ table, so the nightly full projection is cheap in the comms_mirror window.
 
 Only rows with a non-null blast_id are mirrored (the attribution-relevant subset;
 no-blast rows carry no attribution signal and v_sendivo_outbound_blast filters them).
+
+Completeness boundary (id-only anti-join, deliberate): a row is (re)mirrored purely
+on whether its sendivo_log_id is present yet. The realistic upstream correction — a
+row that had blast_id NULL and later gets it backfilled — IS captured, because while
+blast_id was NULL the row was filtered out and its id was never mirrored, so the first
+run after the backfill picks it up. The ONE case not captured is an in-place value->value
+re-tag of an ALREADY-mirrored message (its blast_id changed to a different non-null id);
+per-message blast_id is set once at send time, so this is assumed immutable. If that ever
+becomes real, switch to a content-aware anti-join or add a reconciliation pass — do NOT
+fold sent_at into the key (the TIMESTAMPTZ postgres<->duckdb round-trip would make every
+row look changed and re-insert the whole table nightly).
+
+Grain: raw layer is per-message append-only; v_sendivo_outbound_blast de-dups to the
+latest row per sendivo_log_id (WHERE blast_id IS NOT NULL), and core.v_sms_booking_attribution
+consumes that VIEW, not this raw table (verified DDL 1050/1051).
 """
 
 from __future__ import annotations
