@@ -1323,49 +1323,73 @@ def get_smswa_reply():
     FRESHNESS (structural, unlike email's incident-drain): the SMS response side is nightly-
     recovered Sendivo logs (worker 08:15/13:30Z -> warehouse next 03:45Z) = ~D-2 at render; WA is
     ~D-1. The newest window days read as unanswered and BACK-FILL — per-channel UNDERSTATED warns
-    fire only past the structural lag (SMS >2, WA >=2 missing biz-days). SMS history is floored at
+    fire only past the structural lag (3+ missing biz-days, both channels; and loudly when NO
+    answered pair synced at all despite population). SMS history is floored at
     2026-06-27 (reply-capture era — earlier capture was partial and is wiped, never blended;
     see deliverables/2026-07-02-smswa-program/ITEM3-SLA/COVERAGE-AUDIT.md).
 
     Returns rows in _SMSWA_DESKS order: (label, population, n_answered, med_biz, avg_biz, med_raw).
     No inline fallback path (unlike email §6 there is no second source): pre-first-build the table
-    is empty/absent -> _safe fallback zeros + the sub-block's empty-state note."""
+    is empty/absent -> _safe fallback zeros + the sub-block's empty-state note.
+
+    Aggregated SERVER-SIDE (code-review 07-03): every output is an aggregate, and a row-level pull
+    of answered+unanswered pairs (~tens of k / 11 days, growing with send volume) would sit on a
+    collision course with the read API's 100k truncation cap — wq raises on truncation -> _safe ->
+    the whole sub-block silently collapses to the empty-state note past a volume threshold nobody
+    watches. The grouped pull returns O(#desks) rows and is immune."""
     global _SMSWA_WARNS
     _SMSWA_WARNS = []
     wk0 = _d - datetime.timedelta(days=6)
     lo = (wk0 - datetime.timedelta(days=4)).isoformat()   # pull below wk0 so the frontier is detectable
     rows = wq(f"""
-      SELECT desk, channel, clock_open_date, biz_latency_minutes, raw_latency_minutes
+      SELECT desk,
+             count(*)                    FILTER (WHERE clock_open_date >= DATE '{wk0.isoformat()}') AS pop,
+             count(biz_latency_minutes)  FILTER (WHERE clock_open_date >= DATE '{wk0.isoformat()}') AS n_ans,
+             median(biz_latency_minutes) FILTER (WHERE clock_open_date >= DATE '{wk0.isoformat()}') AS med_biz,
+             avg(biz_latency_minutes)    FILTER (WHERE clock_open_date >= DATE '{wk0.isoformat()}') AS avg_biz,
+             median(raw_latency_minutes) FILTER (WHERE clock_open_date >= DATE '{wk0.isoformat()}') AS med_raw,
+             max(clock_open_date)        FILTER (WHERE biz_latency_minutes IS NOT NULL)             AS frontier
       FROM core.sla_reply_time_smswa
-      WHERE clock_open_date >= DATE '{lo}' AND clock_open_date <= DATE '{_d.isoformat()}'""")
-    per = {}        # desk -> {"pop": int, "biz": [..], "raw": [..]}
+      WHERE clock_open_date >= DATE '{lo}' AND clock_open_date <= DATE '{_d.isoformat()}'
+      GROUP BY desk""")
+    per = {r[0]: r[1:] for r in rows}   # desk -> (pop, n_ans, med_biz, avg_biz, med_raw, frontier)
+    desk_channel = {desk: ch for desk, _label, ch in _SMSWA_DESKS}
     frontier = {}   # channel -> max clock-open date with >=1 ANSWERED pair
-    for desk, channel, d_val, biz, raw in rows:
-        d = d_val if isinstance(d_val, datetime.date) else datetime.date.fromisoformat(str(d_val)[:10])
-        if biz is not None and (channel not in frontier or d > frontier[channel]):
-            frontier[channel] = d
-        if d < wk0 or d > _d:
+    haspop = {}     # channel -> any population rows at all in the pulled range
+    for desk, vals in per.items():
+        ch = desk_channel.get(desk)
+        if ch is None:
             continue
-        b = per.setdefault(desk, {"pop": 0, "biz": [], "raw": []})
-        b["pop"] += 1
-        if biz is not None:
-            b["biz"].append(float(biz)); b["raw"].append(float(raw))
-    for channel, label, thresh in (("sms", "SMS", 3), ("whatsapp", "WhatsApp", 2)):
+        if (vals[0] or 0) > 0:
+            haspop[ch] = True
+        f_val = vals[5]
+        if f_val is None:
+            continue
+        d = f_val if isinstance(f_val, datetime.date) else datetime.date.fromisoformat(str(f_val)[:10])
+        if ch not in frontier or d > frontier[ch]:
+            frontier[ch] = d
+    # Threshold 3 for BOTH channels (code-review 07-03): the frontier is "last clock-open day with
+    # an ANSWERED pair", which on a ~12-26%-answered channel conflates "responses not synced" with
+    # "nothing warranted an answer" — one legit zero-answer business day + the structural D-1/D-2
+    # lag must not false-fire. 3+ missing business days = a real multi-day sync stall.
+    biz_days = [dd for dd in (wk0 + datetime.timedelta(n) for n in range((_d - wk0).days + 1))
+                if dd.isoweekday() <= 5]
+    for channel, label in (("sms", "SMS"), ("whatsapp", "WhatsApp")):
         fr = frontier.get(channel)
         if fr is None:
-            continue   # no answered pairs at all -> the empty-state note covers it
-        missing = [dd for dd in (wk0 + datetime.timedelta(n) for n in range((_d - wk0).days + 1))
-                   if dd.isoweekday() <= 5 and dd > fr]
-        if len(missing) >= thresh:
+            # Population exists but NOT ONE answered pair in the entire 11-day pull = the response
+            # sync is stalled beyond the pull horizon (the worst case must be the loudest, not
+            # silent — code-review 07-03). No population at all -> the empty-state note covers it.
+            if haspop.get(channel):
+                _SMSWA_WARNS.append((label, None, len(biz_days)))
+            continue
+        missing = [dd for dd in biz_days if dd > fr]
+        if len(missing) >= 3:
             _SMSWA_WARNS.append((label, fr, len(missing)))
     out = []
     for desk, label, _ch in _SMSWA_DESKS:
-        b = per.get(desk, {"pop": 0, "biz": [], "raw": []})
-        v = b["biz"]
-        out.append((label, b["pop"], len(v),
-                    statistics.median(v) if v else None,
-                    sum(v) / len(v) if v else None,
-                    statistics.median(b["raw"]) if b["raw"] else None))
+        pop, n_ans, med_b, avg_b, med_r, _f_val = per.get(desk, (0, 0, None, None, None, None))
+        out.append((label, int(pop or 0), int(n_ans or 0), med_b, avg_b, med_r))
     return out
 
 # ============================ source self-verify (the DATA-TICKET fix) ============================
@@ -1703,6 +1727,8 @@ if DRY:
     print("§4 TRUTH (ws, otd_exp, goog_exp, tot_exp, actual, otd_actual, goog_actual):"); [print("  ", x) for x in SENDING_TRUTH]
     print("§5 PARTNER:", PARTNER_D, "total", PARTNER_D_TOTAL)
     print("§6 IM-REPLY (ws, d_n,d_med,d_avg, w_n,w_med,w_avg):"); [print("  ", x) for x in IMREPLY_D]
+    print("§6 SMS/WA REPLY (label, pop, n_ans, med_biz, avg_biz, med_raw):"); [print("  ", x) for x in SMSWA_D]
+    print("§6 SMS/WA warns:", _SMSWA_WARNS)
     print("Pre-IPO meetings:", PREIPO_MTG)
     print("WhatsApp Pre-IPO meetings (yellow block):", WA_PREIPO_MTG)
     sys.exit(0)
@@ -1957,7 +1983,10 @@ def build_and_write(tab, build_fn):
         # on day D — an always-empty block that reads as noise. The weekly-7d window carries the signal.
         # (The Monthly/MTD block was already dropped [DR-10, Sam 07-01] — no MTD on a daily tab.)
         W = 4
-        si = add([label]); sec.append(si); row_ncol[si] = W
+        si = add([label]); sec.append(si)
+        # Section-title band spans the WIDEST block in §6 (the 7-col SMS/WA sub-block below), not
+        # the 4-col email block, so the blue band doesn't stop mid-table (code-review 07-03).
+        row_ncol[si] = 7
         hr = add(["Workspace", "Weekly (7d) — n", "Median min", "Avg min"]); th.append(hr); th_ncol[hr] = W
         for name, dn, dmed, davg, wn, wmed, wavg in rows_data:
             ri = add([name, wn, mins(wmed), mins(wavg)])
@@ -1998,30 +2027,42 @@ def build_and_write(tab, build_fn):
         # answer — a median alone would read as "we answer everything fast"]. Source:
         # core.sla_reply_time_smswa (DDL 1077); definition + validation (22/22 hand-checked
         # timelines): deliverables/2026-07-02-smswa-program/ITEM3-SLA/.
-        W2 = 6
+        W2 = 7
         hr2 = add(["SMS · WhatsApp (same clock; non-opt-out first replies)",
-                   "Weekly (7d) — n answered", "Median biz-min", "Avg biz-min",
-                   "Median RAW min", "Answered %"])
+                   "Weekly (7d) — n answered", "of first replies", "Answered %",
+                   "Median biz-min", "Avg biz-min", "Median RAW min"])
         th.append(hr2); th_ncol[hr2] = W2
         for label2, pop, n_ans, med_b, avg_b, med_r in smswa_rows:
+            # Population renders as its own column (code-review 07-03): with n_answered=0 the
+            # denominator is unrecoverable from Answered% alone — a 500-reply desk nobody answered
+            # must not look identical to a 1-reply desk nobody answered.
             pct = (float(n_ans) / float(pop)) if pop else "—"
-            ri = add([label2, n_ans, mins(med_b), mins(avg_b), mins(med_r), pct])
+            ri = add([label2, n_ans, pop, pct, mins(med_b), mins(avg_b), mins(med_r)])
             data.append(ri); row_ncol[ri] = W2
-            pctcells.append((ri, 5))
-        if not any((r[2] or 0) for r in smswa_rows):
+            pctcells.append((ri, 3))
+        # Empty-state keyed on POPULATION, not answered-n (code-review 07-03): population==0 means
+        # the fact is absent (pre-first-nightly-build) or the pull failed; population>0 with zero
+        # answered is a REAL 0% answered week and must render as data, not as a pipeline error.
+        if not any((r[1] or 0) for r in smswa_rows):
             note = add(["(!) SMS/WA reply-time rendered EMPTY — core.sla_reply_time_smswa is absent "
                         "(pre-first-nightly-build) or the pull failed (see render stderr); back-fills "
                         "on the next nightly"])
             data.append(note); row_ncol[note] = W2
         # Per-channel UNDERSTATED warn — same semantic as the email SYNC-7 warn above, but the lag
         # here is STRUCTURAL (SMS response side = nightly-recovered Sendivo logs, ~D-2 at render;
-        # WA ~D-1), so thresholds sit past the structural norm (SMS >2, WA >=2 missing biz-days)
-        # and the newest window days back-fill by design.
+        # WA ~D-1), so the threshold (3 missing biz-days, both channels) sits past the structural
+        # norm plus one legit zero-answer day; the newest window days back-fill by design.
         for ch_label, fr, nmiss in _SMSWA_WARNS:
-            warn = add(["(⚠ %s WEEKLY UNDERSTATED — responses synced only through %s; %d of the 7 "
-                        "window business-days have zero synced responses, so n/Answered%% are "
-                        "deflated on the newest days — structural sync lag, NOT a desk-speed "
-                        "change. Back-fills on the next nightly.)" % (ch_label, fr.isoformat(), nmiss)])
+            if fr is None:
+                warn = add(["(⚠ %s WEEKLY UNDERSTATED — first replies exist but NO answered pair has "
+                            "synced in the entire pull range: the response sync looks stalled beyond "
+                            "the window (or genuinely nothing was answered). Check the recovered-log/"
+                            "Iskra sync before reading these rows as desk behavior.)" % ch_label])
+            else:
+                warn = add(["(⚠ %s WEEKLY UNDERSTATED — responses synced only through %s; %d window "
+                            "business-days have zero synced responses, so n/Answered%% are deflated "
+                            "on the newest days — structural sync lag, NOT a desk-speed change. "
+                            "Back-fills on the next nightly.)" % (ch_label, fr.isoformat(), nmiss)])
             data.append(warn); row_ncol[warn] = W2
     def infra_table(infra, header_label):
         # §1b — one row PER INFRASTRUCTURE, summed across ALL workspaces (Sam 2026-06-30; Google == reseller).
