@@ -1438,7 +1438,11 @@ def build_and_write(tab, build_fn):
         # exact failure mode the wq truncation guard exists to prevent).
         if not any((r[1] or 0) for r in rows_data):
             if any((r[4] or 0) for r in rows_data):
-                note = add(["(no answered first-reply pairs clocked to %s yet — core.email_message "
+                # Only claim "weekly carries the signal" when the weekly ISN'T itself eroded by the
+                # drain — otherwise the WEEKLY-UNDERSTATED warn below is the authoritative note and
+                # this reassurance would contradict it (the exact confusion this whole guard fixes).
+                note = None if _IMREPLY_WARN else add([
+                            "(no answered first-reply pairs clocked to %s yet — core.email_message "
                             "is nightly-fed (D-1 at best by design), so day-D's daily cell is "
                             "structurally empty on day D and back-fills on later renders; weekly "
                             "carries the signal)" % DAILY])
@@ -1446,7 +1450,8 @@ def build_and_write(tab, build_fn):
                 note = add(["(!) §6 rendered EMPTY for %s — the warehouse pull failed or returned "
                             "no pairs at all (see render stderr); this is NOT the normal D-1 "
                             "sync-lag pattern" % DAILY])
-            data.append(note); row_ncol[note] = W
+            if note is not None:                       # None = suppressed (weekly-understated warn owns the message)
+                data.append(note); row_ncol[note] = W
         # WEEKLY-INCOMPLETENESS WARN (2026-07-02): fires when the email_message sync frontier lags
         # ≥2 business-days into the trailing-7d window, so the weekly n/median are structurally
         # deflated (not a real speed change). Distinct from the daily-empty note above, which only
