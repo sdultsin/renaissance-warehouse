@@ -199,18 +199,24 @@ def run(ctx: RunContext) -> PhaseResult:
     db.executemany(
         f"INSERT INTO raw_im_bookings ({col_list}) VALUES ({placeholders})", payload
     )
-    # 2026-07-03: portal is LEAN (live bookings, >= 2026-06-01). Re-merge the pinned pre-cutover
+    # 2026-07-03: portal went LEAN (live bookings, >= 2026-06-01). Re-merge the pinned pre-cutover
     # history archive INTO this live snapshot so max(_snapshot_date) readers (render_mtd /
     # render_daily / conversion_event / v_sms_booking_phone_imb) still see full pre-cutover history.
     # The archive (_source=portal_im_bookings_archive, pinned _snapshot_date=2026-05-31) is preserved
     # across pulls by the DELETE above (keeps the FROZEN 2026-05-31 date) and never itself becomes
-    # max(_snapshot_date). Pre-cutover only (< 2026-06-01) -> no overlap with the portal pull.
+    # max(_snapshot_date).
+    # 2026-07-06: pre-June history was RESTORED into the portal (source='ff-history-restore-20260706',
+    # original ids), so the pull may now CONTAIN pre-cutover rows — the id anti-join below makes the
+    # re-merge overlap-safe in both worlds: portal full -> inserts ~0; portal lean(ed again) -> inserts
+    # the full archive. Without it a full portal doubles pre-June in the published snapshot.
     db.execute(
         f"INSERT INTO raw_im_bookings ({col_list}) "
         f"SELECT {', '.join(SOURCE_COLUMNS)}, ?, ?, ? FROM raw_im_bookings "
         f"WHERE _source = 'portal_im_bookings_archive' "
-        f"AND try_cast(\"date\" AS DATE) < DATE '2026-06-01'",
-        [snapshot_date, SOURCE_TAG, loaded_at],
+        f"AND try_cast(\"date\" AS DATE) < DATE '2026-06-01' "
+        f"AND id NOT IN (SELECT id FROM raw_im_bookings "
+        f"               WHERE _snapshot_date = ? AND _source = ? AND id IS NOT NULL)",
+        [snapshot_date, SOURCE_TAG, loaded_at, snapshot_date, SOURCE_TAG],
     )
     db.execute("COMMIT")
 
