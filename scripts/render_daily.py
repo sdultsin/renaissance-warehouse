@@ -1222,6 +1222,40 @@ def _im_pairs_from_email(wk0, day0):
         out.append((ws, _clock_open_date(p, tz), _biz_minutes(p, r, tz)))
     return out
 
+# §6 ANSWERABLE denominator (2026-07-03, item-2): per-ws count of first prospect replies
+# (seq_in_thread=1) MINUS the opt-out/stop/unsub class, so a desk's Answered% is fair — autos and
+# opt-outs never count against it. Opt-out = the FIRST reply body matches a standard unsubscribe/
+# not-interested pattern (bare "stop" EXCLUDED — too many false positives; ~26% of first replies
+# match). Reads the canonical fact core.sla_reply_time (clock_open_date + population, unanswered
+# rows KEPT) joined to core.email_message for the first-reply body. Empty on the inline-fallback
+# path (fact unavailable) -> those cells render "-".
+_IM_OPTOUT_LIKE = " OR ".join(
+    f"lower(f.body_text) LIKE '%{p}%'" for p in
+    ("unsubscribe", "remove me", "remove from", "not interested", "opt out", "opt-out",
+     "take me off", "do not contact", "do not email", "please remove", "unsub", "leave me alone"))
+
+def _im_answerable_by_ws(wk0, day0):
+    """{ws_slug: n_answerable} = first prospect replies in the weekly window MINUS opt-outs."""
+    try:
+        rows = wq(f"""
+          WITH firsts AS (
+            SELECT thread_id, body_text,
+                   row_number() OVER (PARTITION BY thread_id ORDER BY message_at, message_id) AS rn
+            FROM core.email_message WHERE ue_type=2 AND thread_id IS NOT NULL)
+          SELECT s.workspace_slug,
+                 count(*) - count(*) FILTER (WHERE ({_IM_OPTOUT_LIKE}) AND s.biz_latency_minutes IS NULL) AS answerable
+          FROM core.sla_reply_time s
+          JOIN firsts f ON f.thread_id=s.thread_id AND f.rn=1
+          WHERE s.seq_in_thread=1
+            AND s.clock_open_date >= DATE '{wk0.isoformat()}'
+            AND s.clock_open_date <= DATE '{day0.isoformat()}'
+            AND s.workspace_slug IN ({SLUGS_SQL})
+          GROUP BY 1""")
+        return {r[0]: int(r[1] or 0) for r in rows}
+    except Exception as e:
+        print(f"WARN §6 answerable/opt-out count failed ({e}); Answered% renders '-'", file=sys.stderr)
+        return {}
+
 def get_im_reply():
     """§6 IM reply-time — reads the CANONICAL warehouse fact core.sla_reply_time (DR-7, 2026-07-03).
     Average/median BUSINESS MINUTES from each thread's FIRST prospect reply to our first reply, per
@@ -1287,10 +1321,11 @@ def get_im_reply():
             _IMREPLY_WARN = (frontier, len(missing))
     def _stats(v):
         return (len(v), statistics.median(v) if v else None, sum(v) / len(v) if v else None)
+    answerable = _im_answerable_by_ws(wk0, day0)
     out = []
     for slug, name in WS:
         b = lats.get(slug, {"d": [], "w": []})
-        out.append((name,) + _stats(b["d"]) + _stats(b["w"]))
+        out.append((name,) + _stats(b["d"]) + _stats(b["w"]) + (answerable.get(slug),))
     return (DAILY, wk), out
 
 # ---- §6 SMS/WA first-reply time (ITEM-3, 2026-07-03 — Sam's decided clock) ----------------------
@@ -1670,7 +1705,7 @@ _SMS_FB = [("Renaissance 1 (SMS)", 0, None, None, 0, None, None, 0, None),
            ("WhatsApp (ISKRA)", 0, None, None, 0, None, None, 0, None)]
 _CLOSE_FB = {"dials": 0, "leads": 0, "connects": 0, "meetings": 0}
 _TRUTH_FB = (None, [(name, 0, 0, 0, 0, None, None) for _, name in WS])  # split None -> "—", never fake 0
-_IMREPLY_FB = ((DAILY, DAILY), [(name, 0, None, None, 0, None, None) for _, name in WS])
+_IMREPLY_FB = ((DAILY, DAILY), [(name, 0, None, None, 0, None, None, None) for _, name in WS])
 
 EMAIL_D = _safe("email", get_email, _EMAIL_FB)
 SMS_D = _safe("sms_wa", get_sms_wa, _SMS_FB)
@@ -1726,7 +1761,7 @@ if DRY:
     print("§3 CLOSE:", CLOSE_D)
     print("§4 TRUTH (ws, otd_exp, goog_exp, tot_exp, actual, otd_actual, goog_actual):"); [print("  ", x) for x in SENDING_TRUTH]
     print("§5 PARTNER:", PARTNER_D, "total", PARTNER_D_TOTAL)
-    print("§6 IM-REPLY (ws, d_n,d_med,d_avg, w_n,w_med,w_avg):"); [print("  ", x) for x in IMREPLY_D]
+    print("§6 IM-REPLY (ws, d_n,d_med,d_avg, w_n,w_med,w_avg, w_answerable):"); [print("  ", x) for x in IMREPLY_D]
     print("§6 SMS/WA REPLY (label, pop, n_ans, med_biz, avg_biz, med_raw):"); [print("  ", x) for x in SMSWA_D]
     print("§6 SMS/WA warns:", _SMSWA_WARNS)
     print("Pre-IPO meetings:", PREIPO_MTG)
@@ -1982,15 +2017,16 @@ def build_and_write(tab, build_fn):
         # (core.email_message) is nightly-fed (D-1 at best), so day-D's daily cell is STRUCTURALLY empty
         # on day D — an always-empty block that reads as noise. The weekly-7d window carries the signal.
         # (The Monthly/MTD block was already dropped [DR-10, Sam 07-01] — no MTD on a daily tab.)
-        W = 4
+        W = 6
         si = add([label]); sec.append(si)
         # Section-title band spans the WIDEST block in §6 (the 7-col SMS/WA sub-block below), not
         # the 4-col email block, so the blue band doesn't stop mid-table (code-review 07-03).
         row_ncol[si] = 7
-        hr = add(["Workspace", "Weekly (7d) — n", "Median min", "Avg min"]); th.append(hr); th_ncol[hr] = W
-        for name, dn, dmed, davg, wn, wmed, wavg in rows_data:
-            ri = add([name, wn, mins(wmed), mins(wavg)])
-            data.append(ri); row_ncol[ri] = W
+        hr = add(["Workspace", "Weekly (7d) — n answered", "of answerable", "Answered %", "Median min", "Avg min"]); th.append(hr); th_ncol[hr] = W
+        for name, dn, dmed, davg, wn, wmed, wavg, wpop in rows_data:
+            pct = (float(wn) / float(wpop)) if wpop else "—"
+            ri = add([name, wn, (wpop if wpop is not None else "—"), pct, mins(wmed), mins(wavg)])
+            data.append(ri); row_ncol[ri] = W; pctcells.append((ri, 3))
         # Empty-state: the weekly window should essentially always carry pairs; if it's empty the pull
         # FAILED (_safe fallback) or returned nothing — say THAT (the old benign D-1 lag line only ever
         # explained the now-removed daily cell, so it's gone with the daily block).
@@ -2244,7 +2280,7 @@ def daily(ctx):
     ctx["close_table"](CLOSE_D, f"3 · CLOSE CRM — warm calling · day {DAILY}"); add()
     ctx["truth_table"](f"4 · SENDING VOLUME TRUTH — expected (CONNECTED active capacity; disconnected/paused inboxes excluded) vs actual sends, split OTD/Google · Actual total = §1 Instantly (incl. Outlook, excluded from the OTD/Google split & from Expected) · split = account-grain sending_account_daily when the report day has loaded, else the live §1b infra split (unresolved shows '—', never 0) · no-lag · census {SENDING_CENSUS}"); add()
     ctx["partner_table"](PARTNER_D, PARTNER_D_TOTAL, f"5 · BOOKINGS BY PARTNER · day {DAILY}"); add()
-    ctx["imreply_table"](IMREPLY_D, SMSWA_D, f"6 · REPLY-TIME — business minutes to first reply · clock runs 12-8pm ET Mon-Fri only (all arrivals count; off-hours clock opens next window) · WEEKLY (7d) only — daily block removed 2026-07-02 (sources are nightly-fed, so day-D daily is structurally empty) · EMAIL by workspace + SMS by desk + WHATSAPP (SMS/WA also show the RAW wall-clock median — answering runs ~24/7, so a biz-median of 0 = answered before the next noon-ET clock-open — and Answered% of non-opt-out first replies, most of which are junk/hostile and correctly get no answer) · BLENDED human+AI on BOTH channels: email AIM replies ship through the same Instantly inboxes with no distinguishing flag (a low-AIM workspace like Renaissance 1 DFY reads slower for that reason, not because the desk is broken); SMS R3 is AIM-served while R1/R2 are manual desks on the same pairing · Grace & Sam"); add()
+    ctx["imreply_table"](IMREPLY_D, SMSWA_D, f"6 · REPLY-TIME — business minutes to first reply · clock runs 12-8pm ET Mon-Fri only (all arrivals count; off-hours clock opens next window) · WEEKLY (7d) only — daily block removed 2026-07-02 (sources are nightly-fed, so day-D daily is structurally empty) · EMAIL by workspace (Answered% = answered ÷ answerable; answerable EXCLUDES the opt-out/stop/unsub class — autos/opt-outs never count against a desk) + SMS by desk + WHATSAPP (SMS/WA also show the RAW wall-clock median — answering runs ~24/7, so a biz-median of 0 = answered before the next noon-ET clock-open — and Answered% of non-opt-out first replies, most of which are junk/hostile and correctly get no answer) · BLENDED human+AI on BOTH channels: email AIM replies ship through the same Instantly inboxes with no distinguishing flag (a low-AIM workspace like Renaissance 1 DFY reads slower for that reason, not because the desk is broken); SMS R3 is AIM-served while R1/R2 are manual desks on the same pairing · Grace & Sam"); add()
     ctx["caveats_table"]("7 · DATA CAVEATS — how to read these numbers (load-bearing; promoted from footnotes)", [
         "§1b EMAIL infra rows exclude non-email bookings: SMS / Call / WhatsApp Funding meetings (the bulk of §1b's 'no resolvable email campaign' note) are correctly NOT in the OTD/Google rows. On OTD-churn days a few genuine EMAIL meetings also fall into 'unattributed' — their campaign was created or deleted intraday, so it doesn't map to a live tagged campaign — so §1b Email→meeting understates slightly that day. Not a data error.",
         f"§4 Actual OTD/Google split: on the ~10pm-ET evening render the report-day account feed (core.sending_account_daily) has not loaded yet, so the split is the LIVE §1b infra resolution (same Instantly source as Actual total). Subsequence + deleted-campaign sends fall to an unsplit residual, so OTD+Google can be LESS than Actual total; '—' means the split was unresolvable for that workspace on {DAILY} (never a fake 0). It heals to the complete account-grain split at the 12:45Z backfill re-render. Actual total includes Outlook, which is excluded from the split and from Expected.",
