@@ -1,4 +1,4 @@
-"""account_tags: nightly per-INBOX tag column from Instantly (COMPLETE REBUILD).
+"""account_tags: nightly per-INBOX tag column from Instantly (ADDITIVE COMPLETE REFRESH).
 
 Populates core.account_tags (DDL 1026/98): ONE row per inbox, with every tag that inbox
 carries in Instantly rolled into a single `tags` column (verbatim, no curation). This is
@@ -23,11 +23,14 @@ entities/account_tag.py already uses for workflow tags:
   1. Per workspace, list every custom tag, then GET /accounts?tag_ids=<id> per tag. This is a
      SERVER-SIDE filter that returns only CURRENT accounts (no historical-edge bloat), WITH the
      account object — so we build the inbox→{labels} map directly, completely, cheaply.
-  2. FULL-REPLACE per workspace (the DDL's intended design): delete the inboxes that no longer
-     carry any tag, then upsert the current set. Removals ARE reflected; nothing lags.
-  3. A failed/degraded workspace keeps its LAST-GOOD rows — a per-workspace clean-pull gate plus
-     a shrink guard (a fresh pull returning < MIN_KEEP of the prior count is treated as a partial
-     pull and skipped), so one bad pull can never wipe a workspace.
+  2. ADDITIVE refresh per workspace: DELETE only the inboxes in THIS pull, then re-INSERT them with
+     their current tags — so a LIVE inbox's tag changes (add or remove) are reflected. Rows for
+     inboxes no longer present (ghosts of moved/deleted accounts) are KEPT: account_tags is the
+     permanent per-inbox tag record; the domain/inbox archive lives in core.sending_account_batch.
+     Deletes nothing historical.
+  3. Because it never shrinks, a bad/partial pull can only fail to refresh some inboxes — never wipe
+     a workspace, so no shrink guard is needed. A workspace whose whole pull errors is skipped
+     (its rows stay last-good).
 
 Workspaces are pulled with BOUNDED CONCURRENCY (each a distinct key). The "serial within a
 workspace" discipline still holds — one cursor at a time per key — this only overlaps DIFFERENT
@@ -50,13 +53,10 @@ from sources.instantly import InstantlyClient, InstantlyError
 
 logger = logging.getLogger("entities.account_tags")
 
-# Complete-rebuild tuning (env-overridable).
-#   WORKERS   — workspaces pulled CONCURRENTLY (each a distinct key). Bounded so the aggregate
-#               IP rate stays gentle; per-workspace paging is still serial (one cursor at a time).
-#   MIN_KEEP  — guard ratio: skip the replace for a workspace whose fresh pull returns fewer than
-#               this fraction of its prior row count (a degraded/partial pull) → keep last-good.
+# Concurrency tuning (env-overridable).
+#   WORKERS — workspaces pulled CONCURRENTLY (each a distinct key). Bounded so the aggregate
+#             IP rate stays gentle; per-workspace paging is still serial (one cursor at a time).
 _WORKERS = max(1, int(os.environ.get("WAREHOUSE_ACCOUNT_TAGS_WORKERS", "3")))
-_MIN_KEEP = float(os.environ.get("WAREHOUSE_ACCOUNT_TAGS_MIN_KEEP_RATIO", "0.5"))
 
 
 def register(registry: Registry) -> None:
@@ -139,31 +139,25 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
         canon_slug = uuid_to_slug.get(wid, r.get("ws_slug") or slug)
         by_email = r["by_email"]
         new_n = len(by_email)
-
-        prior = ctx.db.execute(
-            "SELECT count(*) FROM core.account_tags WHERE workspace_uuid = ?", [wid]
-        ).fetchone()[0]
-        # Shrink guard: a fresh pull far smaller than last time = suspected partial/degraded pull
-        # → keep last-good, do not replace. (new_n==0 with prior>0 is caught here too.)
-        if prior > 0 and new_n < prior * _MIN_KEEP:
-            logger.error("account_tags %s: fresh pull %d < %.0f%% of prior %d — keeping last-good "
-                         "(suspected partial pull)", slug, new_n, _MIN_KEEP * 100, prior)
-            failures.append({"slug": slug, "error": f"shrink_guard new={new_n} prior={prior}"})
-            continue
-
         rows = [(email, sorted(labels)) for email, labels in by_email.items()]
         try:
             ctx.db.execute("CREATE OR REPLACE TEMP TABLE _wt (email VARCHAR, tags_arr VARCHAR[])")
             if rows:
                 ctx.db.executemany("INSERT INTO _wt VALUES (?, ?)", rows)
-            # Full-replace this workspace: DELETE all its rows, then bulk INSERT the fresh set.
+            # ADDITIVE refresh: DELETE only the inboxes present in THIS pull, then re-INSERT them
+            # with their current tags. Rows for inboxes no longer in the workspace (ghosts) are KEPT
+            # — account_tags is the permanent per-inbox tag record; the domain/inbox archive lives in
+            # core.sending_account_batch. Deletes nothing historical, and never shrinks, so a bad or
+            # partial pull can only fail to refresh some live inboxes — it can never wipe a workspace
+            # (hence no shrink guard needed). A workspace whose whole pull errors is skipped upstream.
             # NOT `ON CONFLICT DO UPDATE`, and NOT a same-transaction delete+reinsert — BOTH trip a
-            # DuckDB ART-index INTERNAL "duplicate key" abort on core.account_tags (proven 2026-07-01;
-            # see scripts/backfill_account_tags_full.py). Statements AUTO-COMMIT (no BEGIN/COMMIT): the
-            # DELETE commits first so the INSERT sees fresh keys. Removals ARE reflected (full delete);
-            # the shrink guard above already refuses to run this on a suspiciously-small pull, so the
-            # brief post-DELETE window can't wipe a workspace from a bad pull.
-            ctx.db.execute("DELETE FROM core.account_tags WHERE workspace_uuid = ?", [wid])
+            # DuckDB ART-index INTERNAL "duplicate key" abort on this table (proven 2026-07-01; see
+            # scripts/backfill_account_tags_full.py). AUTO-COMMIT: the DELETE commits before the INSERT
+            # so the re-INSERT sees fresh keys.
+            ctx.db.execute(
+                "DELETE FROM core.account_tags "
+                "WHERE workspace_uuid = ? AND email IN (SELECT email FROM _wt)", [wid]
+            )
             ctx.db.execute(
                 """
                 INSERT INTO core.account_tags
