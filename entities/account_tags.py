@@ -153,7 +153,7 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
 
         rows = [(email, sorted(labels)) for email, labels in by_email.items()]
         try:
-            ctx.db.execute("CREATE OR REPLACE TEMP TABLE _wt (email VARCHAR, arr VARCHAR[])")
+            ctx.db.execute("CREATE OR REPLACE TEMP TABLE _wt (email VARCHAR, tags_arr VARCHAR[])")
             if rows:
                 ctx.db.executemany("INSERT INTO _wt VALUES (?, ?)", rows)
             # Full-replace semantics WITHOUT a wipe window: remove only inboxes that no longer
@@ -167,7 +167,7 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
                 """
                 INSERT INTO core.account_tags
                   (email, workspace_slug, workspace_uuid, tags, tags_arr, n_tags, _loaded_at, _run_id)
-                SELECT email, ?, ?, array_to_string(arr, ' | '), arr, len(arr), ?, ?
+                SELECT email, ?, ?, array_to_string(tags_arr, ' | '), tags_arr, len(tags_arr), ?, ?
                 FROM _wt
                 ON CONFLICT (workspace_uuid, email) DO UPDATE SET
                     workspace_slug = excluded.workspace_slug,
