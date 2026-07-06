@@ -156,26 +156,20 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
             ctx.db.execute("CREATE OR REPLACE TEMP TABLE _wt (email VARCHAR, tags_arr VARCHAR[])")
             if rows:
                 ctx.db.executemany("INSERT INTO _wt VALUES (?, ?)", rows)
-            # Full-replace semantics WITHOUT a wipe window: remove only inboxes that no longer
-            # carry any tag (or left the workspace), then upsert the current set. So a mid-write
-            # failure can never leave the workspace empty — untouched rows stay put.
-            ctx.db.execute(
-                "DELETE FROM core.account_tags "
-                "WHERE workspace_uuid = ? AND email NOT IN (SELECT email FROM _wt)", [wid]
-            )
+            # Full-replace this workspace: DELETE all its rows, then bulk INSERT the fresh set.
+            # NOT `ON CONFLICT DO UPDATE`, and NOT a same-transaction delete+reinsert — BOTH trip a
+            # DuckDB ART-index INTERNAL "duplicate key" abort on core.account_tags (proven 2026-07-01;
+            # see scripts/backfill_account_tags_full.py). Statements AUTO-COMMIT (no BEGIN/COMMIT): the
+            # DELETE commits first so the INSERT sees fresh keys. Removals ARE reflected (full delete);
+            # the shrink guard above already refuses to run this on a suspiciously-small pull, so the
+            # brief post-DELETE window can't wipe a workspace from a bad pull.
+            ctx.db.execute("DELETE FROM core.account_tags WHERE workspace_uuid = ?", [wid])
             ctx.db.execute(
                 """
                 INSERT INTO core.account_tags
                   (email, workspace_slug, workspace_uuid, tags, tags_arr, n_tags, _loaded_at, _run_id)
                 SELECT email, ?, ?, array_to_string(tags_arr, ' | '), tags_arr, len(tags_arr), ?, ?
                 FROM _wt
-                ON CONFLICT (workspace_uuid, email) DO UPDATE SET
-                    workspace_slug = excluded.workspace_slug,
-                    tags           = excluded.tags,
-                    tags_arr       = excluded.tags_arr,
-                    n_tags         = excluded.n_tags,
-                    _loaded_at     = excluded._loaded_at,
-                    _run_id        = excluded._run_id
                 """,
                 [canon_slug, wid, now, ctx.run_id],
             )
