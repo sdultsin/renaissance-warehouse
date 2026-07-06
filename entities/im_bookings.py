@@ -34,7 +34,7 @@ import logging
 import sys
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta, date
 
 from core.registry import Registry, RunContext
 from core.sync_run import PhaseResult
@@ -45,7 +45,9 @@ TABLE = "im_bookings"
 PAGE = 1000
 FROZEN_SNAPSHOT_DATE = "2026-05-31"      # the one-time analysis freeze — never deleted
 SOURCE_TAG = "portal_im_bookings_nightly"
-MIN_EXPECTED_ROWS = 36_000               # portal is append-mostly; below this = broken pull
+MIN_EXPECTED_ROWS = 3_000                # 2026-07-03: portal made LEAN (live bookings only, ~Jun onward,
+                                         # ~5-6k). Pre-cutover history lives in the pinned archive
+                                         # (_source=portal_im_bookings_archive, re-merged in run()). Below this = broken pull.
 
 # Source columns mirrored verbatim. The INSERT lists columns explicitly, so this is the set of
 # im_bookings keys to pull (order need only match the payload build below, not the table). The
@@ -104,6 +106,30 @@ def run(ctx: RunContext) -> PhaseResult:
 
     rows = _fetch_all(base_url, api_key)
     logger.info("fetched %d im_bookings rows from portal", len(rows))
+
+    # --- Ingest date-validity guard (2026-07-03) --------------------------------------
+    # The retired Funding-Form Apps Script reseed injected rows with impossible booking
+    # dates (e.g. 0202-05-23, 2027-05-28). Drop rows whose "date" parses BEFORE the ancient
+    # floor or BEYOND today+grace so junk-dated rows never enter the mirror and can't corrupt
+    # date-bucketed KPI. Null/unparseable dates are KEPT (logged) — not the junk fingerprint.
+    # Runs before the floor/regression checks so a mostly-junk pull correctly trips the floor.
+    _ig_today = datetime.now(timezone.utc).date()
+    _ig_floor = date(2020, 1, 1)
+    _ig_ceil = _ig_today + timedelta(days=30)
+    def _ig_junk_dated(r):
+        s = (r.get("date") or "")[:10]
+        try:
+            d = date.fromisoformat(s)
+        except (ValueError, TypeError):
+            return False
+        return d < _ig_floor or d > _ig_ceil
+    _ig_rejected = [r for r in rows if _ig_junk_dated(r)]
+    if _ig_rejected:
+        rows = [r for r in rows if not _ig_junk_dated(r)]
+        logger.warning(
+            "im_bookings ingest guard dropped %d impossible-dated rows (e.g. %s)",
+            len(_ig_rejected), [(r.get("id"), r.get("date")) for r in _ig_rejected[:5]])
+
     if len(rows) < MIN_EXPECTED_ROWS:
         # Fail LOUD, write nothing — keep last-known-good live snapshot.
         raise RuntimeError(
@@ -149,11 +175,11 @@ def run(ctx: RunContext) -> PhaseResult:
                 "or partial portal reseed (cf. 2026-06-30 mid-migration). Refusing to replace "
                 "the live snapshot."
             )
-        if len(rows) < prev_rows * 0.97:
-            raise RuntimeError(
-                f"im_bookings pull rowcount collapsed {prev_rows} -> {len(rows)} (>3% drop) "
-                "while above the absolute floor. Refusing to replace the live snapshot."
-            )
+        # 2026-07-03: rowcount-drop guard REMOVED. The portal was intentionally made LEAN
+        # (46k -> ~5.8k live bookings; pre-cutover history moved to the pinned archive), so a
+        # >3% drop is the normal steady state now and this check would refuse EVERY pull. The
+        # MIN_EXPECTED_ROWS floor (3k) + the newest-booking-date regression check above still
+        # catch a genuinely broken/stale/partial pull.
 
     snapshot_date = datetime.now(timezone.utc).date().isoformat()
     loaded_at = datetime.now(timezone.utc)
@@ -172,6 +198,19 @@ def run(ctx: RunContext) -> PhaseResult:
     )
     db.executemany(
         f"INSERT INTO raw_im_bookings ({col_list}) VALUES ({placeholders})", payload
+    )
+    # 2026-07-03: portal is LEAN (live bookings, >= 2026-06-01). Re-merge the pinned pre-cutover
+    # history archive INTO this live snapshot so max(_snapshot_date) readers (render_mtd /
+    # render_daily / conversion_event / v_sms_booking_phone_imb) still see full pre-cutover history.
+    # The archive (_source=portal_im_bookings_archive, pinned _snapshot_date=2026-05-31) is preserved
+    # across pulls by the DELETE above (keeps the FROZEN 2026-05-31 date) and never itself becomes
+    # max(_snapshot_date). Pre-cutover only (< 2026-06-01) -> no overlap with the portal pull.
+    db.execute(
+        f"INSERT INTO raw_im_bookings ({col_list}) "
+        f"SELECT {', '.join(SOURCE_COLUMNS)}, ?, ?, ? FROM raw_im_bookings "
+        f"WHERE _source = 'portal_im_bookings_archive' "
+        f"AND try_cast(\"date\" AS DATE) < DATE '2026-06-01'",
+        [snapshot_date, SOURCE_TAG, loaded_at],
     )
     db.execute("COMMIT")
 

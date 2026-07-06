@@ -53,6 +53,17 @@ SEND_SENSITIVE = {
 
 # Explicit per-table overrides (full control for the special cases).
 OVERRIDES: dict[str, dict] = {
+    # 2026-07-03: high-frequency messages feed (loads intraday, 7-9x/day) but had NO
+    # biz-date SLA, so it was judged ONLY on 36h wall-clock and false-tripped during
+    # multi-day maintenance pauses (e.g. the 07-01 compaction ~60h gap). Give it the
+    # same biz-recency SLA as its sibling raw_instantly_email -> alarm on DATA staleness.
+    "raw_instantly_email_message": dict(
+        biz_date_column="message_at", biz_sla_days=2,
+        notes="direct-Instantly messages (all directions); biz-recency SLA 2d on message_at"),
+    # 2026-07-03: no loader exists anywhere (repo entities/sources/scripts verified);
+    # 0 rows, never populated -> mark empty so the freshness backbone stops false-alarming.
+    "raw_partner_outcomes": dict(cadence="retired", status="empty",
+        notes="no loader (verified 2026-07-03); 0 rows -- registered stub, marked empty"),
     "raw_instantly_campaign_marker_tag": dict(
         cadence="retired", status="empty", source="instantly",
         notes="tag-mappings endpoint not in public REST (known empty)"),
@@ -93,9 +104,16 @@ OVERRIDES: dict[str, dict] = {
     # no loader exists anywhere (verified: repo entities/scripts + droplet ops dirs).
     # cadence=periodic gave them a phantom 192h SLA they breach on a cycle (239h FAILs).
     # No SQL consumer reads either. Re-snapshot manually if infra inventory changes.
+    # 2026-07-03: loader (scripts/refresh_cloudflare_zones.py) IS scheduled daily but
+    # collided with the nightly single-writer lock at 06:20 (nightly overran), short-
+    # circuiting the chain, so the table sat stale since 06-26 -> chronic false alarm.
+    # Loader verified WORKING (manual run 07-03 loaded 51 rows). Fixes: (1) cron moved
+    # to 08:20 + flock-waits behind the nightly; (2) CF zones are a slowly-changing dim
+    # (delta 0 for weeks) so a WEEKLY (192h) SLA matches real change cadence + tolerates
+    # a skipped day. Feeds core.domain_registry.
     "raw_cloudflare_zones": dict(
-        cadence="daily", source="cloudflare", freshness_column="_loaded_at",
-        notes="live CF zones (scripts/refresh_cloudflare_zones.py, RG+Sam accounts); feeds core.domain_registry"),
+        cadence="weekly", source="cloudflare", freshness_column="_loaded_at",
+        notes="live CF zones (scripts/refresh_cloudflare_zones.py, RG+Sam accounts); feeds core.domain_registry; weekly SLA (slowly-changing dim)"),
     # 2026-06-26: retired-by-design feeds — marked retired so the freshness backbone
     # stops false-alarming. Tables/data preserved (not dropped).
     "raw_sheets_blacklist_all_domains": dict(cadence="retired", status="retired", notes="retired 2026-06-07 (SHEET_TABS emptied)"),
@@ -132,7 +150,7 @@ OVERRIDES: dict[str, dict] = {
 # (name, source, owner_phase, cadence, freshness_column, biz_date_column, biz_sla_days, notes)
 CORE_FEEDS = [
     ("core.campaign_daily",        "instantly_step_api", "derived",   "daily",    "_loaded_at", "date", None, "Track H per-campaign daily"),
-    ("core.sending_account_daily", "account_truth",      "account_truth", "daily", "_loaded_at", "date", None, "Track G infra daily"),
+    ("core.sending_account_daily", "account_truth",      "account_truth", "daily", "_loaded_at", "date", 2, "Track G infra daily; no load-ts column -> biz-recency SLA 2d (wall-clock nulled)"),
     # biz date = posted_at (when the meeting was POSTED, not when we synced) — the Jun 4-10
     # outage had last_synced_at current while the newest meeting was 4 days old.
     ("core.meeting",               "slack_scrape",       "canonical", "daily",    "_last_seen_at", "posted_at", 2, "booked meetings; biz-recency SLA 2d"),
@@ -187,6 +205,13 @@ def _upsert_policy(conn, name, schema, source, owner_phase, cadence,
                    fresh_col, biz_col, send_sensitive, status, notes,
                    biz_sla_days=None) -> None:
     sla = CADENCE_SLA_HOURS.get(cadence)
+    # 2026-07-03: a pure business-date column (midnight-stamped) cannot measure LOAD
+    # latency -- wall-clock age against it is always ~24-48h, so the sla_hours check
+    # false-fires every cycle. When the ONLY freshness column available IS the biz-date
+    # column (and a biz_sla_days recency SLA is defined as the real monitor), disable the
+    # wall-clock SLA and rely on biz-date recency. Fixes core.sending_account_daily.
+    if biz_sla_days is not None and fresh_col is not None and fresh_col == biz_col:
+        sla = None
     conn.execute(
         """
         INSERT INTO core.sync_registry
