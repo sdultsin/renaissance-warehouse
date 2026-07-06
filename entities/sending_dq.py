@@ -187,37 +187,68 @@ def run_sending_dq(ctx: RunContext) -> PhaseResult:
     # the healed Google/Outlook/OTD rows (the downstream vendor esp-backfill still applies).
     reasserted = _reassert_capacity_from_core(db)
 
-    # Rebuild canonical daily table from raw (dedup: one row per date+email, prefer highest actual_sends)
-    db.execute("DELETE FROM core.sending_account_daily")
-    db.execute("""
-        INSERT INTO core.sending_account_daily
-        WITH deduped AS (
-            SELECT *,
-                ROW_NUMBER() OVER (
-                    PARTITION BY date, email
-                    ORDER BY actual_sends DESC NULLS LAST
-                ) AS rn
-            FROM raw_account_truth_daily_actuals
-        )
-        SELECT
-            date,
-            email AS account_id,
-            workspace_slug,
-            CASE infra_type
-                WHEN 'Google' THEN 'google'
-                WHEN 'Outlook' THEN 'outlook'
-                WHEN 'OTD' THEN 'otd'
-                ELSE NULL
-            END AS esp,
-            daily_limit,
-            expected_sends,
-            actual_sends,
-            delta,
-            fulfillment,
-            active_campaign_count
-        FROM deduped
-        WHERE rn = 1
-    """)
+    # Rebuild canonical daily table from raw (dedup: one row per date+email, prefer highest actual_sends).
+    # [2026-07-06] Two-part fix for a recurring nightly failure that left core.sending_account_daily EMPTY
+    # (row_floors=0 / "no fresh data" / QA-stale alerts). The table has a composite PK (date, account_id),
+    # and DuckDB's in-memory ART index for that PK CANNOT spill to temp; the old single 55M-row DELETE-all +
+    # INSERT-all pinned ~7.4GiB building that index in one commit and OOM'd at the 8GB memory_limit. Worse,
+    # an OOM-killed commit left the PK index ORPHANED from the (deleted) rows — a persistent corruption that
+    # survives DELETE/TRUNCATE/CHECKPOINT, so every subsequent rebuild then failed with a phantom
+    # "duplicate key" on an empty table. Fix:
+    #   (1) Recreate the table fresh from its OWN current DDL (CREATE OR REPLACE) — this drops the corrupt PK
+    #       index and rebuilds it clean every run (self-healing), preserves the PK/NOT-NULL contract, and
+    #       reads the live schema so a future migration is picked up automatically. Dependent views survive
+    #       CREATE OR REPLACE and re-bind to the same name.
+    #   (2) Populate PER DATE, each day in its own transaction — bounds each commit's PK-index delta to ~1
+    #       day (~1.4M rows) so it fits far under the 8GB limit. Same dedup result as the global rebuild
+    #       (the window PARTITIONs by (date, email), so restricting the source to one date is equivalent).
+    db.execute("SET preserve_insertion_order=false")
+    _ddl = db.execute(
+        "SELECT sql FROM duckdb_tables() "
+        "WHERE schema_name='core' AND table_name='sending_account_daily'"
+    ).fetchone()[0]
+    assert _ddl.strip().upper().startswith("CREATE TABLE"), f"unexpected DDL: {_ddl[:40]!r}"
+    db.execute(_ddl.replace("CREATE TABLE", "CREATE OR REPLACE TABLE", 1))
+    raw_dates = [r[0] for r in db.execute(
+        "SELECT DISTINCT date FROM raw_account_truth_daily_actuals ORDER BY date"
+    ).fetchall()]
+    for _d in raw_dates:
+        db.execute("BEGIN")
+        try:
+            db.execute("""
+                INSERT INTO core.sending_account_daily
+                WITH deduped AS (
+                    SELECT *,
+                        ROW_NUMBER() OVER (
+                            PARTITION BY date, email
+                            ORDER BY actual_sends DESC NULLS LAST
+                        ) AS rn
+                    FROM raw_account_truth_daily_actuals
+                    WHERE date = ?
+                )
+                SELECT
+                    date,
+                    email AS account_id,
+                    workspace_slug,
+                    CASE infra_type
+                        WHEN 'Google' THEN 'google'
+                        WHEN 'Outlook' THEN 'outlook'
+                        WHEN 'OTD' THEN 'otd'
+                        ELSE NULL
+                    END AS esp,
+                    daily_limit,
+                    expected_sends,
+                    actual_sends,
+                    delta,
+                    fulfillment,
+                    active_campaign_count
+                FROM deduped
+                WHERE rn = 1
+            """, [_d])
+            db.execute("COMMIT")
+        except Exception:
+            db.execute("ROLLBACK")
+            raise
 
     # [2026-06-16 infra-data-truth] ESP BACKFILL. The CSV's infra_type is 'Missing Current Inventory'
     # for accounts that sent but aren't in the (cached) account_truth inventory -> esp=NULL above
