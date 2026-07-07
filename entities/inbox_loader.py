@@ -317,6 +317,32 @@ def _archive(inbox: Path, dest: str, path: Path) -> None:
     shutil.move(str(path), str(target))
 
 
+def _prune_done(inbox: Path, dry_run: bool) -> int:
+    """Archived batches are load evidence, not a data store — the rows live in
+    the warehouse. Prune .done files older than the retention window so the
+    high-volume exporters (domain_rr_state alone parks ~600MB/day hourly full
+    state) can't fill the disk. Retention days via
+    WAREHOUSE_INBOX_DONE_RETENTION_DAYS (default 7; <=0 disables)."""
+    retention_days = int(os.environ.get("WAREHOUSE_INBOX_DONE_RETENTION_DAYS", "7"))
+    if dry_run or retention_days <= 0:
+        return 0
+    done = inbox / ".done"
+    if not done.is_dir():
+        return 0
+    cutoff = time.time() - retention_days * 86400
+    pruned = 0
+    for f in done.rglob("*"):
+        try:
+            if f.is_file() and f.stat().st_mtime < cutoff:
+                f.unlink()
+                pruned += 1
+        except OSError:
+            pass  # racing another pruner / permissions — retention is best-effort
+    if pruned:
+        logger.info(".done retention: pruned %d file(s) older than %dd", pruned, retention_days)
+    return pruned
+
+
 def load_inbox(conn, run_id: str, inbox_dir: str | None = None, dry_run: bool = False) -> LoadReport:
     """Drain every batch in the inbox. Never raises mid-drain: per-file errors are
     collected (file left in place) so healthy tables still land; caller fails
@@ -381,6 +407,7 @@ def load_inbox(conn, run_id: str, inbox_dir: str | None = None, dry_run: bool = 
             tr.files, tr.rows_read, tr.net_new, tr.total_after,
         )
 
+    _prune_done(inbox, dry_run)
     return report
 
 
