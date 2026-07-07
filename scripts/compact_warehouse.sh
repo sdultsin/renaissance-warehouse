@@ -48,7 +48,18 @@ mkdir -p "$TMPDIR"
 # order-preserving EXPORT buffers rows and cannot fully spill -> OOMs even at 8GB (observed
 # 2026-06-14). Row ORDER within a table is not semantically meaningful here (queries use ORDER BY)
 # and compaction reorders anyway; exact COUNT(*) verification below proves data identity.
-SET_PRELUDE="SET preserve_insertion_order=false; SET memory_limit='$MEMLIMIT'; SET temp_directory='$TMPDIR';"
+#
+# EXPORT gets its OWN, TIGHTER bounds (2026-07-07 oom-kill): parquet-writer buffers live OUTSIDE
+# the buffer pool, so `memory_limit` alone does NOT cap the export — the 07-07 EXPORT was
+# oom-killed at ~12GB anon (9.9GB RSS + 2.2GB swapped) against memory_limit=8GB with the CLI's
+# default threads=8 (one row-group buffer + compression state PER thread), while a concurrent
+# ~4.7GB duckdb reader (monitor cron) had already exhausted the box's swap. threads=2 mirrors
+# the bound compact_import.py has used for COPYs since 07-01; 5GB pool + 2 writer threads keeps
+# worst-case export RSS ~6.5GB so ambient readers can't push the 16GB box over. The IMPORT keeps
+# the proven 8GB ($MEMLIMIT) — compact_import.py bounds its own threads internally.
+EXPORT_MEMLIMIT="${COMPACT_EXPORT_MEMORY_LIMIT:-5GB}"
+EXPORT_THREADS="${COMPACT_EXPORT_THREADS:-2}"
+SET_PRELUDE="SET preserve_insertion_order=false; SET threads=$EXPORT_THREADS; SET memory_limit='$EXPORT_MEMLIMIT'; SET temp_directory='$TMPDIR';"
 # Disk guard factor (free >= SIZE * NUM/10). Default 7 (conservative). Override for a one-time
 # compaction on a tight-but-sufficient disk: COMPACT_FREE_FACTOR_NUM=4 (the real export+import
 # peak is ~30GB for a high-bloat DB, well under the default 0.7*SIZE).
@@ -108,7 +119,7 @@ CQ=$("$DUCKDB" -readonly "$DB" -noheader -list \
 [ -s /tmp/compact_pre.csv ] || { LOG "ABORT: pre-count capture empty (cannot verify) — keeping original"; exit 7; }
 VIEWS_OLD=$("$DUCKDB" -readonly "$DB" -noheader -list "SELECT count(*) FROM duckdb_views() WHERE NOT internal")
 
-LOG "exporting primary ($((SIZE/1024/1024/1024))GB, memory_limit=$MEMLIMIT)..."
+LOG "exporting primary ($((SIZE/1024/1024/1024))GB, memory_limit=$EXPORT_MEMLIMIT, threads=$EXPORT_THREADS)..."
 "$DUCKDB" -readonly "$DB" "$SET_PRELUDE EXPORT DATABASE '$EXP' (FORMAT PARQUET)" || { LOG "ABORT: export failed"; rm -rf "$EXP"; exit 1; }
 LOG "importing into fresh DB (memory_limit=$MEMLIMIT)..."
 # NOT `IMPORT DATABASE`: that replays schema.sql top-to-bottom and dies on the first
