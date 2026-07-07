@@ -2316,8 +2316,20 @@ try:
         _msg = (f":warning: *daily-report Pre-IPO source DRIFT* ({DAILY}, tab '{DAILY_TAB}'): "
                 + " | ".join(_drift) + f"  (rendered {_sheet} vs anchor {_anchor}). "
                 "Fix config/daily_report_sources.json -> preipo_meetings (a new/renamed desk?).")
-        print("WARN " + _msg, file=sys.stderr)
-        _alert(_msg)
+        # Same-day portal-vs-desk COUNT churn is expected at the evening render (9:30PM ET — both the
+        # portal and the desk sheets are still being written until the ET day closes; Jul-5 and Jul-6
+        # both false-fired this alert and self-healed at the 12:30AM-ET relock). While the report day
+        # is still open in ET and the ONLY drift is the count mismatch -> WARN-only, no Slack; the
+        # relock + next-day backfill re-run this exact check after day close and alert if it persists.
+        # Structural drift (desk source unhealthy / unknown desk / #pre-ipo-success counter mismatch)
+        # still alerts immediately regardless of time of day.
+        _count_churn_only = all(d.startswith("portal Pre-IPO=") for d in _drift)
+        if _count_churn_only and _today_et <= DAILY:
+            print("WARN (Slack alert suppressed: same-day count churn, report day still open in ET; "
+                  "the relock re-checks after day close) " + _msg, file=sys.stderr)
+        else:
+            print("WARN " + _msg, file=sys.stderr)
+            _alert(_msg)
     else:
         print(f"Pre-IPO reconcile: {_st} (desks {_sheet})")
 except Exception as _e:
