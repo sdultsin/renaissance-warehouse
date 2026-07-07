@@ -42,10 +42,12 @@
 --   IDENTICAL _biz_minutes / _clock_open_date functions render_daily.py §6 uses — so the
 --   materialized values are digit-for-digit what §6 computed inline (by construction).
 --
--- BLENDED IM+AIM (standing caveat, FINDINGS §3 / PR #175): AIM (AI-drafted) replies ship
---   through the SAME Instantly inboxes with NO distinguishing flag, so a fast median
---   reflects AI-assisted answering, not desk speed. A low/no-AIM workspace (Renaissance 1
---   DFY) reads slower for that reason. There is no per-message human/AI split in the source.
+-- BLENDED IM+AIM — RESOLVED (2026-07-06; supersedes the FINDINGS §3 / PR #175 caveat): the
+--   source DOES carry a per-message human/AI split — the /emails item's `ai_agent_id`
+--   (non-null on AI-authored messages), surfaced as core.email_message.ai_agent_id / is_aim
+--   by DDL 1081. The answering ue_type=3 message's flag is joined onto every fact row as
+--   our_reply_ai_agent_id / our_reply_is_aim, so consumers can split the SLA clock
+--   human-vs-AIM instead of reading a blended median.
 
 CREATE SCHEMA IF NOT EXISTS core;
 
@@ -74,6 +76,8 @@ CREATE TABLE IF NOT EXISTS core.sla_reply_time (
   seq_in_thread            INTEGER NOT NULL, -- = 1 (first prospect reply in the thread). §6 reads seq_in_thread=1.
   prospect_msg_ts          TIMESTAMPTZ,      -- first prospect reply message_at (UTC)
   our_reply_ts             TIMESTAMPTZ,      -- min ue_type=3 message_at after the first prospect reply (UTC); NULL if unanswered
+  our_reply_ai_agent_id    TEXT,             -- ai_agent_id of THE answering message (core.email_message, DDL 1081); NULL = human answer or unanswered
+  our_reply_is_aim         BOOLEAN,          -- TRUE = AIM (AI-authored) answer · FALSE = human answer · NULL = unanswered (three-state by design)
   biz_latency_minutes      DOUBLE,           -- §6 business-minute clock (12-20 ET Mon-Fri) prospect->our reply; NULL if unanswered
   raw_latency_minutes      DOUBLE,           -- raw wall-clock minutes our_reply_ts - prospect_msg_ts (reference); NULL if unanswered
   response_latency_minutes DOUBLE,           -- back-compat alias of raw_latency_minutes (DDL-69 consumers); NULL if unanswered
