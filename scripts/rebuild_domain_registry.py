@@ -88,7 +88,7 @@ GROUP BY domain;
 
 CREATE OR REPLACE TEMP TABLE acct AS
 SELECT domain,
-       count(*) FILTER (WHERE status = 'active')   AS inbox_count,
+       count(*) FILTER (WHERE is_active)   AS inbox_count,
        mode(workspace_slug)                        AS assigned_workspace,
        bool_or(esp = 'otd')                        AS any_otd
 FROM core.sending_account
