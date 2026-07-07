@@ -47,14 +47,21 @@ def run_account_first_cold_send(ctx: RunContext) -> PhaseResult:
         logger.error("account_first_cold_send SKIP: no send-log source table present.")
         return PhaseResult(rows_in=0, rows_out=0, notes={"skipped": "no_sendlog"})
 
-    union_sql = " UNION ALL ".join(parts)
+    msg_cte = ("msg AS (SELECT email, min(ts) AS ts FROM (" + " UNION ALL ".join(parts) + ") GROUP BY 1)")
+    # sending_account_daily = Instantly's COMPLETE send feed; the message-log misses ~22k live inboxes (e.g. OTD).
+    if _table_exists(conn, "core", "sending_account_daily"):
+        sad_cte = ("sad AS (SELECT lower(account_id) AS email, CAST(min(date) AS TIMESTAMPTZ) AS ts "
+                   "FROM core.sending_account_daily WHERE actual_sends>0 AND date >= DATE '2025-01-01' GROUP BY 1)")
+    else:
+        sad_cte = "sad AS (SELECT CAST(NULL AS VARCHAR) AS email, CAST(NULL AS TIMESTAMPTZ) AS ts WHERE FALSE)"
     try:
         conn.execute("BEGIN")
         conn.execute("DELETE FROM core.account_first_cold_send")
         conn.execute(f"""
             INSERT INTO core.account_first_cold_send BY NAME
-            SELECT email, min(ts) AS first_cold_send_at, now() AS _loaded_at, '{ctx.run_id}' AS _run_id
-            FROM ({union_sql}) GROUP BY email
+            WITH {msg_cte}, {sad_cte}, u AS (SELECT email FROM msg UNION SELECT email FROM sad)
+            SELECT u.email, COALESCE(msg.ts, sad.ts) AS first_cold_send_at, now() AS _loaded_at, '{ctx.run_id}' AS _run_id
+            FROM u LEFT JOIN msg USING(email) LEFT JOIN sad USING(email)
         """)
         conn.execute("COMMIT")
     except Exception:
