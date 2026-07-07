@@ -131,11 +131,17 @@ _STAGE_COL_TYPES = {
 
 
 def _read_stage_sql(stage_path: str) -> str:
-    """read_json with EXPLICIT columns so no field is mis-inferred as JSON (all-null pages)."""
+    """read_json with EXPLICIT columns so no field is mis-inferred as JSON (all-null pages).
+
+    maximum_object_size=256MB [2026-07-07]: DuckDB's 16MB default aborted the warm-leads apply
+    ("maximum_object_size of 16777216 bytes exceeded") on ONE giant thread line (~25MB of
+    api_response_raw for a long thread), freezing that workspace's watermark. A stage LINE is
+    one message with its full raw payload — 256MB is far beyond any legitimate single message
+    while still bounding a corrupt/unterminated line."""
     cols = ", ".join(f"'{c}': '{t}'" for c, t in _STAGE_COL_TYPES.items())
     return (
         f"read_json('{stage_path}', format='newline_delimited', "
-        f"columns={{{cols}}}, ignore_errors=false)"
+        f"columns={{{cols}}}, ignore_errors=false, maximum_object_size=268435456)"
     )
 
 
@@ -456,6 +462,7 @@ def discover_replied_leads(
     ws_uuid: str | None,
     since_ws,
     skip_live_walk: bool = False,
+    ws_slug: str | None = None,
 ) -> tuple[dict[str, "datetime | None"], dict]:
     """{lowercased lead -> last known reply ts (drain key)} to (re)pull for one org since
     `since_ws`. The timestamp keys the ORDERED DRAIN (429-hardening 2026-07-02): leads are
@@ -502,29 +509,80 @@ def discover_replied_leads(
     ids = [str(x) for x in {org_id, ws_uuid} if x]
     placeholders = ", ".join(["?"] * len(ids))
     local_n = 0
+    skipped_committed = 0
+    # SISYPHUS FIX [2026-07-07]: skip candidates whose last known reply is ALREADY durably
+    # committed in raw_instantly_email_message. Without this, every catch-up cycle restarts the
+    # ordered drain from watermark-2d with NO memory of the leads prior cycles already pulled and
+    # committed: a timeout-killed cycle re-pulls the SAME earliest leads next run (measured
+    # 2026-07-06: ~6-7k messages re-staged per 3h cycle with messages_upserted_changed≈0-100, i.e.
+    # >98% identical re-pulls, watermarks frozen for 8+ days on 5 workspaces). The anti-join makes
+    # cycles CUMULATIVE: leads committed by any prior cycle (even out-of-prefix) drop out of the
+    # candidate set, so each bounded window pulls only genuinely-new work and the contiguous
+    # prefix marches forward. CORRECT because a committed message_at >= the lead's last known
+    # reply_timestamp proves a full-thread pull captured that reply (lead_emails pulls the FULL
+    # per-lead history); a NEW reply moves the lead's key past its committed max -> re-pulled.
+    # A late-arriving OLD inbound row (discovery-source lag) has no committed row at/after its
+    # ts -> still pulled: the 2d overlap's guard is preserved, minus the redundant re-pulls.
+    # Kill-switch: WAREHOUSE_THREADS_NO_SKIP_COMMITTED=1 restores the historic full re-pull.
+    skip_committed = ws_slug is not None and os.environ.get(
+        "WAREHOUSE_THREADS_NO_SKIP_COMMITTED") != "1"
+    base_sql = (
+        f"SELECT lower(trim(lead_email)) AS lead, max(reply_timestamp) AS last_reply "
+        f"FROM raw_instantly_email "
+        f"WHERE workspace_id IN ({placeholders}) AND lead_email IS NOT NULL "
+    )
+    base_params: list = list(ids)
+    if since_ws is not None:
+        base_sql += "AND reply_timestamp > ? "
+        base_params.append(since_ws)
+    base_sql += "GROUP BY 1"
+    rows = None
+    if skip_committed:
+        try:
+            rows = read_conn.execute(
+                f"WITH cand AS ({base_sql}), "
+                f"comm AS (SELECT lower(trim(lead_email)) AS lead, "
+                f"         max(message_at) AS committed_through "
+                f"         FROM raw_instantly_email_message WHERE workspace_id = ? GROUP BY 1) "
+                f"SELECT c.lead, c.last_reply, "
+                f"       (m.committed_through IS NOT NULL "
+                f"        AND c.last_reply IS NOT NULL "
+                f"        AND c.last_reply <= m.committed_through) AS already_committed "
+                f"FROM cand c LEFT JOIN comm m USING (lead)",
+                base_params + [ws_slug],
+            ).fetchall()
+        except duckdb.Error as exc:
+            # Fail OPEN to the historic full re-pull (never worse than the status quo) — e.g.
+            # raw_instantly_email_message not created yet on a brand-new warehouse.
+            logger.warning(
+                "discovery: committed-skip anti-join failed (%s) — falling back to full re-pull",
+                exc,
+            )
+            rows = None
     try:
-        if since_ws is None:
-            rows = read_conn.execute(
-                f"SELECT lower(trim(lead_email)), max(reply_timestamp) FROM raw_instantly_email "
-                f"WHERE workspace_id IN ({placeholders}) AND lead_email IS NOT NULL "
-                f"GROUP BY 1",
-                ids,
-            ).fetchall()
-        else:
-            rows = read_conn.execute(
-                f"SELECT lower(trim(lead_email)), max(reply_timestamp) FROM raw_instantly_email "
-                f"WHERE workspace_id IN ({placeholders}) AND lead_email IS NOT NULL "
-                f"AND reply_timestamp > ? GROUP BY 1",
-                ids + [since_ws],
-            ).fetchall()
-        for lead, ts in rows:
-            if lead:
+        if rows is not None:
+            for lead, ts, already_committed in rows:
+                if not lead:
+                    continue
+                if already_committed:
+                    skipped_committed += 1
+                    continue
                 _note(lead, ts)
                 local_n += 1
+        else:
+            for lead, ts in read_conn.execute(base_sql, base_params).fetchall():
+                if lead:
+                    _note(lead, ts)
+                    local_n += 1
     except duckdb.Error as exc:
         # raw_instantly_email not present (e.g. a brand-new warehouse before #36 ran) -> empty
         # local set; the incremental live walk below (if since_ws set) still finds new activity.
         logger.warning("discovery: raw_instantly_email not queryable (%s) — local set empty", exc)
+    if skipped_committed:
+        logger.info(
+            "discovery: %d candidate repliers, %d skipped (last reply already committed), "
+            "%d to pull", local_n + skipped_committed, skipped_committed, local_n,
+        )
 
     # --- INCREMENTAL ONLY: broadened live trigger for a late ue_type=3 with no new inbound ---
     # skip_live_walk forces LOCAL-ONLY discovery even for a non-null since_ws — used by a bounded
@@ -546,6 +604,7 @@ def discover_replied_leads(
 
     return leads, {
         "local_replied_leads": local_n,
+        "skipped_committed": skipped_committed,
         "incremental_emails_scanned": n_seen,
         "discovery_ceiling_hit": ceiling_hit,
     }
@@ -858,6 +917,7 @@ def run_fetch(
                         lead_keys, dd = discover_replied_leads(
                             disc_conn, client, organization_id, ws_uuid, since_ws,
                             skip_live_walk=(local_only or full_backfill),
+                            ws_slug=ws_slug,
                         )
                         total_cold_sends_window = _cold_send_count(disc_conn, ws_slug, since_ws)
                         # pre-run effective drained-through (for the M1 seed below): the value
@@ -997,7 +1057,12 @@ def run_fetch(
                                 messages_upserted += 1
                             if not hit:
                                 tracker.mark_done(idx)  # rows written to the stage buffer above
-                            if n % 200 == 0:
+                            # Every 50 completions (was 200 [2026-07-07]): a timeout-killed fetch
+                            # loses the un-synced tail of its prefix — at ~3-6 leads/min under a
+                            # 429 storm, 200 could exceed a whole bounded window's throughput,
+                            # leaving only the baseline (= no watermark advance). 50 keeps the
+                            # fsync cost trivial while bounding the lost tail to minutes.
+                            if n % 50 == 0:
                                 stage.flush()
                                 os.fsync(stage.fileno())
                                 _sync_progress()  # ONLY after fsync: never claim un-staged work
