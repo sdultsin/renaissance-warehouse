@@ -403,7 +403,9 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     echo "promoting serving snapshot (nightly complete; coupling promote to build completion)" | tee -a "$LOG_FILE"
     PUBLISHER_BIN="${PUBLISHER_BIN:-/opt/duckdb/bin/publisher.py}"
     PUBLISHER_PY="${PUBLISHER_PY:-/opt/duckdb/venv/bin/python}"
-    PROMOTE_TIMEOUT_S="${PROMOTE_TIMEOUT_S:-900}"   # serving copy is ~50GiB; allow 15m, then bound
+    PROMOTE_TIMEOUT_S="${PROMOTE_TIMEOUT_S:-2400}"  # serving copy is ~118GiB now (~16min measured 2026-07-07;
+                                                    # 900s got the copy KILLED at 110/126GB -> rc=124, serving
+                                                    # stale ~17h). 40m = ~2.5x headroom for DB growth, then bound.
     if [[ -x "$PUBLISHER_PY" && -f "$PUBLISHER_BIN" ]]; then
         set +e
         SERVING_PROFILE=prod SERVING_CONFIG=/opt/duckdb/bin/config.yaml \
