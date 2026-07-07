@@ -138,6 +138,12 @@ LOADER_SPECS: dict[str, LoadSpec] = {
     "domain_rr_state": LoadSpec(
         mode="upsert", key_sql="CAST(domain AS VARCHAR)", key_cols=("domain",)
     ),
+    # instantly-quota-warden droplet job: append-only per-workspace lead-quota
+    # snapshots (upstream PK = bigserial id; see jobs/instantly-quota-warden/
+    # migrations/20260511_quota_warden.sql).
+    "quota_warden_snapshots": LoadSpec(
+        mode="insert", key_sql="CAST(id AS VARCHAR)", key_cols=("id",)
+    ),
     # Append-only event log with no upstream id — synthetic key over the full
     # natural row + export time (two identical events at different exports both land).
     "domain_rr_events": LoadSpec(
