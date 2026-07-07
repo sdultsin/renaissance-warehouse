@@ -198,7 +198,9 @@ fi
 log "promoting serving snapshot (publisher.py) ..."
 PUBLISHER_BIN="${PUBLISHER_BIN:-/opt/duckdb/bin/publisher.py}"
 PUBLISHER_PY="${PUBLISHER_PY:-/opt/duckdb/venv/bin/python}"
-PROMOTE_TIMEOUT_S="${PROMOTE_TIMEOUT_S:-1800}"
+PROMOTE_TIMEOUT_S="${PROMOTE_TIMEOUT_S:-2400}"  # align w/ nightly.sh (#210): serving copy ~16min
+                                                # measured 2026-07-07; 900s killed a copy at 110/126GB
+                                                # (rc=124). 40m = ~2.5x headroom for DB growth.
 SERVING_PROFILE=prod SERVING_CONFIG=/opt/duckdb/bin/config.yaml \
   timeout --signal=TERM --kill-after=60 "$PROMOTE_TIMEOUT_S" \
   "$PUBLISHER_PY" "$PUBLISHER_BIN" --reason infra-batch-weekly-refresh \
