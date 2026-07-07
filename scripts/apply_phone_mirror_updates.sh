@@ -38,12 +38,18 @@ DUCKDB_BIN="${DUCKDB_BIN:-/usr/local/bin/duckdb}"
 # box while transcribe + the sig-phone extract were resident -> kernel OOM-killed
 # the writer mid-tx; DuckDB rolled back cleanly, but the run died). Cap memory
 # and give DuckDB a disk spill dir so the join goes out-of-core instead of OOM.
-# 4GB was too tight for a large replay: DuckDB's COMMIT pins updated blocks and
-# CANNOT spill them — a 15k-row backfill commit failed at "failed to pin block
-# (3.7GiB/3.7GiB used)" [2026-07-02]. 6GB clears nightly-scale commits with
-# kernel headroom on the 15GB box; override MIRROR_APPLY_MEMORY=8GB for big
-# replays (the 20k-row backfill passed at 8GB).
-APPLY_MEM="${MIRROR_APPLY_MEMORY:-6GB}"
+# The floor is set by COMMIT: DuckDB pins updated blocks + the PK/ART index and
+# CANNOT spill them, and the floor GROWS with the mirror. History: 4GB failed a
+# 15k-row commit ("failed to pin block, 3.7GiB/3.7GiB used") [2026-07-02]; the
+# same 15k backfill passed at 8GB; 6GB then failed a mere 5.2k-row nightly
+# commit ("5.5GiB/5.5GiB used") [2026-07-07] — 6GB is below the floor at
+# current mirror size. Default is now 8GB (capped, so no kernel OOM on the
+# 15GB box), and on a pin-failure the write is retried ONCE at
+# MIRROR_APPLY_RETRY_MEMORY (default 10GB, threads=2) instead of hard-failing:
+# the failed txn rolls back cleanly and the statement is freshness-guarded /
+# idempotent, so a fresh retry is safe.
+APPLY_MEM="${MIRROR_APPLY_MEMORY:-8GB}"
+RETRY_MEM="${MIRROR_APPLY_RETRY_MEMORY:-10GB}"
 DUCK_TMP="${MIRROR_APPLY_TMPDIR:-/mnt/volume_nyc1_1781398428838/duckdb_tmp}"
 mkdir -p "$DUCK_TMP"
 DUCK_PREAMBLE="PRAGMA memory_limit='${APPLY_MEM}'; SET temp_directory='${DUCK_TMP}';"
@@ -62,8 +68,15 @@ exec 9>"$LOCK"
 flock -w "$LOCK_WAIT_S" 9 || { echo "[$(ts)] ERR: could not acquire writer.lock in ${LOCK_WAIT_S}s"; exit 75; }
 echo "[$(ts)] lock held"
 
-ddw "$DB" <<SQL
-$DUCK_PREAMBLE
+apply_write() {
+  local mem="$1" prelude_extra="${2:-}"
+  # .bail on = abort on the FIRST failed statement. Without it the CLI keeps
+  # going after an error — a failed memory_limit PRAGMA would let the UPDATE
+  # run UNCAPPED (the 2026-07-01 kernel-OOM scenario), and a failed COMMIT
+  # would still report the post-rollback SELECTs as if fine.
+  ddw "$DB" <<SQL
+.bail on
+PRAGMA memory_limit='${mem}'; SET temp_directory='${DUCK_TMP}'; ${prelude_extra}
 BEGIN TRANSACTION;
 CREATE TEMP TABLE src_raw AS
   SELECT lower(trim(column0)) AS email,
@@ -109,6 +122,12 @@ WHERE l.email = s.email
 
 COMMIT;
 SQL
+}
+
+if ! apply_write "$APPLY_MEM"; then
+  echo "[$(ts)] WARN: apply failed at memory_limit=${APPLY_MEM}; failed txn rolled back -- retrying once at ${RETRY_MEM} (threads=2)"
+  apply_write "$RETRY_MEM" "SET threads=2;"
+fi
 
 echo "[$(ts)] === post-commit verify ==="
 ddw -readonly "$DB" <<SQL
