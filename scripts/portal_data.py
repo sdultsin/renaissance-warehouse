@@ -163,7 +163,7 @@ CM_RESOLVED = (
 # Rationale: status='active' is the tightest defensible "active inbox" — it is what an
 # operator means by "an inbox that can send right now". Kept as an env knob so the
 # definition can be re-pinned against the live inbox count post-swap without a code edit.
-ACTIVE_INBOX_WHERE = os.environ.get("PORTAL_ACTIVE_INBOX_FILTER", "status = 'active'")
+ACTIVE_INBOX_WHERE = os.environ.get("PORTAL_ACTIVE_INBOX_FILTER", "is_active")
 # In-warmup = active inboxes still in the warming lifecycle phase.
 WARMUP_WHERE = f"({ACTIVE_INBOX_WHERE}) AND lower(COALESCE(lifecycle_state,'')) LIKE '%warm%' AND lower(COALESCE(lifecycle_state,'')) <> 'warmed'"
 
