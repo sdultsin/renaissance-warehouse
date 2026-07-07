@@ -320,6 +320,7 @@ def _schema_gate_checks(con) -> list[str]:
                 """
                 SELECT count(*) FROM information_schema.columns c
                 WHERE c.table_schema IN ('main','core','derived','raw')
+                  AND c.table_catalog <> 'temp'  -- session scratch tables are not schema
                   AND NOT EXISTS (
                     SELECT 1 FROM core.schema_catalog sc
                     WHERE sc.table_schema=c.table_schema AND sc.table_name=c.table_name
@@ -345,21 +346,31 @@ def _schema_gate_checks(con) -> list[str]:
     except Exception as exc:  # noqa: BLE001
         out.append(f"SCHEMA-DRIFT: check errored ({exc})")
 
-    # 5b. Entity-INSERT contract — explicit INSERT column lists must exist in live schema.
+    # 5b. Entity-INSERT contract — the explicit column list of an INSERT into a LIVE
+    # table must exist on THAT table. Scoped per-target-table on purpose: the old
+    # whole-statement scan (columns_referenced_q) also picked up SELECT-body
+    # references — CTE aliases, ATTACHed-mirror columns, session TEMP tables —
+    # none of which live information_schema can see, and false-positived on
+    # 2026-07-07 (campaign_infra _ci_universe.raw_workspace_id, lead_spine
+    # lm.enrich_first_name, sending_account CTE email_lc/first_seen_date/
+    # last_row_date). Targets not in the live schema (TEMP/scratch) are skipped
+    # for the same reason.
     try:
-        import ast as _ast
-        from pathlib import Path as _Path
         try:
             from core import schema_gate_lib as _lib
         except Exception:
             _lib = None
         if _lib is not None:
-            live_cols = {
-                c.lower() for (c,) in con.execute(
-                    "SELECT DISTINCT column_name FROM information_schema.columns "
-                    "WHERE table_schema IN ('main','core','derived','raw')"
-                ).fetchall()
-            }
+            import sqlglot
+            from sqlglot import exp
+            live_tbl_cols: dict[tuple[str, str], set[str]] = {}
+            for sch, tbl, col in con.execute(
+                "SELECT table_schema, table_name, column_name "
+                "FROM information_schema.columns "
+                "WHERE table_schema IN ('main','core','derived','raw') "
+                "  AND table_catalog <> 'temp'"
+            ).fetchall():
+                live_tbl_cols.setdefault((sch.lower(), tbl.lower()), set()).add(col.lower())
             ent_dir = REPO_ROOT / "entities"
             offenders = 0
             for f in sorted(ent_dir.glob("*.py")):
@@ -377,26 +388,41 @@ def _schema_gate_checks(con) -> list[str]:
                     low = litobj.text.lower()
                     if "insert into" not in low or "(" not in litobj.text:
                         continue
-                    cols, clean = _lib.columns_referenced_q(litobj.text)
-                    if not clean:
-                        continue  # regex-skim fallback over-counts (table names/keywords) — skip
-                    unknown = {
-                        c for c in cols
-                        if c.isidentifier() and len(c) > 2 and not c.startswith("_")
-                        and c not in live_cols
-                        and c not in ("select", "insert", "update", "from", "where",
-                                      "into", "values", "table", "core", "derived",
-                                      "raw", "main", "true", "false", "null")
-                    }
-                    if unknown:
-                        offenders += 1
-                        sample = ", ".join(sorted(unknown)[:4])
-                        out.append(
-                            f"CONTRACT: {f.name}:{litobj.line} INSERT names column(s) not in live "
-                            f"schema: {sample} (rename/typo drift, or DDL not shipped yet).")
-                        if offenders >= 8:
-                            out.append("CONTRACT: (more entity-contract findings suppressed)")
-                            return out
+                    try:
+                        stmts = sqlglot.parse(
+                            litobj.text.replace("__DYN__", "_dyn_"), read="duckdb")
+                    except Exception:
+                        continue  # unparseable fragment — precision over recall
+                    for stmt in stmts or []:
+                        if stmt is None:
+                            continue
+                        for ins in stmt.find_all(exp.Insert):
+                            schema_node = ins.this
+                            if not isinstance(schema_node, exp.Schema):
+                                continue  # no explicit column list to check
+                            tbl_node = schema_node.this
+                            if not isinstance(tbl_node, exp.Table) or not tbl_node.name:
+                                continue
+                            key = ((tbl_node.db or "main").lower(), tbl_node.name.lower())
+                            target = live_tbl_cols.get(key)
+                            if target is None:
+                                continue  # TEMP/scratch/attached target — unverifiable vs live
+                            named = {
+                                e.name.lower() for e in schema_node.expressions
+                                if isinstance(e, (exp.Identifier, exp.Column)) and e.name
+                            }
+                            unknown = sorted(named - target)
+                            if unknown:
+                                offenders += 1
+                                out.append(
+                                    f"CONTRACT: {f.name}:{litobj.line} INSERT into "
+                                    f"{key[0]}.{key[1]} names column(s) not on the live "
+                                    f"table: {', '.join(unknown[:4])} "
+                                    f"(rename/typo drift, or DDL not shipped yet).")
+                                if offenders >= 8:
+                                    out.append(
+                                        "CONTRACT: (more entity-contract findings suppressed)")
+                                    return out
     except Exception as exc:  # noqa: BLE001
         out.append(f"CONTRACT: entity-contract check errored ({exc})")
     return out

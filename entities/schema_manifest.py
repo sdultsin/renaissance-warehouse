@@ -96,6 +96,14 @@ def _rebuild_catalog(db) -> int:
         LEFT JOIN information_schema.tables t
                ON t.table_schema = c.table_schema AND t.table_name = c.table_name
         WHERE c.table_schema IN {lib.GATE_SCHEMAS}
+          -- Session TEMP tables (entity scratch: _ci_universe, _df_stage,
+          -- sending_account_PRE, ...) surface in information_schema with
+          -- table_schema='main' but table_catalog='temp'. The manifest runs
+          -- mid-nightly in the same session as the entities that create them, so
+          -- without this filter they get cataloged 'active', vanish when the
+          -- session ends, and warehouse_qa reports phantom SCHEMA-DRIFT
+          -- (85 ghost columns on 2026-07-07).
+          AND c.table_catalog <> 'temp'
         """
     ).fetchall()
 
