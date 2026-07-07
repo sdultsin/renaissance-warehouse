@@ -32,6 +32,7 @@ ENV_FILE_CANDIDATES = [
 # multiple ingests can register and they run sequentially in registration order.
 PHASE_ORDER = [
     "pipeline_mirror",   # 03:30 — slim mirror from pipeline-supabase
+    "inbox_loader",      # 03:35 — drain /root/warehouse-inbox upsert batches (Gates 1b/2a)
     "comms_mirror",      # 03:45 — comms-orchestration snapshot
     "sendivo",           # 03:50 — Sendivo SMS send-side (delivery metrics, campaigns, billing)
     "iskra",             # 03:52 — Iskra WhatsApp (messages/conversations/meetings/deals/numbers/stats)
