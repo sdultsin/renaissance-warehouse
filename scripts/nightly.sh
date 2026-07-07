@@ -273,14 +273,14 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
       # through the contiguously-drained prefix, so partial progress accrues nightly and NOTHING
       # is skipped (ceiling-hit workspaces stay quarantined via the .ceiling sidecar; grep
       # RUN-SUMMARY-FETCH / RUNLOG-APPLY here for fetched/applied/429 counts).
-      if timeout -k 30s "${THREADS_FETCH_TIMEOUT:-60m}" "$PYTHON" -m entities.email_thread_sync fetch --local-only --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE"; then
+      if timeout -k 30s "${THREADS_FETCH_TIMEOUT:-90m}" "$PYTHON" -m entities.email_thread_sync fetch --local-only --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE"; then
           # `|| echo`: apply exits 4 when it QUARANTINED a ceiling-hit ws (rows for the other
           # ws DID commit) — without the guard, `set -e` would abort the subshell here, mislabel
           # the run as email_thread_sync_nightly_failed, and skip the trailing cleanup.
           "$PYTHON" -m entities.email_thread_sync apply --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE" \
               || echo "WARN email_thread apply rc!=0 (ceiling quarantine or failure — see RUNLOG-APPLY above)" | tee -a "$LOG_FILE"
       else
-          echo "WARN email_thread fetch incomplete (timeout >${THREADS_FETCH_TIMEOUT:-60m} / ceiling / crash) — applying PARTIAL progress (drain watermark advances only through the completed prefix; the rest re-pulls next run)" | tee -a "$LOG_FILE"
+          echo "WARN email_thread fetch incomplete (timeout >${THREADS_FETCH_TIMEOUT:-90m} / ceiling / crash) — applying PARTIAL progress (drain watermark advances only through the completed prefix; the rest re-pulls next run)" | tee -a "$LOG_FILE"
           "$PYTHON" -m entities.email_thread_sync apply --stage "$THREADS_NIGHTLY_STAGE" 2>&1 | tee -a "$LOG_FILE" \
               || echo "WARN email_thread partial apply failed (stage kept nothing; watermark unchanged — clean re-pull next run)" | tee -a "$LOG_FILE"
       fi

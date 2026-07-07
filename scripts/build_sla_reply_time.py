@@ -32,6 +32,9 @@ reconciled 2026-07-03 — this REPLACES the DDL-69 iam_response_time wall-clock 
   * GRAIN = THREAD (thread_id, workspace_id), NOT lead_email — the validated reference is
     thread-grain (§6 reads seq_in_thread=1 here and reproduces its numbers with zero delta).
     Lead-grain dedup is the optional v_sla_reply_time_lead_grain view (DDL 1070 #5).
+  * HUMAN/AIM SPLIT (2026-07-06): the answering ue_type=3 message's ai_agent_id / is_aim
+    (core.email_message, DDL 1081) is carried onto each fact row as our_reply_ai_agent_id /
+    our_reply_is_aim (NULL when unanswered), so SLA consumers can split human vs AIM answering.
 
 Usage:
     python scripts/build_sla_reply_time.py                  # full fact rebuild + FULL daily snapshot
@@ -150,6 +153,10 @@ def build(db, snapshot_days: int | None, run_id: str) -> None:
     # --- 1. pull first-reply pairs (seq=1) across ALL workspaces (canonical) ------------------
     # No truncation cap here (box-local DuckDB), so unanswered firsts are kept. `ours` spans
     # full history so an old first-reply still finds its true earliest ue_type=3 answer.
+    # The answering message is picked by row_number (earliest r_ts, message_id tie-break) so its
+    # ai_agent_id/is_aim (DDL 1081 human/AIM split) rides along; r_ts is IDENTICAL to the old
+    # correlated min() (verified read-only vs the live warehouse 2026-07-06: 0 mismatches on
+    # 132,005 pairs; 17,911 answered of which 5,434 AIM).
     pairs = db.execute(
         f"""
         WITH inbound AS (
@@ -158,21 +165,28 @@ def build(db, snapshot_days: int | None, run_id: str) -> None:
                                     ORDER BY message_at, message_id) AS seq
           FROM {_EMAIL}
           WHERE ue_type=2 AND thread_id IS NOT NULL),
-        ours AS (SELECT thread_id, workspace_id AS ws, message_at AS r_ts
+        firsts AS (SELECT * FROM inbound WHERE seq=1),
+        ours AS (SELECT thread_id, workspace_id AS ws, message_at AS r_ts, message_id, ai_agent_id
                  FROM {_EMAIL}
-                 WHERE ue_type=3 AND thread_id IS NOT NULL)
-        SELECT i.thread_id, i.ws, i.lead_email, i.campaign_id,
-               epoch_ms(i.p_ts) AS p_ms,
-               epoch_ms((SELECT min(o.r_ts) FROM ours o
-                         WHERE o.thread_id=i.thread_id AND o.ws=i.ws AND o.r_ts > i.p_ts)) AS r_ms
-        FROM inbound i
-        WHERE i.seq=1
+                 WHERE ue_type=3 AND thread_id IS NOT NULL),
+        answer AS (
+          SELECT f.thread_id, f.ws, o.r_ts, o.ai_agent_id,
+                 row_number() OVER (PARTITION BY f.thread_id, f.ws
+                                    ORDER BY o.r_ts, o.message_id) AS rn
+          FROM firsts f
+          JOIN ours o ON o.thread_id=f.thread_id AND o.ws=f.ws AND o.r_ts > f.p_ts)
+        SELECT f.thread_id, f.ws, f.lead_email, f.campaign_id,
+               epoch_ms(f.p_ts) AS p_ms,
+               epoch_ms(a.r_ts) AS r_ms,
+               a.ai_agent_id
+        FROM firsts f
+        LEFT JOIN answer a ON a.thread_id=f.thread_id AND a.ws=f.ws AND a.rn=1
         """
     ).fetchall()
 
     now_ts = dt.datetime.now(tz=utc)
     rows = []
-    for thread_id, ws, lead_email, campaign_id, p_ms, r_ms in pairs:
+    for thread_id, ws, lead_email, campaign_id, p_ms, r_ms, ai_agent_id in pairs:
         if p_ms is None:
             continue
         p = dt.datetime.fromtimestamp(float(p_ms) / 1000.0, tz=utc)
@@ -180,16 +194,20 @@ def build(db, snapshot_days: int | None, run_id: str) -> None:
         reply_date = p.date()
         if r_ms is None:
             our_ts = biz_lat = raw_lat = None
+            ai_id = is_aim = None          # unanswered -> authorship unknowable (3-state NULL)
         else:
             r = dt.datetime.fromtimestamp(float(r_ms) / 1000.0, tz=utc)
             our_ts = r
             biz_lat = _biz_minutes(p, r, tz)
             raw_lat = (r - p).total_seconds() / 60.0
+            ai_id = ai_agent_id
+            is_aim = ai_agent_id is not None
         rows.append((
             f"{thread_id}|{ws}",           # response_id (one first-reply pair per thread+ws)
             thread_id, ws, campaign_id, lead_email,
             1,                             # seq_in_thread
             p, our_ts,
+            ai_id, is_aim,                 # human/AIM split of THE answering message (DDL 1081)
             biz_lat, raw_lat, raw_lat,     # biz_latency, raw_latency, response_latency (back-compat alias)
             clock_open, reply_date,
             now_ts, run_id,
@@ -198,9 +216,10 @@ def build(db, snapshot_days: int | None, run_id: str) -> None:
     db.executemany(
         """INSERT INTO core.sla_reply_time
            (response_id, thread_id, workspace_slug, campaign_id, lead_email, seq_in_thread,
-            prospect_msg_ts, our_reply_ts, biz_latency_minutes, raw_latency_minutes,
+            prospect_msg_ts, our_reply_ts, our_reply_ai_agent_id, our_reply_is_aim,
+            biz_latency_minutes, raw_latency_minutes,
             response_latency_minutes, clock_open_date, reply_date, _built_at, _run_id)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         rows,
     )
     db.execute(index_and_rest)   # snapshot table DROP+CREATE + indexes + views + macro
