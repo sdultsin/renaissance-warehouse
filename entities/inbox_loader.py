@@ -138,6 +138,26 @@ LOADER_SPECS: dict[str, LoadSpec] = {
     "domain_rr_state": LoadSpec(
         mode="upsert", key_sql="CAST(domain AS VARCHAR)", key_cols=("domain",)
     ),
+    # ---- infra sheet-registry trio [2026-07-09]: DP-v2 parses the master Google Sheet
+    # (RENAISSANCE_SHEET_ID) and upserts these to legacy Supabase; relaying the PARSED rows
+    # through the inbox beats re-implementing the 600-line parser warehouse-side (the
+    # inbox-export.ts "mirror the Sheet directly" note is superseded by this).
+    # Keys = the exporters' Supabase ON CONFLICT columns (sheet-registry.ts:629-631).
+    "infra_brand_registry": LoadSpec(
+        mode="upsert",
+        key_sql=_key_concat(["source_tab", "source_row", "offer", "brand_name"]),
+        key_cols=("source_tab", "source_row", "offer", "brand_name"),
+    ),
+    "infra_sheet_registry": LoadSpec(
+        mode="upsert",
+        key_sql=_key_concat(["source_tab", "source_row"]),
+        key_cols=("source_tab", "source_row"),
+    ),
+    "infra_cancelled_registry": LoadSpec(
+        mode="upsert",
+        key_sql=_key_concat(["source_tab", "source_row"]),
+        key_cols=("source_tab", "source_row"),
+    ),
     # instantly-quota-warden droplet job: append-only per-workspace lead-quota
     # snapshots (upstream PK = bigserial id; see jobs/instantly-quota-warden/
     # migrations/20260511_quota_warden.sql).
