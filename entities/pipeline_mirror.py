@@ -69,6 +69,8 @@ def _key_concat(cols: list[str]) -> str:
 
 
 SPECS: dict[str, Spec] = {
+    # DO NOT DELETE this Spec: family is INBOX-FED (legacy read skipped) but inbox_loader
+    # imports this entry for upsert-key derivation. Deleting it silently freezes the table.
     "campaigns": Spec(
         mode="upsert",
         key_sql="campaign_id",
@@ -81,6 +83,8 @@ SPECS: dict[str, Spec] = {
         ],
         array_columns={"tags", "rg_batch_ids"},
     ),
+    # DO NOT DELETE this Spec: family is INBOX-FED (legacy read skipped) but inbox_loader
+    # imports this entry for upsert-key derivation. Deleting it silently freezes the table.
     "campaign_data": Spec(
         # UPSERT (spec 15 amendment 2026-06-06): campaign_data carries the daily
         # metric rollup (emails_sent / opportunities / v_disabled / total_leads …)
@@ -106,6 +110,8 @@ SPECS: dict[str, Spec] = {
         ],
         array_columns={"tags", "rg_batch_tags", "sender_tags", "other_tags"},
     ),
+    # DO NOT DELETE this Spec: family is INBOX-FED (legacy read skipped) but inbox_loader
+    # imports this entry for upsert-key derivation. Deleting it silently freezes the table.
     "campaign_daily_metrics": Spec(
         mode="upsert",
         key_sql=_key_concat(["campaign_id", "date"]),
@@ -179,6 +185,8 @@ SPECS: dict[str, Spec] = {
     # "send_date", "sent_count", "first_sent_at", "last_sent_at", "updated_at",
     # ],
     # ),
+    # DO NOT DELETE this Spec: family is INBOX-FED (legacy read skipped) but inbox_loader
+    # imports this entry for upsert-key derivation. Deleting it silently freezes the table.
     "variant_copy": Spec(
         mode="insert_hash",
         key_sql=_key_concat(["campaign_id", "step", "variant", "content_hash"]),
@@ -189,6 +197,8 @@ SPECS: dict[str, Spec] = {
             "subject_unspintaxed",
         ],
     ),
+    # DO NOT DELETE this Spec: family is INBOX-FED (legacy read skipped) but inbox_loader
+    # imports this entry for upsert-key derivation. Deleting it silently freezes the table.
     "bounce_suppression": Spec(
         mode="upsert",
         key_sql="CAST(id AS VARCHAR)",
@@ -303,6 +313,22 @@ def run_pipeline_mirror(ctx: RunContext) -> PhaseResult:
     # without re-mirroring everything; unknown names fail loudly rather than no-op.
     only_env = os.environ.get("PIPELINE_MIRROR_ONLY", "").strip()
     specs = SPECS
+    # [2026-07-09 family flip] These families are now INBOX-FED: DP-v2/droplet jobs dual-write
+    # them to /root/warehouse-inbox and entities.inbox_loader upserts them with the same keys
+    # (parity verified +0 net-new over nights 07-08/07-09). The mirror therefore stops reading
+    # them from legacy Supabase — first step of the legacy-DB retirement. SPECS entries STAY
+    # (inbox_loader imports them for key derivation); only the legacy READ is skipped.
+    # Un-flip by removing a name from this set. Override for a one-off legacy re-pull:
+    # PIPELINE_MIRROR_ONLY=<family> still works (takes precedence below).
+    INBOX_FED = {
+        "campaigns", "campaign_data", "campaign_daily_metrics",
+        "variant_copy", "bounce_suppression",
+    }
+    _unknown_fed = INBOX_FED - SPECS.keys()
+    if _unknown_fed:
+        raise ValueError(f"INBOX_FED names unknown SPECS tables: {sorted(_unknown_fed)}")
+    specs = {t: sp for t, sp in specs.items() if t not in INBOX_FED}
+    logger.info("inbox-fed families, legacy read SKIPPED: %s", sorted(INBOX_FED))
     if only_env:
         wanted = [t.strip() for t in only_env.split(",") if t.strip()]
         unknown = [t for t in wanted if t not in SPECS]
@@ -349,7 +375,10 @@ def run_pipeline_mirror(ctx: RunContext) -> PhaseResult:
     # remaining NULLs from the campaign dim (raw_pipeline_campaigns, mirrored earlier this run) —
     # best-effort current workspace — so per-workspace/CM rollups and the ground-truth harness stop
     # dropping recent fact rows into a NULL bucket. Warehouse-only UPDATE (safe after DETACH pg).
-    if "campaign_daily_metrics" in specs:
+    # [2026-07-09] UNCONDITIONAL: campaign_daily_metrics is inbox-fed (not in specs) but the fixup
+    # must keep running for rows already present; entities.inbox_loader re-runs the same fixup
+    # after its drain so rows arriving via inbox (post this phase) are filled the same night.
+    if True:
         conn.execute(
             """
             UPDATE raw_pipeline_campaign_daily_metrics m
