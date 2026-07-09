@@ -303,6 +303,18 @@ def run_pipeline_mirror(ctx: RunContext) -> PhaseResult:
     # without re-mirroring everything; unknown names fail loudly rather than no-op.
     only_env = os.environ.get("PIPELINE_MIRROR_ONLY", "").strip()
     specs = SPECS
+    # [2026-07-09 family flip] These families are now INBOX-FED: DP-v2/droplet jobs dual-write
+    # them to /root/warehouse-inbox and entities.inbox_loader upserts them with the same keys
+    # (parity verified +0 net-new over nights 07-08/07-09). The mirror therefore stops reading
+    # them from legacy Supabase — first step of the legacy-DB retirement. SPECS entries STAY
+    # (inbox_loader imports them for key derivation); only the legacy READ is skipped.
+    # Un-flip by removing a name from this set. Override for a one-off legacy re-pull:
+    # PIPELINE_MIRROR_ONLY=<family> still works (takes precedence below).
+    INBOX_FED = {
+        "campaigns", "campaign_data", "campaign_daily_metrics",
+        "variant_copy", "bounce_suppression",
+    }
+    specs = {t: sp for t, sp in specs.items() if t not in INBOX_FED}
     if only_env:
         wanted = [t.strip() for t in only_env.split(",") if t.strip()]
         unknown = [t for t in wanted if t not in SPECS]
