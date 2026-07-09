@@ -57,7 +57,7 @@ mkdir -p "$TMPDIR"
 # the bound compact_import.py has used for COPYs since 07-01; 5GB pool + 2 writer threads keeps
 # worst-case export RSS ~6.5GB so ambient readers can't push the 16GB box over. The IMPORT keeps
 # the proven 8GB ($MEMLIMIT) — compact_import.py bounds its own threads internally.
-EXPORT_MEMLIMIT="${COMPACT_EXPORT_MEMORY_LIMIT:-5GB}"
+EXPORT_MEMLIMIT="${COMPACT_EXPORT_MEMORY_LIMIT:-14GB}"
 EXPORT_THREADS="${COMPACT_EXPORT_THREADS:-2}"
 SET_PRELUDE="SET preserve_insertion_order=false; SET threads=$EXPORT_THREADS; SET memory_limit='$EXPORT_MEMLIMIT'; SET temp_directory='$TMPDIR';"
 # Disk guard factor (free >= SIZE * NUM/10). Default 7 (conservative). Override for a one-time
