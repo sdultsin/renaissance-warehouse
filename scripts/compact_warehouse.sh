@@ -41,7 +41,7 @@ THRESHOLD_BYTES=$(( ${COMPACT_THRESHOLD_GB:-120}*1024*1024*1024 ))
 DUCKDB=$(command -v duckdb)
 # Bound DuckDB memory so the EXPORT/IMPORT cannot OOM the 16GB box (root cause of the 2026-06-12
 # nightly oom-kill: the IMPORT hit ~12.9GB RSS at the default ~80%-RAM limit). Spill to disk instead.
-MEMLIMIT="${COMPACT_MEMORY_LIMIT:-8GB}"
+MEMLIMIT="${COMPACT_MEMORY_LIMIT:-20GB}"
 TMPDIR="$VOL_DIR/duckdb_tmp"
 mkdir -p "$TMPDIR"
 # preserve_insertion_order=false is REQUIRED for EXPORT/IMPORT of a large DB under a memory_limit:
