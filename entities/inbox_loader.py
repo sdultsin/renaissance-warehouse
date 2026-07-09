@@ -434,6 +434,35 @@ def run_inbox_loader(ctx: RunContext) -> PhaseResult:
             f"(landed {report.rows_read} rows from the healthy ones first): "
             + " | ".join(report.errors)
         )
+
+    # [2026-07-09 family flip post-steps]
+    # (a) workspace_id carry-forward for campaign_daily_metrics rows that arrived VIA INBOX this
+    #     run (the pipeline_mirror-phase fixup ran before this drain; D-L2-4 semantics preserved).
+    ctx.db.execute(
+        """
+        UPDATE raw_pipeline_campaign_daily_metrics m
+        SET workspace_id = c.workspace_id, workspace_name = c.workspace_name
+        FROM raw_pipeline_campaigns c
+        WHERE m.campaign_id = c.campaign_id
+          AND m.workspace_id IS NULL
+          AND c.workspace_id IS NOT NULL AND c.workspace_id <> ''
+        """
+    )
+    # (b) freshness gate for the inbox-fed families: the legacy-mirror backstop is gone, so a
+    #     silently-dead exporter must show up HERE, loudly, not as quiet staleness.
+    for _t, _col in (("campaigns", "synced_at"), ("campaign_data", "synced_at"),
+                     ("campaign_daily_metrics", "synced_at"), ("variant_copy", "synced_at"),
+                     ("bounce_suppression", "last_seen_at")):
+        try:
+            _age = ctx.db.execute(
+                f"SELECT date_diff('hour', max({_col}), now()) FROM raw_pipeline_{_t}"
+            ).fetchone()[0]
+            if _age is not None and _age > 30:
+                logger.error("INBOX-FED FRESHNESS: raw_pipeline_%s max(%s) is %sh old (>30h) - "
+                             "exporter likely dead; legacy backstop is OFF for this family", _t, _col, _age)
+        except Exception as _e:  # never block the drain on the gate itself
+            logger.error("INBOX-FED FRESHNESS probe failed for %s: %s", _t, _e)
+
     return PhaseResult(rows_in=report.rows_read, rows_out=report.net_new, notes=notes)
 
 
