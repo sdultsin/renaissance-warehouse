@@ -130,6 +130,84 @@ class CloseClient:
                 raise CloseError(
                     f"Close call pagination exceeded {seen_pages} pages — refusing to return a partial feed")
 
+    # --- CRM-mirror endpoints (2026-07-10 Close→warehouse ingest) ---------
+    # All read-only GETs. See entities/close_crm_mirror.py + sql/ddl/99_close_crm_mirror.sql.
+
+    def iter_activities(self, activity_type: str, since: datetime | None = None) -> Iterator[dict]:
+        """Yield Close activity objects of one type (email / sms / status_change),
+        newest-first via _skip/_limit, stopping at the `since` watermark on
+        date_created (same pattern as iter_calls; the caller passes a watermark
+        with a safety overlap because activity feeds are only ~newest-first).
+
+        `activity_type` is the URL segment: 'email', 'sms', 'status_change/lead'.
+        """
+        skip = 0
+        seen_pages = 0
+        while True:
+            payload = self._get(
+                f"/activity/{activity_type}/", params={"_limit": _PAGE_LIMIT, "_skip": skip}
+            )
+            data = payload.get("data") or []
+            if not data:
+                return
+            for act in data:
+                if since is not None:
+                    dc = _parse_dt(act.get("date_created"))
+                    if dc is not None and dc <= since:
+                        logger.info(
+                            "iter_activities(%s) hit watermark (date_created %s <= %s) — stopping",
+                            activity_type, dc.isoformat(), since.isoformat(),
+                        )
+                        return
+                yield act
+            seen_pages += 1
+            if not payload.get("has_more"):
+                return
+            skip += _PAGE_LIMIT
+            time.sleep(0.1)
+            if seen_pages > 50_000:
+                raise CloseError(
+                    f"Close {activity_type} pagination exceeded {seen_pages} pages — refusing to return a partial feed")
+
+    def iter_leads(self, window_days: int = 15, start: str = "2025-06-01") -> Iterator[dict]:
+        """Yield EVERY Close lead (full snapshot) via date_created windows.
+
+        The /lead/ search endpoint caps _skip pagination at 10k results, so we
+        window the query by date_created (15-day windows keep each window well
+        under the cap at current volume ~20k leads total) and _skip within each
+        window. Empty windows cost one request. Full snapshot each run: leads
+        mutate (status, custom fields) without a reliable updated-feed, and 20k
+        rows ≈ 100 requests — cheap enough nightly.
+        """
+        from datetime import timedelta
+        cursor = datetime.fromisoformat(start).replace(tzinfo=timezone.utc)
+        end = datetime.now(timezone.utc) + timedelta(days=1)
+        while cursor < end:
+            w_end = cursor + timedelta(days=window_days)
+            query = (
+                f'date_created >= "{cursor.date().isoformat()}" '
+                f'date_created < "{w_end.date().isoformat()}" sort:created'
+            )
+            skip = 0
+            while True:
+                payload = self._get(
+                    "/lead/", params={"query": query, "_limit": 200, "_skip": skip}
+                )
+                data = payload.get("data") or []
+                for lead in data:
+                    yield lead
+                if not payload.get("has_more"):
+                    break
+                skip += 200
+                time.sleep(0.1)
+            cursor = w_end
+
+    def get_dim(self, path: str) -> list[dict]:
+        """Small dimension pulls (lead statuses, custom-field defs, smart views).
+        One unpaginated GET; these are tiny (≤ dozens of rows)."""
+        payload = self._get(path, params={"_limit": _PAGE_LIMIT})
+        return payload.get("data") or []
+
     def get_lead(self, lead_id: str) -> dict | None:
         """`GET /lead/{lead_id}/` — the Close lead. Carries:
           - contacts[].emails[].email        (email identity; empty for Sendivo phone-only)
