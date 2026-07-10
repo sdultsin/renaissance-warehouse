@@ -252,6 +252,18 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     # sends/day) and HARD-FAIL them every night. A new replier's FULL thread is re-pulled, so their IM
     # responses ARE captured; the only uncovered edge is an IM message on a thread with no NEW prospect
     # reply (rare cold-thread chase) — acceptable vs a nightly that ceilings.
+    # [2026-07-10 flag #26] The inline SERIAL thread fetch is REMOVED from the nightly critical path.
+    # Root cause (warehouse-flags #26): the nightly's other phases run ~05:30->14:00 UTC, so this
+    # phase started ~14:00 and its 90m serial /emails drain advanced only ONE workspace (renaissance-4)
+    # per night — a 99% coverage collapse across the other 7 while it also (a) added ~90m to the nightly,
+    # (b) DOUBLE-PULLED the same Instantly /emails the standalone SYNC-7 drain already pulls (violates the
+    # MotherDuck "never double-run source syncs" rule), and (c) held the writer lock to ~15:27, starving
+    # 2 of the 3 daily parallel drains that skip when the nightly overruns. The standalone continuous
+    # per-workspace parallel drain (threads_daytime_drain.sh, supervisor cron in the post-nightly window)
+    # OWNS thread freshness now — same --local-only discovery, but ~8x parallel + ~14h/day instead of ~1
+    # ws/90m. Watermark honesty + convergence are watched by threads_drain_watchdog.py.
+    # REVERSIBLE: set THREADS_IN_NIGHTLY=1 (env or .env.threads) to restore the inline phase below.
+    if [ "${THREADS_IN_NIGHTLY:-0}" = "1" ]; then
     THREADS_NIGHTLY_STAGE=/root/core/threads_nightly_stage.jsonl
     echo "email-thread sync (native reply threads — nightly incremental, local-only)" | tee -a "$LOG_FILE"
     ( set -a; [ -f /root/core/.env.threads ] && . /root/core/.env.threads; set +a
@@ -291,6 +303,9 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
     # keep apply manifests out of the repo working tree (gitignored too, belt + suspenders)
     mkdir -p /root/core/threads_bf/manifests 2>/dev/null
     mv /root/renaissance-warehouse/core/email_thread_manifest_*.txt /root/core/threads_bf/manifests/ 2>/dev/null || true
+    else
+        echo "email-thread sync SKIPPED in nightly — owned by the standalone SYNC-7 continuous drain (flag #26, 2026-07-10); set THREADS_IN_NIGHTLY=1 to restore" | tee -a "$LOG_FILE"
+    fi
 
     # SLA reply-time (§6 canonical business-minute clock) — MUST run AFTER the email-thread apply
     # above so core.email_message carries tonight's fresh prospect replies (ue_type=2) + our replies
