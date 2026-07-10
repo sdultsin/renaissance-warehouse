@@ -38,11 +38,27 @@ Tables mirrored:
   comms.gbc_application    -> raw_comms_gbc_application    (WS-E gap-close, 2026-06-08)
   comms.app_link_check     -> raw_comms_app_link_check     (WS-E gap-close, 2026-06-08)
   comms.lead_application   -> raw_comms_lead_application   (Lumara apply-form, 2026-06-11)
+  comms.campaign_blast_template -> raw_comms_campaign_blast_template (coverage-audit gap #3, 2026-07-09)
+  comms.meeting_reminder   -> raw_comms_meeting_reminder        (coverage-audit gap #3, 2026-07-09)
+  comms.sendivo_outbound_log -> raw_comms_sendivo_outbound_log  (coverage-audit gap #3, 2026-07-09)
+  config.kill_switch       -> raw_comms_kill_switch             (coverage-audit gap #3, 2026-07-09)
+  config.worker_config     -> raw_comms_worker_config           (coverage-audit gap #3; value REDACTED for secret keys)
+  config.brand_followup_cap -> raw_comms_brand_followup_cap     (coverage-audit gap #3, 2026-07-09)
+  config.iskra_watchdog_state -> raw_comms_iskra_watchdog_state (coverage-audit gap #3, 2026-07-09)
 
-Explicitly NOT mirrored: comms.webhook_receipt and config.* tables.
+SECURITY (config.worker_config): its ``value`` column holds live secrets
+(worker_secret, cc_slack_bot_token). ``_COLUMN_EXPRS`` swaps ``value`` for
+'<redacted>' on secret-pattern keys in the SELECT so secret material never
+lands in the warehouse (which is served broadly via the read-only query API).
+
+Explicitly NOT mirrored: comms.webhook_receipt, comms.alert_throttle,
+comms.iskra_conversation.
   * comms.webhook_receipt (~6.18M rows) is a raw pre-processing webhook log —
     intentionally excluded as noise (no analytic value; the processed signal
     already lands in the other mirrored tables). Do NOT add it here.
+  * comms.alert_throttle is ops throttle state (no analytic value);
+    comms.iskra_conversation is a rebuildable poll cache of an API that is
+    already mirrored richer (raw_iskra_conversations).
 
 WS-E (Spec 16 §WS-E, 2026-06-08) closed the close_sync / gbc_application /
 app_link_check gap. Their DDL is additive-only in sql/ddl/47_comms_mirror_gaps.sql
@@ -86,6 +102,21 @@ _TABLES: list[tuple[str, str, str]] = [
     # conversion event. Webform → worker /apply/webhook → this table → partner
     # CRM (GBC; Ken round-robin planned). DDL in sql/ddl/56_lead_application_mirror.sql.
     ("comms", "lead_application", "raw_comms_lead_application"),
+    # ── Mirror-coverage-audit gap #3 (2026-07-09): the remaining small comms-hub
+    # tables. DDL in sql/ddl/1092_comms_mirror_gap_ops_config.sql. All tiny —
+    # full-refresh REPLACE like the rest.
+    # SMS cold-blast copy provenance (feeds Close "Original Message" fallback):
+    ("comms", "campaign_blast_template", "raw_comms_campaign_blast_template"),
+    # Reminder/no-show funnel (T-1h email / T-30m SMS latches + call-window stamps):
+    ("comms", "meeting_reminder", "raw_comms_meeting_reminder"),
+    # Standalone /sms/logs reconciliation mirror w/ blast_id enrichment:
+    ("comms", "sendivo_outbound_log", "raw_comms_sendivo_outbound_log"),
+    # config.* ops/config forensics (worker_config value is REDACTED for secret
+    # keys via _COLUMN_EXPRS — see SECURITY note in the module docstring):
+    ("config", "kill_switch", "raw_comms_kill_switch"),
+    ("config", "worker_config", "raw_comms_worker_config"),
+    ("config", "brand_followup_cap", "raw_comms_brand_followup_cap"),
+    ("config", "iskra_watchdog_state", "raw_comms_iskra_watchdog_state"),
 ]
 
 # Columns that must be CAST to VARCHAR for postgres_scanner -> DuckDB. Covers
@@ -107,6 +138,29 @@ _CAST_TO_VARCHAR: dict[str, set[str]] = {
     "raw_comms_app_link_check": {"raw_response"},
     # ── lead_application (2026-06-11): id is uuid, raw is jsonb.
     "raw_comms_lead_application": {"id", "raw"},
+    # ── coverage-audit gap #3 (2026-07-09): jsonb columns on the new tables.
+    "raw_comms_meeting_reminder": {"metadata"},
+    "raw_comms_sendivo_outbound_log": {"raw"},
+}
+
+# Per-table column-expression overrides for the mirror SELECT. Unlike
+# _CAST_TO_VARCHAR (a plain CAST), these swap the whole column expression —
+# used to REDACT secret material so it never lands in the warehouse (which is
+# served broadly via the read-only query API). Expressions run DuckDB-side over
+# the attached pg table; unqualified column refs are unambiguous (single-table
+# SELECT). Keyed by raw table name, then column name.
+_COLUMN_EXPRS: dict[str, dict[str, str]] = {
+    # config.worker_config holds live secrets in `value` (worker_secret,
+    # cc_slack_bot_token). Keep key names + non-secret values (worker_url,
+    # iskra_push_enabled, …) — redact anything secret-shaped, incl. future keys.
+    "raw_comms_worker_config": {
+        "value": (
+            "CASE WHEN lower(key) LIKE '%secret%' OR lower(key) LIKE '%token%' "
+            "OR lower(key) LIKE '%password%' OR lower(key) LIKE '%api_key%' "
+            "OR lower(key) LIKE '%apikey%' OR lower(key) LIKE '%credential%' "
+            "THEN '<redacted>' ELSE value END"
+        ),
+    },
 }
 
 
@@ -122,12 +176,15 @@ def _build_select(
     SELECT column list always matches the DDL.
     """
     cast_cols = _CAST_TO_VARCHAR.get(raw_table, set())
+    expr_cols = _COLUMN_EXPRS.get(raw_table, {})
     cols = [r[1] for r in ctx.db.execute(f"PRAGMA table_info('{raw_table}')").fetchall()]
     # Drop our bookkeeping cols; we add them explicitly.
     data_cols = [c for c in cols if c not in ("_loaded_at", "_run_id")]
     select_exprs = []
     for c in data_cols:
-        if c in cast_cols:
+        if c in expr_cols:
+            select_exprs.append(f"{expr_cols[c]} AS {c}")
+        elif c in cast_cols:
             select_exprs.append(
                 f"CAST(pg.{source_schema}.{pg_table}.{c} AS VARCHAR) AS {c}"
             )
