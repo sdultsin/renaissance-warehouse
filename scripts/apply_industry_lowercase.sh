@@ -14,6 +14,7 @@ OKFILE=/root/renaissance-warehouse/logs/backup_lead_mirror.last_ok
 ts(){ date -u +%Y-%m-%dT%H:%M:%SZ; }
 log(){ echo "[$(ts)] $*" | tee -a "$LOG"; }
 ddw(){ ( exec -a duckdb_cli_writer "$DUCK" "$@" ); }
+alert(){ local py="/root/renaissance-warehouse/.venv/bin/python"; [ -x "$py" ] || py=python3; "$py" /root/renaissance-warehouse/scripts/alert_slack.py "$1" >/dev/null 2>&1 || true; }
 mkdir -p "$TMP"
 
 [ -f "$MAP" ] || { log "FATAL map missing $MAP"; exit 2; }
@@ -22,6 +23,9 @@ mkdir -p "$TMP"
 [ "$(date -u -d @"$(stat -c %Y "$OKFILE")" +%Y%m%d)" = "$STAMP" ] || { log "GATE-WAIT: backup last_ok not from $STAMP"; exit 10; }
 # GATE 2: primary free (nightly/delta not attached)
 if fuser "$DB" >/dev/null 2>&1; then log "GATE-WAIT: primary busy (nightly/delta)"; exit 11; fi
+# GATE 3: RAM headroom (need ~16G free for a safe 12G-limit CTAS)
+AVAIL=$(free -m | awk '/^Mem:/{print $7}')
+[ "${AVAIL:-0}" -ge 16000 ] || { log "GATE-WAIT: only ${AVAIL}MB available (<16G) — box busy"; exit 12; }
 # IDEMPOTENCE: already applied?
 pre=$(ddw "$DB" -readonly -noheader -list "SELECT count(*) FROM mirror.leads_current WHERE general_industry='Construction'" 2>/dev/null || echo ERR)
 [ "$pre" = "ERR" ] && { log "FATAL cannot read primary"; exit 2; }
@@ -33,7 +37,7 @@ log "lock acquired (pre-change Title-Case Construction rows=$pre); PHASE A build
 
 ddw "$DB" <<SQL 2>&1 | tee -a "$LOG"
 PRAGMA temp_directory='$TMP';
-SET memory_limit='20GB';
+SET memory_limit='12GB';
 SET threads=4;
 DROP TABLE IF EXISTS mirror.leads_current_lcnew;
 CREATE TABLE IF NOT EXISTS mirror.industry_lc_backup_${STAMP} AS
@@ -57,7 +61,7 @@ OLD=$(ddw "$DB" -readonly -noheader -list "SELECT count(*) FROM mirror.leads_cur
 NEW=$(ddw "$DB" -readonly -noheader -list "SELECT count(*) FROM mirror.leads_current_lcnew" 2>/dev/null)
 log "rowcount old=$OLD new=$NEW"
 if [ "$OLD" != "$NEW" ] || [ -z "$NEW" ]; then
-  log "FATAL rowcount mismatch — aborting, dropping lcnew (no swap done)"
+  log "FATAL rowcount mismatch — aborting, dropping lcnew (no swap done)"; alert ":rotating_light: industry-lowercase ABORTED: rowcount mismatch (no swap). See industry_lowercase_apply.log"
   ddw "$DB" "DROP TABLE IF EXISTS mirror.leads_current_lcnew;" >>"$LOG" 2>&1
   flock -u 9; exit 6
 fi
@@ -85,7 +89,7 @@ DROP TABLE mirror._industry_lc_map;
 SQL
 rc=${PIPESTATUS[0]}
 flock -u 9
-[ "$rc" -eq 0 ] || { log "FATAL phase B rc=$rc — data intact in leads_current; indexes/PK may be partial, re-run to repair"; exit 7; }
+[ "$rc" -eq 0 ] || { log "FATAL phase B rc=$rc — data intact; indexes/PK may be partial, re-run to repair"; alert ":rotating_light: industry-lowercase phase-B FAILED rc=$rc — data intact, indexes may be partial, re-run apply script"; exit 7; }
 
 # verify + counts
 IDX=$(ddw "$DB" -readonly -noheader -list "SELECT count(*) FROM duckdb_indexes() WHERE table_name='leads_current'" 2>/dev/null)
@@ -95,4 +99,4 @@ log "post-swap: indexes=$IDX (want 14), Title-Case Construction=$POST (want 0), 
 log "refreshing serving copy"
 /opt/duckdb/bin/refresh_lead_serving.sh >>"$LOG" 2>&1 && log "serving refreshed" || log "WARN serving refresh failed — will propagate at 03:50"
 touch "$VOL/.industry_lc.done"
-log "DONE industry lowercase swap complete"
+log "DONE industry lowercase swap complete"; alert ":white_check_mark: industry-lowercase swap DONE — Title-Case Construction=$POST (want 0), lowercase=$LOWC, indexes=$IDX/14. Mirror general_industry + specific_industry now lowercase (acronym-safe)."
