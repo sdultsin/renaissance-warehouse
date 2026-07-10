@@ -892,12 +892,24 @@ def write_summary_block(sid):
         blk.append(["WhatsApp PRE-IPO", 0, WA_PREIPO_MTG, ""]); grand += WA_PREIPO_MTG
     if TARIFFS_M:
         blk.append(["Tariffs", "", TARIFFS_M, ""]); grand += TARIFFS_M
+    # EXHAUSTIVE partition: the named lanes above cover email/sms/whatsapp/call(Funding) + Pre-IPO
+    # SMS/WA + Tariffs. Any meeting outside them — LinkedIn, NULL/other channel, a Pre-IPO CALL
+    # (call,1), or an email booking whose workspace_name didn't map to a roster desk — is REAL and
+    # counted in §5; render it as a visible "Other" lane (never silently dropped) so the displayed
+    # lanes always sum to the true day total. canon_total = every canonical meeting for the day.
+    canon_total = sum(MEET_CO.values()) if MEET_CO else grand
+    other = canon_total - grand
+    if other:
+        blk.append(["Other lanes (LinkedIn / other channel / unmapped desk)", "", other, ""])
+        grand += other
     blk.append(["", "", "", ""])
     blk.append(["GRAND TOTAL (all lanes = §5 partner total)", "", grand, ""])
-    # self-check: the overview grand total must equal §5 partner total (the true day count)
+    # self-checks: the overview grand total must equal both the canonical day total AND §5 partner total.
+    if grand != canon_total:
+        print(f"WARN summary grand total {grand} != canonical day total {canon_total} on {DAILY}", file=sys.stderr)
     if PARTNER_D_TOTAL and grand != PARTNER_D_TOTAL:
         print(f"WARN summary grand total {grand} != §5 partner total {PARTNER_D_TOTAL} on {DAILY} "
-              f"(a meeting lane is mis-summed or a channel is missing)", file=sys.stderr)
+              f"(canonical vs partner-view mismatch — investigate)", file=sys.stderr)
     api("PUT", f"{BASE}/values/{urllib.parse.quote(DAILY_TAB)}!L4?valueInputOption=USER_ENTERED", {"values": blk})
     n = len(blk); r0 = 3; r1 = r0 + n; CREAM = rgb(0.988, 0.953, 0.804)
     def br(a, b, c=11, d=15): return {"sheetId": sid, "startRowIndex": a, "endRowIndex": b, "startColumnIndex": c, "endColumnIndex": d}
