@@ -1,0 +1,27 @@
+-- @gate: add
+-- Depends on 16
+-- 1098: mirror the new comms.suppression.source provenance column [2026-07-10]
+--
+-- comms migration 040 (booked-exclusivity DNC) added `source TEXT` to the SOURCE
+-- table comms.suppression and BACKFILLED it: verified 90,408/90,408 booked/form
+-- rows carry a non-null source (portal:<id> / meeting_canonical:<src>:<id> /
+-- gbc_app:<id> / lead_app:<uuid> / sheet:Bookings!<row>). This DDL declares the
+-- matching column on the warehouse raw table so the mirror carries it through.
+--
+-- PRODUCER EXISTS — NOT all-NULL: entities/comms_mirror.py::_build_select derives
+-- its INSERT...SELECT column list from PRAGMA table_info(raw_comms_suppression)
+-- and emits `SELECT <col> FROM pg.comms.suppression.<col>` by EXACT column name.
+-- So once this raw column exists, the nightly REPLACE populates it from the live
+-- comms.suppression.source (which is present + backfilled), not as NULL.
+--
+-- NAME `source` IS REQUIRED, and does NOT collide with source_conversation_id:
+-- the mirror matches columns by EXACT name (not prefix/fuzzy), so the raw column
+-- must be named exactly `source` to bind to comms.suppression.source — renaming
+-- it (e.g. dnc_source) would make the SELECT reference a non-existent source
+-- column and break the sync. `source` and the existing `source_conversation_id`
+-- are distinct exact keys with no code path that conflates them; the lexical
+-- adjacency is the R5 advisory only (permanent WARN, never blocks).
+--
+-- Additive + idempotent; no backfill of the raw table needed (the mirror is
+-- full-refresh REPLACE, so the next nightly run repopulates every row incl. source).
+ALTER TABLE raw_comms_suppression ADD COLUMN IF NOT EXISTS source VARCHAR;
