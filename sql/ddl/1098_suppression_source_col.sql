@@ -1,0 +1,13 @@
+-- @gate: add
+-- Depends on 16
+-- 1098: mirror the new comms.suppression.source provenance column [2026-07-10]
+--
+-- comms migration 040 (booked-exclusivity DNC) added `source TEXT` to
+-- comms.suppression to record which system/row put each key on the DNC
+-- (portal:<id> / meeting_canonical:<src>:<id> / gbc_app:<id> / lead_app:<uuid> /
+-- sheet:Bookings!<row> / scrub-backfill-*). The comms_mirror entity derives its
+-- INSERT...SELECT column list from this raw table's columns (PRAGMA table_info),
+-- so the new source column only flows through once the raw table declares it.
+-- Additive + idempotent; no backfill needed (the nightly mirror is REPLACE, so
+-- the next run repopulates every row including source).
+ALTER TABLE raw_comms_suppression ADD COLUMN IF NOT EXISTS source VARCHAR;
