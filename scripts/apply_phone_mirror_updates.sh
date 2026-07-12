@@ -124,10 +124,47 @@ COMMIT;
 SQL
 }
 
-if ! apply_write "$APPLY_MEM"; then
-  echo "[$(ts)] WARN: apply failed at memory_limit=${APPLY_MEM}; failed txn rolled back -- retrying once at ${RETRY_MEM} (threads=2)"
-  apply_write "$RETRY_MEM" "SET threads=2;"
-fi
+# ---------------------------------------------------------------------------
+# Attempt loop [2026-07-12]. Two DISTINCT failure classes, handled separately:
+#   1. OPEN-CONFLICT: a read-only duckdb holder on the primary (e.g. the hourly
+#      intent-diary sweep's `duckdb -readonly` exports, cron :05 — the holder
+#      that broke every 23:05 run 07-07..07-11) blocks our read-write open with
+#      "Could not set lock ... Conflicting lock is held". The OS .writer.lock we
+#      already hold only serializes WRITERS; it cannot exclude readers of the
+#      DB file. NOT a memory failure — wait for the holder to clear and retry
+#      the open (20s backoff, bounded by MIRROR_OPEN_RETRY_S, default 20 min).
+#   2. MEMORY/PIN failure inside the txn: rolled back cleanly by duckdb; retry
+#      ONCE at RETRY_MEM with threads=2 (unchanged behavior).
+# ---------------------------------------------------------------------------
+OPEN_RETRY_S="${MIRROR_OPEN_RETRY_S:-1200}"
+ERRF="$(mktemp /tmp/apply_phone_mirror.stderr.XXXXXX)"
+trap 'rm -f "$ERRF"' EXIT
+
+attempt() {  # $1=mem  $2=extra-prelude — stderr captured to $ERRF, then re-emitted
+  local rc=0
+  apply_write "$1" "${2:-}" 2>"$ERRF" || rc=$?
+  cat "$ERRF" >&2
+  return "$rc"
+}
+
+open_deadline=$(( $(date +%s) + OPEN_RETRY_S ))
+mem="$APPLY_MEM"; extra=""; mem_retried=0
+while ! attempt "$mem" "$extra"; do
+  if grep -q "Could not set lock" "$ERRF"; then
+    if [ "$(date +%s)" -ge "$open_deadline" ]; then
+      echo "[$(ts)] ERR: primary still lock-held by another process after ${OPEN_RETRY_S}s of open retries -- giving up"
+      exit 77
+    fi
+    echo "[$(ts)] open blocked by a conflicting holder on the primary -- sleeping 20s then retrying open (memory_limit=${mem})"
+    sleep 20
+  elif [ "$mem_retried" -eq 0 ]; then
+    echo "[$(ts)] WARN: apply failed at memory_limit=${mem}; failed txn rolled back -- retrying once at ${RETRY_MEM} (threads=2)"
+    mem="$RETRY_MEM"; extra="SET threads=2;"; mem_retried=1
+  else
+    echo "[$(ts)] ERR: apply failed again at memory_limit=${mem} -- giving up"
+    exit 1
+  fi
+done
 
 echo "[$(ts)] === post-commit verify ==="
 ddw -readonly "$DB" <<SQL
