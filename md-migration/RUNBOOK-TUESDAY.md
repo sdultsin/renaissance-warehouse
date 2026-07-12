@@ -121,7 +121,7 @@ the refusal was correct behavior (bad nightly), only if the runner itself malfun
 /root/md-migration/reader_flip.sh apply
 
 # c.2 verify through the real consumer path (bearer-authenticated REST query)
-TOK=$(head -1 /opt/duckdb/allowed_tokens.txt | awk '{print $1}')
+TOK=$(grep -v '^#' /opt/duckdb/allowed_tokens.txt | head -1 | awk '{print $1}')
 curl -s -H "Authorization: Bearer $TOK" -H 'Content-Type: application/json' \
   -d '{"sql":"SELECT count(*) FROM core.reply"}' http://localhost:8899/query | head -c 400
 # expect rows + "snapshot_id":"md:warehouse_b" (or _a). Latency 20–300ms is normal.
