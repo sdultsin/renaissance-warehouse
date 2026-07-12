@@ -1,0 +1,14 @@
+[
+  {"name": "core_reply_floor",        "sql": "SELECT count(*) FROM core.reply",                                                              "min": 900000,
+   "note": "parity-time canary (1.01M on 07-09, 1.08M on 07-12); 0 on 07-12 in md:warehouse was the mid-repair copy bug this gate exists for"},
+  {"name": "campaign_daily_fresh",    "sql": "SELECT count(*) FROM core.campaign_daily WHERE date >= current_date - INTERVAL 2 DAY",         "min": 1,
+   "note": "nightly_success_watchdog freshness check, ported"},
+  {"name": "sync_run_committed",      "sql": "SELECT count(*) FROM core.sync_run WHERE status IN ('success','partial') AND phase_count >= 5 AND started_at >= now() - INTERVAL 30 HOUR", "min": 1,
+   "note": "tonight's nightly actually COMMITTED"},
+  {"name": "workspaces_present",      "sql": "SELECT count(*) FROM core.workspace",                                                          "min": 8,
+   "note": "8 real workspaces + My Organization"},
+  {"name": "meetings_present",        "sql": "SELECT count(*) FROM core.meeting",                                                            "min": 10000,
+   "note": "THE meetings truth table is non-trivially populated (38,358 on 07-12)"},
+  {"name": "instantly_email_floor",   "sql": "SELECT count(*) FROM main.raw_instantly_email",                                                "min": 300000,
+   "note": "irreplaceable email prose store, append-only system of record (379,081 on 07-12) — must never shrink"}
+]

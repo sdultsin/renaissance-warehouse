@@ -1,0 +1,8 @@
+# MotherDuck write-path cron lines — install per RUNBOOK-TUESDAY.md step (a.5). Staged 2026-07-12 (Lane B).
+# These REPLACE the 09:00Z md_load_tables_v3 storefront refresh (comment it out, keep as fallback).
+
+# publish committed nightly -> staging color -> validate/canaries -> atomic swap [2026-07-14]
+*/30 6-15 * * * /usr/bin/flock -n /tmp/md_write_path.lock /root/md-migration/md_write_path.sh >> /root/md-migration/md_write_path.log 2>&1
+
+# MotherDuck serving health + freshness watchdog (re-armed; was removed 07-10 to stop trial-credit burn)
+*/15 * * * * /usr/bin/flock -n /tmp/md_watchdog.lock /usr/bin/python3 /root/md-migration/md_health_watchdog.py >> /root/md-migration/md_watchdog.log 2>&1

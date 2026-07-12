@@ -1,0 +1,222 @@
+# serving-mcp config — single source of operational + validation-gate truth.
+# Profile-driven: `prod` runs against the real compacted warehouse; `test` runs against tiny
+# synthetic fixtures (isolated paths + ports + dummy service units) so every SP-4 probe is
+# forced-failure-testable without compaction and WITHOUT touching prod serving/systemd.
+# Select via env SERVING_PROFILE=prod|test (default prod). Migration-agnostic SQL throughout.
+#
+# Structure: top-level keys are the PROD defaults. Each profile may carry an `overrides:` block
+# that deep-merges over them (load_config does the merge). The gate spec lives per-profile.
+
+# ---------------- operational defaults (prod) ----------------
+paths:
+  root: /opt/duckdb
+  writer_primary: /root/core/warehouse.duckdb
+  snapshots_dir: /opt/duckdb/snapshots
+  current_symlink: /opt/duckdb/warehouse_current.duckdb
+  known_good_symlink: /opt/duckdb/snapshots/_known_good
+  registry: /opt/duckdb/registry/validated.jsonl
+  logs_dir: /opt/duckdb/logs
+  selfheal_log: /opt/duckdb/logs/selfheal.jsonl
+  surveillance_log: /opt/duckdb/logs/surveillance.jsonl
+  heartbeat: /opt/duckdb/logs/surveillance.heartbeat
+  watcher_log: /opt/duckdb/logs/watcher.jsonl
+  query_guide: /opt/duckdb/warehouse-query-prompt.md
+  allowed_tokens: /opt/duckdb/allowed_tokens.txt
+
+retention:
+  keep_snapshots: 2        # restored 1->2 [2026-06-24]: 1TB volume live; prior TEMP was for the old 198GiB vol
+                           # Restore to 2 after the volume is resized to >=300GB (see deliverables resize note).
+  disk_floor_gb: 20       # restored 5->20 [2026-06-24]: 1TB volume live; prior TEMP was for the old 198GiB vol
+                           # 8GiB is still a safe in-flight margin; restore to 20 after the resize.
+
+mcp:
+  host: 0.0.0.0
+  port: 8899
+  per_query_threads: 2
+  per_query_memory_limit: 2GB
+  statement_timeout_ms: 60000
+  max_rows: 100000
+
+surveillance:
+  interval_sec: 180
+  heartbeat_max_age_sec: 420
+  publish_cadence_hours: 26
+  latency_warn_ms: 8000
+
+selfheal:
+  flap_window_sec: 1800
+  flap_max_fixes: 4
+
+services:
+  mcp_unit: mcp-server.service
+  surveillance_unit: surveillance.service
+
+cutover:
+  done_marker: /opt/duckdb/CUTOVER_DONE
+  old_serving_path: /root/core/warehouse_serving.duckdb
+  lens_unit: lens.service
+
+# ---------------- profiles (gate spec + optional overrides) ----------------
+profiles:
+
+  prod:
+    overrides: {}
+    required_schema:
+      raw_pipeline_campaign_daily_metrics: [date, campaign_id, sent, unique_replies, unique_replies_automatic, unique_opportunities, workspace_id]
+      raw_pipeline_campaigns: [campaign_id, workspace_id, cm_name]
+      v_kpi_email: [sent]
+      v_campaign_metrics: [campaign_id, sent, unique_replies, opportunities, reply_rate, opp_rate, metric_source]
+      raw_instantly_campaign_analytics: [campaign_id, reply_count_unique, emails_sent_count, _loaded_at]
+      "core.meeting": [campaign_id, posted_at, source]
+      "core.sending_account_daily": [esp, actual_sends, date, workspace_slug]
+      v_sms_campaign_performance: [sent, delivered, positive_replies, metric_date]
+    row_floors:
+      raw_pipeline_campaign_daily_metrics: 20000        # campaign×day grain (~24k rows; was a mis-set 20M lead-grain floor). real-collapse guard. [2026-06-14]
+      v_campaign_metrics: 1500
+      "core.meeting": 8000
+      "core.sending_account_daily": 80000
+    canaries:
+      - id: f4_koi_jun10_sends
+        expect: 508685
+        sql: |
+          SELECT COALESCE(SUM(cd.sent),0)::BIGINT FROM raw_pipeline_campaign_daily_metrics cd
+          LEFT JOIN (SELECT DISTINCT ON (campaign_id) campaign_id, workspace_id
+                     FROM raw_pipeline_campaigns ORDER BY campaign_id, _loaded_at DESC) d USING(campaign_id)
+          WHERE cd.date = DATE '2026-06-10' AND d.workspace_id = 'koi-and-destroy';
+      # Scoped to WAREHOUSE-ATTRIBUTABLE violations only [2026-07-01]: a row is exempt iff the
+      # view FAITHFULLY MIRRORS a RAW upstream Instantly analytics row (latest _loaded_at per
+      # campaign_id) that ITSELF reports reply_count_unique > emails_sent_count — inherent
+      # vendor churn (deleted / lead-purged campaign frozen at sent=0 with a stray pre-send
+      # reply attribution), NOT our pipeline math; the set grows with every purge/rename, so
+      # per-id allowlisting is wrong. The value-equality conjuncts (adversarial-review finding)
+      # keep a v109-class corruption landing ON an inherent row visible: any view/raw divergence
+      # FIRES. Everything else still FIRES too: pipeline_fallback-sourced rows, and
+      # instantly_analytics rows where raw was consistent but v_campaign_metrics isn't (the
+      # v109/v113 regression class this canary exists to catch). Keyed on campaign_id (renames
+      # keep the id — the BOUNCED-prefix rule).
+      - id: vcm_replies_gt_sent_is_zero
+        expect: 0
+        sql: |
+          SELECT count(*)::BIGINT FROM v_campaign_metrics m
+          WHERE m.unique_replies IS NOT NULL AND m.sent IS NOT NULL AND m.unique_replies > m.sent
+            AND NOT (m.metric_source = 'instantly_analytics'
+                     AND COALESCE((SELECT r.reply_count_unique > r.emails_sent_count
+                                          AND m.unique_replies = r.reply_count_unique
+                                          AND m.sent = r.emails_sent_count
+                                   FROM raw_instantly_campaign_analytics r
+                                   WHERE r.campaign_id = m.campaign_id
+                                   ORDER BY r._loaded_at DESC LIMIT 1), FALSE));
+      # Scoped to WAREHOUSE-ATTRIBUTABLE violations only [2026-07-02] — the SAME inherent-churn
+      # exemption as vcm_replies_gt_sent_is_zero above (see its comment; same class, same
+      # conjuncts). A reply_rate outside [0,1] is exempt iff metric_source=instantly_analytics
+      # AND the latest raw raw_instantly_campaign_analytics row per campaign_id ITSELF has
+      # reply_count_unique > emails_sent_count AND the view value-equals that raw row on
+      # replies+sent AND sent > 0 AND the rate ITSELF equals round(replies/sent,5) — the view's
+      # exact inline derivation. The extra rate-pinning conjunct (absent from C4, which checks
+      # only base columns) closes the derived-column hole: a v109-class VIEW redefinition
+      # corrupting only the rate expression while replies/sent still mirror raw would otherwise
+      # be masked (synthetic proof case neg_rate caught this). sent > 0 closes the inf edge
+      # (sent=0 mirror of an inherent raw row -> replies/0 = inf = inf would self-exempt;
+      # adversarial-review finding — the faithful view NULLIFs sent, so exempt rows have
+      # sent >= 1 and the conjunct costs nothing). pipeline_fallback rows, any view/raw
+      # divergence, rate-only corruption, and NULL raw counts still FIRE (COALESCE fail-closed).
+      # 07-02 trigger: bb6c1d59 "OTD TO GOODLE/GOOGLE - Construction (SAMUEL)" sent=1
+      # unique_replies=16 rr=16.0 — deleted-campaign Instantly churn.
+      - id: reply_rate_in_unit_violations
+        expect: 0
+        sql: |
+          SELECT count(*)::BIGINT FROM v_campaign_metrics m
+          WHERE (m.reply_rate < 0 OR m.reply_rate > 1)
+            AND NOT (m.metric_source = 'instantly_analytics'
+                     AND m.sent > 0
+                     AND m.reply_rate = round(CAST(m.unique_replies AS DOUBLE) / m.sent, 5)
+                     AND COALESCE((SELECT r.reply_count_unique > r.emails_sent_count
+                                          AND m.unique_replies = r.reply_count_unique
+                                          AND m.sent = r.emails_sent_count
+                                   FROM raw_instantly_campaign_analytics r
+                                   WHERE r.campaign_id = m.campaign_id
+                                   ORDER BY r._loaded_at DESC LIMIT 1), FALSE));
+    sanity_sql: /opt/duckdb/bin/sanity_checks.sql
+    freshness:
+      table: raw_pipeline_campaign_daily_metrics
+      date_col: date
+      max_lag_days: 2
+    correctness_spotchecks:
+      - id: f4_via_query
+        sql: |
+          SELECT COALESCE(SUM(cd.sent),0)::BIGINT FROM raw_pipeline_campaign_daily_metrics cd
+          LEFT JOIN (SELECT DISTINCT ON (campaign_id) campaign_id, workspace_id
+                     FROM raw_pipeline_campaigns ORDER BY campaign_id, _loaded_at DESC) d USING(campaign_id)
+          WHERE cd.date = DATE '2026-06-10' AND d.workspace_id = 'koi-and-destroy';
+    nonempty_canary_sql: |
+      SELECT count(*)::BIGINT FROM raw_pipeline_campaign_daily_metrics;
+
+  test:
+    overrides:
+      paths:
+        writer_primary: /opt/duckdb/test_fixtures/build_good.duckdb
+        snapshots_dir: /opt/duckdb/test_fixtures/snapshots
+        current_symlink: /opt/duckdb/test_fixtures/warehouse_current.duckdb
+        known_good_symlink: /opt/duckdb/test_fixtures/snapshots/_known_good
+        registry: /opt/duckdb/test_fixtures/registry/validated.jsonl
+        logs_dir: /opt/duckdb/test_fixtures/logs
+        selfheal_log: /opt/duckdb/test_fixtures/logs/selfheal.jsonl
+        surveillance_log: /opt/duckdb/test_fixtures/logs/surveillance.jsonl
+        heartbeat: /opt/duckdb/test_fixtures/logs/surveillance.heartbeat
+        watcher_log: /opt/duckdb/test_fixtures/logs/watcher.jsonl
+        query_guide: /opt/duckdb/test_fixtures/warehouse-query-prompt.md
+        allowed_tokens: /opt/duckdb/test_fixtures/allowed_tokens.txt
+      mcp:
+        port: 8898
+        statement_timeout_ms: 2000
+      retention:
+        keep_snapshots: 2
+        disk_floor_gb: 1
+      surveillance:
+        publish_cadence_hours: 26
+      selfheal:
+        flap_window_sec: 60
+        flap_max_fixes: 2
+      services:
+        mcp_unit: mcp-server-test.service
+        surveillance_unit: surveillance-test.service
+      cutover:
+        done_marker: /opt/duckdb/test_fixtures/CUTOVER_DONE
+        old_serving_path: /opt/duckdb/test_fixtures/old_serving.duckdb
+        lens_unit: serving-dummy.service
+    required_schema:
+      raw_pipeline_campaign_daily_metrics: [date, campaign_id, sent, unique_replies, unique_opportunities, workspace_id]
+      raw_pipeline_campaigns: [campaign_id, workspace_id, cm_name]
+      v_campaign_metrics: [campaign_id, sent, unique_replies, reply_rate]
+      "core.meeting": [campaign_id, posted_at, source]
+    row_floors:
+      raw_pipeline_campaign_daily_metrics: 100
+      v_campaign_metrics: 3
+      "core.meeting": 5
+    canaries:
+      - id: f4_koi_jun10_sends
+        expect: 508685
+        sql: |
+          SELECT COALESCE(SUM(cd.sent),0)::BIGINT FROM raw_pipeline_campaign_daily_metrics cd
+          LEFT JOIN (SELECT DISTINCT ON (campaign_id) campaign_id, workspace_id
+                     FROM raw_pipeline_campaigns ORDER BY campaign_id, _loaded_at DESC) d USING(campaign_id)
+          WHERE cd.date = DATE '2026-06-10' AND d.workspace_id = 'koi-and-destroy';
+      - id: vcm_replies_gt_sent_is_zero
+        expect: 0
+        sql: |
+          SELECT count(*)::BIGINT FROM v_campaign_metrics
+          WHERE unique_replies IS NOT NULL AND sent IS NOT NULL AND unique_replies > sent;
+    sanity_sql: /opt/duckdb/bin/sanity_checks_test.sql
+    freshness:
+      table: raw_pipeline_campaign_daily_metrics
+      date_col: date
+      max_lag_days: 100000
+    correctness_spotchecks:
+      - id: f4_via_query
+        sql: |
+          SELECT COALESCE(SUM(cd.sent),0)::BIGINT FROM raw_pipeline_campaign_daily_metrics cd
+          LEFT JOIN (SELECT DISTINCT ON (campaign_id) campaign_id, workspace_id
+                     FROM raw_pipeline_campaigns ORDER BY campaign_id, _loaded_at DESC) d USING(campaign_id)
+          WHERE cd.date = DATE '2026-06-10' AND d.workspace_id = 'koi-and-destroy';
+    nonempty_canary_sql: |
+      SELECT count(*)::BIGINT FROM raw_pipeline_campaign_daily_metrics;
