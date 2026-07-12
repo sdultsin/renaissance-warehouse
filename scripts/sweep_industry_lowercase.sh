@@ -18,7 +18,7 @@ mkdir -p "$TMP"
 
 [ -f "$VOL/.industry_lc.done" ] || { log "skip: initial swap not applied yet"; exit 0; }
 if fuser "$DB" >/dev/null 2>&1; then log "skip: primary busy"; exit 0; fi
-AVAIL=$(free -m|awk '/^Mem:/{print $7}'); [ "${AVAIL:-0}" -ge 8000 ] || { log "skip: low RAM ${AVAIL}MB"; exit 0; }
+AVAIL=$(free -m|awk '/^Mem:/{print $7}'); [ "${AVAIL:-0}" -ge 12000 ] || { log "skip: low RAM ${AVAIL}MB"; exit 0; }
 
 exec 9>"$LOCKFILE"; flock -w 300 9 || { log "skip: could not get lock"; exit 0; }
 
@@ -46,8 +46,12 @@ CNT=$(( $(wc -l < "$MAP") - 1 ))
 if [ "$CNT" -le 0 ]; then log "clean: 0 stragglers"; flock -u 9; exit 0; fi
 log "sweeping $CNT straggler value(s)"
 
+# memory_limit 20GB + threads=4 = the exact config that carried the full-table CTAS swap
+# (apply_industry_lowercase.sh) on this 32GB box. At 8GB/8-threads the post-consolidation
+# backlog sweep (62k values / ~700k rows) crashed duckdb v1.5.2 with malloc heap corruption
+# [2026-07-12]; the txn rolled back cleanly (rows/PK verified). Gate above requires 12GB free.
 ddw "$DB" <<SQL >> "$LOG" 2>&1
-PRAGMA temp_directory='$TMP'; SET memory_limit='8GB';
+PRAGMA temp_directory='$TMP'; SET memory_limit='20GB'; SET threads=4;
 CREATE OR REPLACE TABLE mirror._sweepmap AS
   SELECT * FROM read_csv('$MAP', header=true, quote='"', escape='"', columns={'col':'VARCHAR','old_value':'VARCHAR','new_value':'VARCHAR'});
 UPDATE mirror.leads_current AS l SET general_industry=m.new_value
