@@ -26,9 +26,20 @@ minimal, loss-free repair is:
 Safety: refuses to touch a table any FOREIGN KEY references; verifies the recreated
 column list is byte-identical to the pre-drop DESCRIBE; CHECKPOINTs at the end.
 
+UPDATE (same day, 15:19Z): the canonical re-run after the first repair FATAL'd on a
+THIRD table — core.conversion_event ("Only deleted 1890 out of 2048 rows") — which had
+rebuilt CLEANLY at 10:01Z in the run that then aborted. Evidence points at commits that
+sat in the WAL when a run aborted abnormally (FATAL invalidation / SIGTERM) replaying
+with inconsistent ART state on the next open. Iterating one FATAL at a time is a
+treadmill, so --copy mode rebuilds ALL canonical-phase tables in one pass,
+DATA-PRESERVING (some canonical tables — account_status_history, rollup_history,
+sendivo_cost — are append/upsert accumulators, NOT rebuildable from raw):
+  CREATE <table>__rebuild (same DDL) → INSERT SELECT * (full scan; never touches the
+  damaged index) → verify counts → DROP old → RENAME → recreate secondary indexes.
+
 Run ONLY under the single-writer lock:
   bash scripts/with_warehouse_lock.sh .venv/bin/python \
-      scripts/repair_20260712_art_rebuild.py [--dry-run] [--tables core.domain core.reply]
+      scripts/repair_20260712_art_rebuild.py [--dry-run] [--copy] [--tables core.domain core.reply]
 """
 from __future__ import annotations
 
@@ -49,6 +60,12 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tables", nargs="+", default=["core.domain", "core.reply"])
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument(
+        "--copy",
+        action="store_true",
+        help="data-preserving rebuild (copy-swap) instead of recreate-empty; "
+        "REQUIRED for append/upsert accumulator tables",
+    )
     args = ap.parse_args()
 
     conn = db_module.connect()
@@ -93,26 +110,64 @@ def main() -> int:
             print(f"-- captured INDEX {iname}: {isql}")
 
         if args.dry_run:
-            print("[dry-run] skipping drop/recreate")
+            print("[dry-run] skipping rebuild")
             continue
 
-        conn.execute(f"DROP TABLE {table}")
-        conn.execute(create_sql)
-        for _iname, isql in idx_rows:
-            conn.execute(isql)
+        if args.copy:
+            # data-preserving copy-swap: fresh table + fresh ART, old rows carried over
+            # via full scan (never touches the damaged index).
+            tmp_name = f"{name}__rebuild"
+            tmp = f'{schema}."{tmp_name}"'
+            conn.execute(f"DROP TABLE IF EXISTS {tmp}")
+            tmp_create = None
+            for pat in (f'CREATE TABLE {schema}."{name}"', f"CREATE TABLE {schema}.{name}"):
+                if pat in create_sql:
+                    tmp_create = create_sql.replace(pat, f'CREATE TABLE {schema}."{tmp_name}"', 1)
+                    break
+            if tmp_create is None:
+                print(f"ABORT: cannot rewrite CREATE sql for {table}", file=sys.stderr)
+                return 2
+            conn.execute(tmp_create)
+            conn.execute(f"INSERT INTO {tmp} SELECT * FROM {table}")
+            n_new = conn.execute(f"SELECT count(*) FROM {tmp}").fetchone()[0]
+            if n_new != n_before:
+                print(
+                    f"ABORT: copy count mismatch for {table}: old={n_before} new={n_new} "
+                    f"(leaving {tmp} for inspection)",
+                    file=sys.stderr,
+                )
+                return 2
+            conn.execute(f"DROP TABLE {table}")
+            conn.execute(f'ALTER TABLE {tmp} RENAME TO "{name}"')
+            for _iname, isql in idx_rows:
+                conn.execute(isql)
+            cols_after = conn.execute(f"DESCRIBE {table}").fetchall()
+            if cols_after != cols_before:
+                print(
+                    f"FATAL: rebuilt column list differs for {table}!\n"
+                    f"before={cols_before}\nafter={cols_after}",
+                    file=sys.stderr,
+                )
+                return 2
+            print(f"copy-swap rebuilt ok (rows={n_new}); schema identical; fresh ART")
+        else:
+            conn.execute(f"DROP TABLE {table}")
+            conn.execute(create_sql)
+            for _iname, isql in idx_rows:
+                conn.execute(isql)
 
-        cols_after = conn.execute(f"DESCRIBE {table}").fetchall()
-        if cols_after != cols_before:
-            print(
-                f"FATAL: recreated column list differs for {table}!\n"
-                f"before={cols_before}\nafter={cols_after}",
-                file=sys.stderr,
-            )
-            return 2
-        n_after = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
-        # exercise the exact op class that failed (no-op on the empty table)
-        conn.execute(f"DELETE FROM {table}")
-        print(f"recreated EMPTY ok (rows={n_after}); schema identical; DELETE exercises clean")
+            cols_after = conn.execute(f"DESCRIBE {table}").fetchall()
+            if cols_after != cols_before:
+                print(
+                    f"FATAL: recreated column list differs for {table}!\n"
+                    f"before={cols_before}\nafter={cols_after}",
+                    file=sys.stderr,
+                )
+                return 2
+            n_after = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+            # exercise the exact op class that failed (no-op on the empty table)
+            conn.execute(f"DELETE FROM {table}")
+            print(f"recreated EMPTY ok (rows={n_after}); schema identical; DELETE exercises clean")
 
     if not args.dry_run:
         conn.execute("CHECKPOINT")
