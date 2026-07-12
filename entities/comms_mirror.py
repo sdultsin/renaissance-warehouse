@@ -45,6 +45,7 @@ Tables mirrored:
   config.worker_config     -> raw_comms_worker_config           (coverage-audit gap #3; value REDACTED for secret keys)
   config.brand_followup_cap -> raw_comms_brand_followup_cap     (coverage-audit gap #3, 2026-07-09)
   config.iskra_watchdog_state -> raw_comms_iskra_watchdog_state (coverage-audit gap #3, 2026-07-09)
+  comms.instantly_lead_state_event -> raw_comms_instantly_lead_state_event (opp-state ledger, 2026-07-12)
 
 SECURITY (config.worker_config): its ``value`` column holds live secrets
 (worker_secret, cc_slack_bot_token). ``_COLUMN_EXPRS`` swaps ``value`` for
@@ -117,6 +118,15 @@ _TABLES: list[tuple[str, str, str]] = [
     ("config", "worker_config", "raw_comms_worker_config"),
     ("config", "brand_followup_cap", "raw_comms_brand_followup_cap"),
     ("config", "iskra_watchdog_state", "raw_comms_iskra_watchdog_state"),
+    # ── Instantly opp-state LEDGER (comms migs 042/043, 2026-07-12): append-only
+    # history of lead interest-state changes swept every ~30 min from the
+    # Instantly API (which keeps NO event history — relabels overwrite state, so
+    # this ledger is the only faithful record; daily-opp / ever-opp derived
+    # views build on it warehouse-side). DDL in
+    # sql/ddl/1099_instantly_lead_state_event_mirror.sql. No jsonb/enum/array
+    # columns → no casts. Full-refresh REPLACE like the rest (source is
+    # append-only, so the snapshot only grows).
+    ("comms", "instantly_lead_state_event", "raw_comms_instantly_lead_state_event"),
 ]
 
 # Columns that must be CAST to VARCHAR for postgres_scanner -> DuckDB. Covers
