@@ -15,13 +15,17 @@ from core.config import DB_PATH
 
 log = logging.getLogger(__name__)
 
-# Bound DuckDB memory on the 16GB droplet. DuckDB defaults memory_limit to ~80% of RAM
-# (~12.8GB here) — that is exactly the ~12.9GB RSS the kernel oom-killer reaped on 2026-06-12
-# (the nightly compaction's IMPORT), and the memory pressure that SIGTERM'd the 2026-06-13
-# nightly's reply_data mirror while ~10 cron jobs fired together at 03:30. Cap well below RAM and
-# let DuckDB spill intermediates to disk (temp_directory) instead of triggering OOM. Override via
-# WAREHOUSE_DUCKDB_MEMORY_LIMIT for memory-heavy one-offs on a quiet box.
-_MEMORY_LIMIT = os.environ.get("WAREHOUSE_DUCKDB_MEMORY_LIMIT", "8GB")
+# Bound DuckDB memory well below RAM and let DuckDB spill intermediates to disk
+# (temp_directory) instead of triggering the kernel oom-killer (which reaped the 2026-06-12
+# compaction IMPORT at ~12.9GB RSS back when this was a 16GB box). The box is 32GB now and the
+# old 8GB cap became the 07-11/07-12 nightly killer: entities/f_reply_canonical's dedup window
+# over raw_instantly_email (~12GB of reply_text/api_response_raw VARCHARs, growing daily)
+# OOM-thrashed at 8GB — a 15h one-core livelock on 07-11, then 'Invalid argument'/OutOfMemory
+# on 07-12 (both nightlies lost; ART-index collateral damage repaired by
+# scripts/repair_20260712_art_rebuild.py). 16GB completes that rebuild in ~83s and leaves half
+# the box for the OS page cache + the ~03:30Z cron herd. Override via
+# WAREHOUSE_DUCKDB_MEMORY_LIMIT for one-offs (either direction).
+_MEMORY_LIMIT = os.environ.get("WAREHOUSE_DUCKDB_MEMORY_LIMIT", "16GB")
 
 # ---------------------------------------------------------------------------
 # Single-writer safety net (warehouse-writer wlock — box-local realization).
