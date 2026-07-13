@@ -21,6 +21,12 @@
 --   once     -> NULL  (launched variant copy/spintax; never goes stale once loaded)
 --   retired  -> NULL  (intentionally lapsed; never alerts)
 --
+-- status='paused' (2026-07-13) — TEMPORARY operational pause of a live feed (e.g. SMS
+--   ops paused per Sam ~07-09 idles raw_sendivo_outbound_message). Exempt from
+--   is_stale/is_data_stale like 'retired', but the cadence/SLA policy is KEPT so
+--   un-pausing = flipping status back to 'active' (no SLA re-derivation needed).
+--   Use for known pauses instead of widening the SLA or marking retired.
+--
 -- biz_sla_days — data-recency SLA on last_biz_date (max(biz_date_column)). NULL = no
 --   check. Distinct from sla_hours: sla_hours watches "did the sync RUN", biz_sla_days
 --   watches "is the DATA recent" — a successful-but-empty sync trips only the latter.
@@ -38,7 +44,7 @@ CREATE TABLE IF NOT EXISTS core.sync_registry (
     biz_date_column   VARCHAR,               -- business-date column, if any (nullable)
     biz_sla_days      INTEGER,               -- data-recency SLA in days on last_biz_date (NULL = no check)
     is_send_sensitive BOOLEAN DEFAULT FALSE, -- TRUE => row_delta=0 on a send-day is an alert
-    status            VARCHAR DEFAULT 'active', -- active | retired | empty
+    status            VARCHAR DEFAULT 'active', -- active | retired | empty | paused
 
     -- refreshed state (written each run by refresh_sync_registry.py):
     last_synced_at    TIMESTAMPTZ,           -- max(freshness_column)
@@ -76,7 +82,7 @@ SELECT
     CASE WHEN last_biz_date IS NULL THEN NULL
          ELSE date_diff('day', last_biz_date, current_date) END   AS days_since_biz,
     CASE
-        WHEN status = 'retired'
+        WHEN status IN ('retired', 'paused')  -- paused = known operational pause [2026-07-13]
           OR expected_cadence IN ('once', 'retired')              THEN FALSE
         WHEN sla_hours IS NULL                                    THEN FALSE
         WHEN last_synced_at IS NULL                               THEN TRUE
@@ -84,7 +90,7 @@ SELECT
         ELSE FALSE
     END                                                           AS is_stale,
     CASE
-        WHEN status = 'retired'
+        WHEN status IN ('retired', 'paused')  -- paused = known operational pause [2026-07-13]
           OR expected_cadence IN ('once', 'retired')              THEN FALSE
         WHEN biz_sla_days IS NULL                                 THEN FALSE
         WHEN last_biz_date IS NULL                                THEN TRUE

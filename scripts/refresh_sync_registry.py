@@ -144,6 +144,34 @@ OVERRIDES: dict[str, dict] = {
         biz_date_column="metric_date", biz_sla_days=2,
         notes="§2 SMS sent + $/day per sub-account (entities/sendivo_billing_daily.py, "
               "'sendivo' phase); biz-recency SLA 2d"),
+    # 2026-07-13: SMS operations PAUSED per Sam (~07-09, ALL fleets incl. R3) — the
+    # sendivo outbound-message feed is intentionally idle, so its 36h wall-clock SLA
+    # breached (102h) and would page daily for the whole pause. status='paused' is the
+    # pause-aware exempt flag: v_warehouse_freshness (DDL 38) suppresses is_stale /
+    # is_data_stale for it like 'retired', while cadence=daily is KEPT — UNPAUSE by
+    # deleting this override when SMS resumes (next refresh restores the live SLA).
+    # NOT an SLA widen; raw_sendivo_billing_daily stays live (billing still lands).
+    "raw_sendivo_outbound_message": dict(status="paused",
+        notes="[2026-07-13] PAUSED: SMS ops paused per Sam ~07-09 (all fleets); feed "
+              "intentionally idle, staleness alerts suppressed via status=paused — "
+              "remove this override when SMS sending resumes"),
+    # 2026-07-13: the five raw_portal_archive_* tables are a ONE-SHOT archive (DDL
+    # 1094, 2026-07-09) of the portal's dormant pre-warehouse KPI/CEO history — "no
+    # recurring sync" by design (data inlined in the DDL, applies exactly once).
+    # Auto-discovery classified them ('other') as cadence=daily, so all five started
+    # breaching the phantom 36h SLA ~99h after the one-time load. cadence='once' =
+    # loaded-once, never goes stale (raw_registrar_domains pattern). There is no sync
+    # job to fix — the portal source tables have been dormant since ~2026-06-14.
+    "raw_portal_archive_cm_total": dict(cadence="once", source="darcy_portal",
+        notes="[2026-07-13] one-shot portal KPI archive (DDL 1094, snapshot 2026-07-09); no recurring sync by design"),
+    "raw_portal_archive_cm_individual": dict(cadence="once", source="darcy_portal",
+        notes="[2026-07-13] one-shot portal KPI archive (DDL 1094, snapshot 2026-07-09); no recurring sync by design"),
+    "raw_portal_archive_ceo_snapshot": dict(cadence="once", source="darcy_portal",
+        notes="[2026-07-13] one-shot portal CEO-dashboard archive (DDL 1094, snapshot 2026-07-09); no recurring sync by design"),
+    "raw_portal_archive_ceo_meetings": dict(cadence="once", source="darcy_portal",
+        notes="[2026-07-13] one-shot portal CEO-dashboard archive (DDL 1094, snapshot 2026-07-09); no recurring sync by design"),
+    "raw_portal_archive_ceo_infra_snapshot": dict(cadence="once", source="darcy_portal",
+        notes="[2026-07-13] one-shot portal CEO-dashboard archive (DDL 1094, snapshot 2026-07-09); no recurring sync by design"),
 }
 
 # Curated core/derived decision tables to register IF they exist (raw_ are auto).

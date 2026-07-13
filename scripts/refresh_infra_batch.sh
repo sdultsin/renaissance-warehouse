@@ -132,6 +132,28 @@ log "new parquets: rg_dim=$RG_ROWS (cancelled=$RG_CANCELLED) batch_labels=$BATCH
 [ -f "$OUT_DIR/domain_purchase.parquet" ] \
   || die "domain_purchase.parquet missing in $OUT_DIR — build step 9 would abort; ensure the domain-registry export is present before the refresh"
 
+# ── 2b. SELF-SEQUENCE BEHIND THE WHOLE NIGHTLY [2026-07-13] ──────────────────
+# The Mon 06:30Z slot now ALWAYS overlaps the 05:30Z nightly (the header's
+# "03:30-05:45 nightly window" note is stale; the nightly runs 05:30Z->10:46Z+
+# since the Instantly pull phases grew). On 07-06 and 07-13 the build's duckdb
+# CLI grabbed the writer flock in a gap between nightly write phases and then
+# held the PRIMARY's DuckDB RW lock for 2.5h / 4.3h (standalone the build takes
+# ~2min — the hold is pure contention with the concurrent nightly), starving
+# every read-only consumer of the primary for hours (07-13: intent-freshness
+# watchdog x3 alerts, signature_phone_sync, dashboard refreshers) and
+# guaranteeing the step-5 promote fails "writer active" (the nightly holds the
+# writer lock again by build-end). Queue behind the WHOLE nightly via its
+# run-lock, not just a single write: the build then runs standalone (~2min
+# lock hold) and the promote no longer collides. On timeout: alert + abort
+# (tables untouched; next Monday retries).
+NIGHTLY_LOCK="${NIGHTLY_LOCK:-/tmp/warehouse.nightly.lock}"
+NIGHTLY_WAIT_S="${NIGHTLY_WAIT_S:-28800}"
+log "waiting for the nightly to finish (flock $NIGHTLY_LOCK, max ${NIGHTLY_WAIT_S}s) ..."
+if ! flock -w "$NIGHTLY_WAIT_S" "$NIGHTLY_LOCK" true; then
+  die "nightly still running after ${NIGHTLY_WAIT_S}s (flock $NIGHTLY_LOCK) — not starting the build against a mid-run primary"
+fi
+log "nightly lock free — proceeding with the build"
+
 # ── 3. BUILD under the single-writer flock (one-txn full reconcile) ───────────
 # The live-derived membership floor (>= $MIN_LIVE) is enforced INSIDE the
 # transaction by the build SQL's error() guards, alongside its own rg_dim /

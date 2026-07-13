@@ -207,9 +207,15 @@ def _scan_sql(path: Path) -> str:
     if path.suffix == ".parquet":
         return f"read_parquet('{_quote_path(path)}')"
     if path.suffix == ".ndjson":
+        # sample_size=-1 [2026-07-13]: infer the schema from the WHOLE file, not the
+        # default 20k-row sample. Six infra_accounts batches (2026-07-12) failed with
+        # "JSON transform error ... unknown key" (signature / code / advanced.
+        # warmup_custom_ftag) because rows deep in the file carried nested keys absent
+        # from the sampled prefix; full-file inference unions them (verified: all 6
+        # batches parse, top-level columns unchanged vs raw_pipeline_infra_accounts).
         return (
             f"read_json_auto('{_quote_path(path)}', format='newline_delimited', "
-            f"maximum_object_size=33554432)"
+            f"maximum_object_size=33554432, sample_size=-1)"
         )
     raise ValueError(f"unsupported file type: {path.name} (want .parquet or .ndjson)")
 
