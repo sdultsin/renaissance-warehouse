@@ -45,6 +45,7 @@ import logging
 import os
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import TimeoutError as FuturesTimeout
 from datetime import datetime, timezone
 
 from core.registry import Registry, RunContext
@@ -57,6 +58,15 @@ logger = logging.getLogger("entities.account_tags")
 #   WORKERS — workspaces pulled CONCURRENTLY (each a distinct key). Bounded so the aggregate
 #             IP rate stays gentle; per-workspace paging is still serial (one cursor at a time).
 _WORKERS = max(1, int(os.environ.get("WAREHOUSE_ACCOUNT_TAGS_WORKERS", "3")))
+
+# DEADLINE (env-overridable; 0 = off, the historic behaviour).
+# This phase now runs inside PASS A of the nightly (before the morning serving promote), so an
+# Instantly-side slowdown here would delay BOTH the portal's morning snapshot and every phase in
+# PASS B. Cap the API pull at a wall clock: when it expires we keep whatever workspaces already
+# finished and SKIP the rest. Safe by construction — the refresh is ADDITIVE per workspace, so a
+# skipped workspace simply keeps its last-good tag rows (nothing is wiped, nothing half-written).
+# Degrades gracefully: warn + carry on, never abort the run. [2026-07-14]
+_DEADLINE_S = max(0, int(os.environ.get("WAREHOUSE_ACCOUNT_TAGS_DEADLINE_MIN", "0"))) * 60
 
 
 def register(registry: Registry) -> None:
@@ -114,11 +124,25 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
         logger.warning("account_tags: could not read census slug map: %s", exc)
 
     # --- pull every workspace's COMPLETE tag map concurrently (API only, no DB) -------------
+    # Bounded by _DEADLINE_S when set: on expiry we keep the workspaces that finished and skip the
+    # rest (they retain last-good rows — the refresh is additive). Never aborts the run.
     results: list[dict] = []
+    skipped: list[str] = []
     with ThreadPoolExecutor(max_workers=_WORKERS) as ex:
         futs = {ex.submit(_pull_workspace, slug, keys[slug]): slug for slug in sorted(keys)}
-        for fut in as_completed(futs):
-            results.append(fut.result())
+        try:
+            for fut in as_completed(futs, timeout=_DEADLINE_S or None):
+                results.append(fut.result())
+        except FuturesTimeout:
+            skipped = [slug for fut, slug in futs.items() if not fut.done()]
+            for fut in futs:
+                fut.cancel()
+            logger.warning(
+                "account_tags: hit the %d-min deadline — %d workspace(s) pulled, SKIPPING %s "
+                "(they keep their last-good tag rows; nothing wiped). Raise "
+                "WAREHOUSE_ACCOUNT_TAGS_DEADLINE_MIN if this recurs.",
+                _DEADLINE_S // 60, len(results), ", ".join(skipped) or "-",
+            )
 
     # --- serial full-replace per CLEAN workspace (single writer) ----------------------------
     inboxes_written = 0
@@ -183,4 +207,6 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
         "workspaces_done": workspaces_done,
         "failures": failures,
         "workers": _WORKERS,
+        "deadline_min": _DEADLINE_S // 60,
+        "skipped_on_deadline": skipped,
     })

@@ -25,6 +25,67 @@ fi
 PYTHON="${PYTHON:-python3}"
 ORCHESTRATOR_ARGS="${ORCHESTRATOR_ARGS:-}"
 
+# ─── TWO-PASS NIGHTLY (2026-07-14) ────────────────────────────────────────────────────────────
+# The serving snapshot can only be published while the DuckDB WRITER LOCK IS FREE — i.e. only once
+# the orchestrator process has exited (the publisher aborts with "warehouse_writer_lock_held"
+# otherwise; see /opt/duckdb/logs/publish.jsonl). With a single ~7h pass, that meant the snapshot
+# landed ~09:40 ET, so the Renaissance Data Hub's morning rebuild ALWAYS served yesterday's
+# snapshot — fleet health was a full day stale every morning, every day.
+#
+# The fleet-health tables (account_census, sending_account, account_tags, account_first_cold_send)
+# are FAST. What sat in front of them was slow and unrelated: instantly_replies (~90m), dns_sweep
+# (~73m), CRM/comms. So the night is now split:
+#   PASS A  fleet-health only (~1.5h) -> PROMOTE       => Hub has same-day data by ~03:30 ET
+#   PASS B  everything else -> compaction -> PROMOTE   => all other consumers land as before
+# Every ingest still runs EXACTLY ONCE (no phase is re-run: account_status_history is append-only
+# and would double-insert), and no ingest moved ahead of an upstream it reads. PHASE_ORDER in
+# core/config.py is the source of truth for ordering; the orchestrator re-sorts into PHASE_ORDER,
+# so a typo here cannot run an ingest before its upstream.
+PASS_A_PHASES="${PASS_A_PHASES:-pipeline_mirror,inbox_loader,instantly,account_census,portal_core,account_tags_late}"
+PASS_B_PHASES="${PASS_B_PHASES:-comms_mirror,sendivo,iskra,outreachify,replies_late,close,sheets,otd_billing,im_bookings,account_truth,dns_sweep,canonical,iam_response_time,derived}"
+
+# The tag pull now runs inside PASS A, so it must not be able to stall the morning promote.
+# 8 workers = one per live workspace key (paging stays serial per key, so the aggregate IP rate
+# stays gentle); the deadline makes a slow Instantly night degrade gracefully — finished
+# workspaces are written, the rest keep their last-good rows. Both are env-overridable.
+export WAREHOUSE_ACCOUNT_TAGS_WORKERS="${WAREHOUSE_ACCOUNT_TAGS_WORKERS:-8}"
+export WAREHOUSE_ACCOUNT_TAGS_DEADLINE_MIN="${WAREHOUSE_ACCOUNT_TAGS_DEADLINE_MIN:-75}"
+
+# ─── promote_serving <reason> ─────────────────────────────────────────────────────────────────
+# Publishes the serving snapshot. Extracted into a function (2026-07-14) so it can be called TWICE:
+# once after PASS A (reason=portal-am) and once at nightly completion (reason=nightly-complete).
+# Unchanged semantics: bounded by a hard timeout, non-fatal, alerts on a non-zero publisher rc.
+# The publisher's own flock (publish.lock, LOCK_NB) makes a double-promote impossible, and it
+# re-validates server-side (size/verdict gate) before swapping, so it can never promote a bad
+# snapshot regardless of trigger. Sets PROMOTE_RC.
+promote_serving() {
+    local reason="$1"
+    PROMOTE_RC=0
+    local PUBLISHER_BIN="${PUBLISHER_BIN:-/opt/duckdb/bin/publisher.py}"
+    local PUBLISHER_PY="${PUBLISHER_PY:-/opt/duckdb/venv/bin/python}"
+    local PROMOTE_TIMEOUT_S="${PROMOTE_TIMEOUT_S:-2400}"  # serving copy ~118GiB (~16min measured 2026-07-07);
+                                                          # 900s got the copy KILLED at 110/126GB -> serving
+                                                          # stale ~17h. 40m = ~2.5x headroom, then bound.
+    if [[ ! -x "$PUBLISHER_PY" || ! -f "$PUBLISHER_BIN" ]]; then
+        echo "WARN publisher not found ($PUBLISHER_PY / $PUBLISHER_BIN) — skipping promote ($reason); 06:30 timer fallback still promotes" | tee -a "$LOG_FILE"
+        PROMOTE_RC=127
+        return 0
+    fi
+    echo "promoting serving snapshot (reason=$reason)" | tee -a "$LOG_FILE"
+    set +e
+    SERVING_PROFILE=prod SERVING_CONFIG=/opt/duckdb/bin/config.yaml \
+        timeout --signal=TERM --kill-after=60 "$PROMOTE_TIMEOUT_S" \
+        "$PUBLISHER_PY" "$PUBLISHER_BIN" --reason "$reason" 2>&1 | tee -a "$LOG_FILE"
+    PROMOTE_RC=${PIPESTATUS[0]}
+    set -e
+    if [[ "$PROMOTE_RC" -eq 0 ]]; then
+        echo "serving snapshot promoted (reason=$reason, rc=0)" | tee -a "$LOG_FILE"
+    else
+        echo "WARN serving snapshot promote (reason=$reason) returned rc=$PROMOTE_RC" | tee -a "$LOG_FILE"
+    fi
+    return 0
+}
+
 # Direct-Instantly reply ingest (raw_instantly_email → core.reply). The entity reads
 # this gate from the PROCESS environment only (not the merged .env files), so it must
 # be exported here — without it the nightly logs "skipping" and reports ok rows_in=0
@@ -45,11 +106,60 @@ echo "applying versioned DDL (setup_db)" | tee -a "$LOG_FILE"
 # which silently skipped compaction + all dashboard/serving publishes (root cause of
 # the 06-03 serving freeze). Disable -e just around the orchestrator so the partial-
 # handling logic below actually runs. (2026-06-08 F2 fix.)
-set +e
-# shellcheck disable=SC2086
-"$PYTHON" -m core.orchestrator $ORCHESTRATOR_ARGS 2>&1 | tee -a "$LOG_FILE"
-EXIT_CODE=${PIPESTATUS[0]}
-set -e
+if [[ -n "$ORCHESTRATOR_ARGS" ]]; then
+    # MANUAL/AD-HOC run (e.g. ORCHESTRATOR_ARGS="--phase dns_sweep"): behave exactly as before —
+    # one orchestrator invocation, no two-pass split, no mid-run promote. Only the unattended
+    # cron path (no args) takes the two-pass path below.
+    set +e
+    # shellcheck disable=SC2086
+    "$PYTHON" -m core.orchestrator $ORCHESTRATOR_ARGS 2>&1 | tee -a "$LOG_FILE"
+    EXIT_CODE=${PIPESTATUS[0]}
+    set -e
+else
+    # ── PASS A — fleet-health critical. Its whole purpose is to free the writer lock EARLY so the
+    # serving snapshot can be published while it is still the middle of the night ET. ──
+    echo "=== PASS A (fleet-health): $PASS_A_PHASES ===" | tee -a "$LOG_FILE"
+    set +e
+    "$PYTHON" -m core.orchestrator --phases "$PASS_A_PHASES" 2>&1 | tee -a "$LOG_FILE"
+    EXIT_A=${PIPESTATUS[0]}
+    set -e
+
+    # Promote on clean (0) or partial (1) — same policy as the dashboard publishes below: a partial
+    # means the tables WERE rebuilt and only peripheral ingests failed. Only a hard abort (2) keeps
+    # the last-good snapshot. The orchestrator has exited, so the writer lock is FREE and the
+    # publisher can actually copy (this is the whole point of the split).
+    if [[ "$EXIT_A" -eq 0 || "$EXIT_A" -eq 1 ]]; then
+        promote_serving "portal-am"
+        if [[ "$PROMOTE_RC" -ne 0 && "$PROMOTE_RC" -ne 127 ]]; then
+            # Non-fatal: PASS B still runs and its promote-at-completion is the backstop (that is
+            # exactly today's behaviour), so a failed morning promote degrades to the OLD timing —
+            # it can never make things worse than before this change.
+            "$PYTHON" scripts/alert_slack.py \
+                ":warning: *morning serving promote failed (rc=$PROMOTE_RC)* — PASS A (fleet health) rebuilt fine but the snapshot did not publish, so the Renaissance Data Hub will serve YESTERDAY's fleet health this morning. The nightly continues; the promote-at-completion still runs later. Check /opt/duckdb/logs/publish.jsonl." \
+                2>&1 | tee -a "$LOG_FILE" || true
+        fi
+    else
+        echo "PASS A hard-aborted (exit=$EXIT_A) — skipping morning promote (last-good snapshot kept)" | tee -a "$LOG_FILE"
+    fi
+
+    # ── PASS B — everything else. Slow, and nothing the fleet-health pages read depends on it. ──
+    echo "=== PASS B (everything else): $PASS_B_PHASES ===" | tee -a "$LOG_FILE"
+    set +e
+    "$PYTHON" -m core.orchestrator --phases "$PASS_B_PHASES" 2>&1 | tee -a "$LOG_FILE"
+    EXIT_B=${PIPESTATUS[0]}
+    set -e
+
+    # Roll the two passes into the single EXIT_CODE the rest of this script (and every downstream
+    # guard/watchdog) already understands: 2 (hard abort) dominates, then 1 (partial), else 0.
+    if [[ "$EXIT_A" -ge 2 || "$EXIT_B" -ge 2 ]]; then
+        EXIT_CODE=2
+    elif [[ "$EXIT_A" -eq 1 || "$EXIT_B" -eq 1 ]]; then
+        EXIT_CODE=1
+    else
+        EXIT_CODE=0
+    fi
+    echo "two-pass complete (PASS A=$EXIT_A, PASS B=$EXIT_B -> EXIT_CODE=$EXIT_CODE)" | tee -a "$LOG_FILE"
+fi
 
 # Set to 1 by any fail-loud post-orchestrator step (e.g. a failed campaign_data
 # D1 publish or a parity divergence) so the nightly's FINAL exit reflects the
@@ -415,33 +525,18 @@ fi
 # and does NOT change FINAL_EXIT, so it can't mask the orchestrator's own status.
 # Reversible: delete this block to revert to timer-only promotion.
 if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
-    echo "promoting serving snapshot (nightly complete; coupling promote to build completion)" | tee -a "$LOG_FILE"
-    PUBLISHER_BIN="${PUBLISHER_BIN:-/opt/duckdb/bin/publisher.py}"
-    PUBLISHER_PY="${PUBLISHER_PY:-/opt/duckdb/venv/bin/python}"
-    PROMOTE_TIMEOUT_S="${PROMOTE_TIMEOUT_S:-2400}"  # serving copy is ~118GiB now (~16min measured 2026-07-07;
-                                                    # 900s got the copy KILLED at 110/126GB -> rc=124, serving
-                                                    # stale ~17h). 40m = ~2.5x headroom for DB growth, then bound.
-    if [[ -x "$PUBLISHER_PY" && -f "$PUBLISHER_BIN" ]]; then
-        set +e
-        SERVING_PROFILE=prod SERVING_CONFIG=/opt/duckdb/bin/config.yaml \
-            timeout --signal=TERM --kill-after=60 "$PROMOTE_TIMEOUT_S" \
-            "$PUBLISHER_PY" "$PUBLISHER_BIN" --reason nightly-complete 2>&1 | tee -a "$LOG_FILE"
-        PROMOTE_RC=${PIPESTATUS[0]}
-        set -e
-        if [[ "$PROMOTE_RC" -eq 0 ]]; then
-            echo "serving snapshot promoted at nightly completion (rc=0)" | tee -a "$LOG_FILE"
-        else
-            # rc=1 can be a benign no-op (the 06:30 timer already promoted this same build,
-            # or we landed inside the 03:30-05:45 guard on an unusually fast night) — the
-            # publisher logs the precise reason. Alert anyway so a REAL promote failure is
-            # never silent; the 06:30 fallback + success-watchdog remain the safety net.
-            echo "WARN serving snapshot promote at completion returned rc=$PROMOTE_RC (06:30 timer fallback still armed)" | tee -a "$LOG_FILE"
-            "$PYTHON" scripts/alert_slack.py \
-                ":warning: *serving snapshot promote-at-completion rc=$PROMOTE_RC* — the nightly tried to promote the freshly-built serving snapshot but the publisher returned non-zero (could be a benign no-op if the 06:30 timer already promoted this build; check /opt/duckdb/logs). The 06:30 timer + 07:15/09:00 success-watchdog still cover serving freshness. Investigate /opt/duckdb/bin/publisher.py if serving is stale." \
-                2>&1 | tee -a "$LOG_FILE" || true
-        fi
-    else
-        echo "WARN publisher not found ($PUBLISHER_PY / $PUBLISHER_BIN) — skipping promote-at-completion; 06:30 timer fallback still promotes" | tee -a "$LOG_FILE"
+    # [2026-07-14] Now the SECOND promote of the night (PASS A already published the fleet-health
+    # snapshot hours ago). This one carries everything else — replies, CRM, DNS, canonical, derived
+    # — so all other consumers land exactly as they did before the two-pass split.
+    promote_serving "nightly-complete"
+    if [[ "$PROMOTE_RC" -ne 0 && "$PROMOTE_RC" -ne 127 ]]; then
+        # rc=1 can be a benign no-op (the 06:30 timer already promoted this build, or we landed
+        # inside the 03:30-05:45 publisher guard on an unusually fast night) — the publisher logs
+        # the precise reason. Alert anyway so a REAL promote failure is never silent; the 06:30
+        # fallback + the 07:15/09:00 success-watchdog remain the safety net.
+        "$PYTHON" scripts/alert_slack.py \
+            ":warning: *serving snapshot promote-at-completion rc=$PROMOTE_RC* — the nightly tried to promote the freshly-built serving snapshot but the publisher returned non-zero (could be a benign no-op if an earlier promote already published this build; check /opt/duckdb/logs). The 06:30 timer + 07:15/09:00 success-watchdog still cover serving freshness. Investigate /opt/duckdb/bin/publisher.py if serving is stale." \
+            2>&1 | tee -a "$LOG_FILE" || true
     fi
 fi
 
