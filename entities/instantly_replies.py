@@ -72,7 +72,12 @@ def _to_int(v) -> int | None:
 
 
 def register(registry: Registry) -> None:
-    registry.add_phase("instantly", "instantly_replies", run_instantly_replies_ingest)
+    # [2026-07-14] Moved 'instantly' -> 'replies_late' (PASS B). This is the single slowest ingest in
+    # the night (~90 min) and NOTHING in PASS A depends on it — it only feeds 'canonical'
+    # (core.reply), which still runs after it. Sitting inside the 'instantly' phase it delayed every
+    # fleet-health table by 90 min for no reason, which is what pushed the morning snapshot past the
+    # start of the working day.
+    registry.add_phase("replies_late", "instantly_replies", run_instantly_replies_ingest)
 
 
 def run_instantly_replies_ingest(ctx: RunContext) -> PhaseResult:

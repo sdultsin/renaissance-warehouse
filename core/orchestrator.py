@@ -183,6 +183,16 @@ def main(argv: list[str] | None = None) -> int:
         help="Run only this phase (default: all phases)",
     )
     parser.add_argument(
+        "--phases",
+        type=str,
+        default=None,
+        help=(
+            "Run only these phases, comma-separated (e.g. instantly,account_census). Runs them in "
+            "PHASE_ORDER sequence, not the order given. Used by nightly.sh to split the night into "
+            "PASS A (fleet-health -> promote) and PASS B (everything else). [2026-07-14]"
+        ),
+    )
+    parser.add_argument(
         "--ingest",
         type=str,
         default=None,
@@ -220,11 +230,31 @@ def main(argv: list[str] | None = None) -> int:
 
     ctx = RunContext(run_id=run_id, db=conn, credentials=creds)
 
-    phases_to_run = [args.phase] if args.phase else PHASE_ORDER
-    if args.phase and args.phase not in PHASE_ORDER:
-        logger.error("Unknown phase: %s. Valid: %s", args.phase, PHASE_ORDER)
-        end_run(conn, run_id, "failed", {"error": "unknown_phase"})
+    if args.phase and args.phases:
+        logger.error("--phase and --phases are mutually exclusive")
+        end_run(conn, run_id, "failed", {"error": "phase_args_conflict"})
         return 2
+
+    if args.phases:
+        requested = [p.strip() for p in args.phases.split(",") if p.strip()]
+        unknown = [p for p in requested if p not in PHASE_ORDER]
+        if unknown:
+            logger.error("Unknown phase(s): %s. Valid: %s", ", ".join(unknown), PHASE_ORDER)
+            end_run(conn, run_id, "failed", {"error": "unknown_phase", "unknown": unknown})
+            return 2
+        # Always execute in PHASE_ORDER sequence — never the order the caller happened to type,
+        # so a typo in nightly.sh can't silently run an ingest before its upstream.
+        phases_to_run = [p for p in PHASE_ORDER if p in set(requested)]
+    elif args.phase:
+        if args.phase not in PHASE_ORDER:
+            logger.error("Unknown phase: %s. Valid: %s", args.phase, PHASE_ORDER)
+            end_run(conn, run_id, "failed", {"error": "unknown_phase"})
+            return 2
+        phases_to_run = [args.phase]
+    else:
+        phases_to_run = list(PHASE_ORDER)
+
+    logger.info("Phases this run: %s", ", ".join(phases_to_run))
 
     total_failed = 0
     try:
