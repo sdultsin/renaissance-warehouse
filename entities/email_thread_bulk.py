@@ -112,7 +112,8 @@ def _replied_set(ws_slug: str, org_id: str | None, ws_uuid: str | None) -> set[s
 
 
 def run_bulk_fetch(stage_path: str, window_floor_hours: float | None,
-                   max_pages: int, overlap_minutes: float, fsync_pages: int = 5) -> int:
+                   max_pages: int, overlap_minutes: float, fsync_pages: int = 5,
+                   received_only: bool = False, max_span_hours: float | None = None) -> int:
     """One bounded ascending bulk-window pull for every allowlisted workspace (the
     driver allowlists exactly one per worker). Returns worst rc across workspaces:
     0 = window complete, 2 = page-cap partial (healthy, resume next pass), 3 = error."""
@@ -130,14 +131,16 @@ def run_bulk_fetch(stage_path: str, window_floor_hours: float | None,
     worst_rc = 0
     for ws_uuid, (ws_slug, api_key, organization_id) in workspaces.items():
         rc = _bulk_fetch_one(ws_uuid, ws_slug, api_key, organization_id, stage_path,
-                             window_floor_hours, max_pages, overlap_minutes, fsync_pages)
+                             window_floor_hours, max_pages, overlap_minutes, fsync_pages,
+                             received_only, max_span_hours)
         worst_rc = max(worst_rc, rc)
     return worst_rc
 
 
 def _bulk_fetch_one(ws_uuid: str, ws_slug: str, api_key: str, org_id: str | None,
                     stage_path: str, window_floor_hours: float | None,
-                    max_pages: int, overlap_minutes: float, fsync_pages: int) -> int:
+                    max_pages: int, overlap_minutes: float, fsync_pages: int,
+                    received_only: bool = False, max_span_hours: float | None = None) -> int:
     now = datetime.now(timezone.utc)
     fetched_at = now.isoformat()
 
@@ -171,15 +174,36 @@ def _bulk_fetch_one(ws_uuid: str, ws_slug: str, api_key: str, org_id: str | None
         logger.info("RUNLOG-BULK ws=%s window empty (floor %s >= now)", ws_slug, floor.isoformat())
         return 0
 
+    # WINDOW-CEILING [2026-07-14]: cap the span per pass. A wide (multi-day) ascending window on a
+    # DENSE workspace makes Instantly's server-side sort time out (koi 5d window: limit=1 ReadTimeout
+    # after 30s), stalling the whole backfill. Bounded slices (default 36h) each return page-1 in
+    # <1s; the watermark advances per completed slice and the next pass continues -> contiguous.
+    ceiling = now
+    capped_span = False
+    if max_span_hours is not None:
+        cap = start + timedelta(hours=max_span_hours + overlap_minutes / 60.0)
+        if cap < now:
+            ceiling = cap
+            capped_span = True
+
     params = {
         "limit": 100, "sort_order": "asc",
         "min_timestamp_created": _iso_z(start),
-        "max_timestamp_created": _iso_z(now),
+        "max_timestamp_created": _iso_z(ceiling),
     }
-    replied = _replied_set(ws_slug, org_id, ws_uuid)
-    logger.info("bulk-fetch ws=%s window [%s .. %s] replied_set=%d max_pages=%d stage=%s",
+    if received_only:
+        # RECEIVED-ONLY reply-capture mode [2026-07-14]: email_type=received returns ONLY
+        # inbound prospect replies (ue2). On the DENSE big-4 backlog the stream is >90% cold
+        # sends (ue1) that all-emails must page through (koi Jul-8: all-emails page-1
+        # ReadTimeout after 225s; received-only walked the same 12h in 39 pages / 2.4 min).
+        # Advances the watermark + captures every reply ~5-10x faster and reliably; drops ue1
+        # cold-send bodies + ue3 our-replies from THIS lane, enriched later by a full pass (the
+        # upsert is non-destructive — a later ue1/ue3 pull only ADDS). See README-THREADS.md.
+        params["email_type"] = "received"
+    replied = set() if received_only else _replied_set(ws_slug, org_id, ws_uuid)
+    logger.info("bulk-fetch ws=%s window [%s .. %s] capped_span=%s received_only=%s replied_set=%d max_pages=%d stage=%s",
                 ws_slug, params["min_timestamp_created"], params["max_timestamp_created"],
-                len(replied), max_pages, stage_path)
+                capped_span, received_only, len(replied), max_pages, stage_path)
 
     progress_all = _read_progress_sidecar(stage_path)
     pages = raw_n = kept_n = dropped_ue1 = 0
@@ -239,10 +263,13 @@ def _bulk_fetch_one(ws_uuid: str, ws_slug: str, api_key: str, org_id: str | None
                     break
             _flush_progress(stage)
             if complete:
-                # cursor exhausted -> everything created <= window ceiling is staged.
+                # cursor exhausted -> everything created <= the window ceiling is staged. On a
+                # span-capped slice the ceiling is < now, so the watermark advances to the ceiling
+                # and the NEXT pass continues from there (contiguous). complete=True here means
+                # "this slice is done", not necessarily "caught up to now".
                 progress_all[ws_slug] = {
-                    "drained_through": now.isoformat(),
-                    "complete": True, "mode": "watermark",
+                    "drained_through": ceiling.isoformat(),
+                    "complete": not capped_span, "mode": "watermark",
                 }
                 _write_progress_sidecar(stage_path, progress_all)
             el = max(time.time() - t0, 0.001)
@@ -274,12 +301,19 @@ def main(argv=None) -> int:
                    help="clamp the window floor to now-N hours (FRESH lane); default: none (BACKFILL)")
     f.add_argument("--max-pages", type=int, default=450)
     f.add_argument("--overlap-minutes", type=float, default=60.0)
+    f.add_argument("--received-only", action="store_true",
+                   help="email_type=received: capture ONLY inbound replies (ue2), ~5-10x fewer "
+                        "pages on dense workspaces; drops ue1/ue3 from this lane (enriched later).")
+    f.add_argument("--max-span-hours", type=float, default=None,
+                   help="cap the window span per pass (dense-ws robustness; a multi-day window "
+                        "times out server-side). The watermark advances per completed slice.")
     args = ap.parse_args(argv)
     if os.environ.get("WAREHOUSE_PULL_THREADS") != "1":
         logger.info("WAREHOUSE_PULL_THREADS != 1 — bulk fetch disabled, no-op")
         return 0
     return run_bulk_fetch(args.stage, args.window_floor_hours, args.max_pages,
-                          args.overlap_minutes)
+                          args.overlap_minutes, received_only=args.received_only,
+                          max_span_hours=args.max_span_hours)
 
 
 if __name__ == "__main__":
