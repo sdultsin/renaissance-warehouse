@@ -271,11 +271,12 @@ if DRY:
 
 # ==================================================================== sheet write engine
 SID = "1vL77hVTY3P5_0e-K34qjWWpes_hymx4XiC630llyF34"
-TOK = os.environ.get("GOOGLE_TOKEN", "/root/.config/mcp-google-sheets/token.json")
+TOK = os.environ.get("GOOGLE_SA_KEY", "/root/.config/gcp-sa/droplet-sheets-sync.json")  # [2026-07-14 creds-rebuild] service-account key
 BASE = f"https://sheets.googleapis.com/v4/spreadsheets/{SID}"
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
-_g = Credentials.from_authorized_user_file(TOK); _g.refresh(Request())
+from google.oauth2 import service_account as _sa  # [2026-07-14 creds-rebuild]
+_g = _sa.Credentials.from_service_account_file(TOK, scopes=["https://www.googleapis.com/auth/spreadsheets"]); _g.refresh(Request())
 def _gtok():
     if not _g.valid: _g.refresh(Request())
     return _g.token

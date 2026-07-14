@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$REPO_DIR"; mkdir -p logs
 PY="$REPO_DIR/.venv/bin/python"
-export GOOGLE_TOKEN="${GOOGLE_TOKEN:-/root/.config/mcp-google-sheets/token.json}"
+export GOOGLE_SA_KEY="${GOOGLE_SA_KEY:-/root/.config/gcp-sa/droplet-sheets-sync.json}"  # [2026-07-14 creds-rebuild] SA key (old OAuth token destroyed)
 
 EXTRA=""
 if [[ "${1:-}" == "--shadow" ]]; then EXTRA="--shadow"; shift; fi
