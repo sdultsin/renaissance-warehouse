@@ -83,4 +83,8 @@ def run_account_first_cold_send(ctx: RunContext) -> PhaseResult:
 
 
 def register(registry: Registry) -> None:
-    registry.add_phase("canonical", "account_first_cold_send", run_account_first_cold_send)
+    # [2026-07-14] Moved 'canonical' -> 'portal_core' (PASS A). Reads main.raw_instantly_email_message
+    # ('instantly' phase), main.raw_pipeline_conversation_messages ('pipeline_mirror') and
+    # core.sending_account_daily — all of which land BEFORE this phase in PASS A. The Data Hub reads
+    # core.account_first_cold_send on its fleet-health pages, so it must be in the morning snapshot.
+    registry.add_phase("portal_core", "account_first_cold_send", run_account_first_cold_send)

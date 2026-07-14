@@ -22,7 +22,13 @@ RECENT_DAYS = 3   # safety-guard window (matches ASSERT 4)
 
 
 def register(registry: Registry) -> None:
-    registry.add_phase("canonical", "sending_account", run_sending_account)
+    # [2026-07-14] Moved 'canonical' -> 'portal_core' (PASS A). This ingest reads ONLY
+    # core.account_census / core.sending_account_* / core.workspace — never core.reply,
+    # core.domain or anything the dns_sweep/replies/CRM phases produce — so it can be built
+    # before them. That lets the serving snapshot with same-day fleet health publish at
+    # ~03:30 ET instead of ~09:40 ET. Runs exactly once per night; canonical ingests that
+    # read core.sending_account now see it FRESHER (built earlier the same night), not staler.
+    registry.add_phase("portal_core", "sending_account", run_sending_account)
 
 
 def run_sending_account(ctx: RunContext) -> PhaseResult:

@@ -30,27 +30,45 @@ ENV_FILE_CANDIDATES = [
 
 # Sync window phase order. Orchestrator runs phases in this order. Within a phase
 # multiple ingests can register and they run sequentially in registration order.
+# PHASE_ORDER is split into two PASSES by scripts/nightly.sh, with a SERVING PROMOTE between them.
+# [2026-07-14] Why: the serving snapshot can only be published when the writer lock is free — i.e.
+# when the orchestrator exits. With one 7h pass that meant the snapshot landed ~09:40 ET, so the
+# Data Hub's morning rebuild always read YESTERDAY's snapshot. The fleet-health tables (census,
+# sending_account, tags) are fast; the slow phases in front of them (instantly_replies ~90m,
+# dns_sweep ~73m, CRM) are NOT needed for them. So PASS A now runs only what fleet health needs
+# (~1.5h) and promotes at ~03:30 ET; PASS B runs everything else and promotes again at completion,
+# exactly as before. Every ingest still runs EXACTLY ONCE per night (account_status_history is
+# append-only — re-running a phase would double-insert), and no ingest was moved ahead of an
+# upstream it reads. See PASS_A_PHASES / PASS_B_PHASES in scripts/nightly.sh.
 PHASE_ORDER = [
-    "pipeline_mirror",   # 03:30 — slim mirror from pipeline-supabase
-    "inbox_loader",      # 03:35 — drain /root/warehouse-inbox upsert batches (Gates 1b/2a)
-    "comms_mirror",      # 03:45 — comms-orchestration snapshot
-    "sendivo",           # 03:50 — Sendivo SMS send-side (delivery metrics, campaigns, billing)
-    "iskra",             # 03:52 — Iskra WhatsApp (messages/conversations/meetings/deals/numbers/stats)
-    "outreachify",       # 03:45 — Outreachify Supabase snapshot
-    "instantly",         # 04:00 — workspaces, campaigns, accounts, tags, lead membership
-    "account_census",    # 04:02 — promote live /accounts poll parquet -> core.account_census (live truth)
-    "close",             # 04:05 — Close CRM warm-call activity (BI/BOF layer, spec 16)
-    "sheets",            # 04:15 — Domain Tech Sheet, blacklist sheet, partner feedback
-    "otd_billing",       # 04:20 — parse OTD account statement -> core.otd_* + cost_ledger rate fix
-    "im_bookings",       # 04:25 — nightly mirror of the bookings-portal im_bookings table (Scope A)
-    "account_truth",     # 04:30 — snapshot from droplet account-truth duckdb
-    "dns_sweep",         # 04:45 — MX/A/SPF/DKIM/DMARC/PTR + DNSBLs + redirects
-    "canonical",         # 05:30 — rebuild canonical tables from raw (incl. core.reply, lead spine, conversions)
+    # ── PASS A — fleet-health critical; promotes the serving snapshot on completion (~03:30 ET) ──
+    "pipeline_mirror",   # slim mirror from pipeline-supabase
+    "inbox_loader",      # drain /root/warehouse-inbox upsert batches (Gates 1b/2a)
+    "instantly",         # workspaces, campaigns, accounts, tags, lead membership (replies split out below)
+    "account_census",    # promote live /accounts poll parquet -> core.account_census (live truth)
+    "portal_core",       # [2026-07-14] core.sending_account + core.account_first_cold_send — split out of
+                         #   'canonical' because they read ONLY account_census / raw instantly / pipeline
+                         #   (never reply/domain/dns), so they can run early. These + account_census +
+                         #   account_tags are what the Data Hub's fleet-health pages read.
+    "account_tags_late", # per-inbox Instantly tag pull. Still the last phase of its pass so it can never
+                         #   block the phases above; now bounded by WAREHOUSE_ACCOUNT_TAGS_DEADLINE_MIN
+                         #   (graceful skip, last-good kept) so it can't delay PASS B either.
+    # ── PASS B — everything else; compaction + the full promote at completion, as before ──────────
+    "comms_mirror",      # comms-orchestration snapshot
+    "sendivo",           # Sendivo SMS send-side (delivery metrics, campaigns, billing)
+    "iskra",             # Iskra WhatsApp (messages/conversations/meetings/deals/numbers/stats)
+    "outreachify",       # Outreachify Supabase snapshot
+    "replies_late",      # [2026-07-14] instantly_replies (~90m) — split out of the 'instantly' phase so it
+                         #   no longer sits IN FRONT of the fleet-health tables. Still runs before
+                         #   'canonical', which is what reads core.reply.
+    "close",             # Close CRM warm-call activity (BI/BOF layer, spec 16)
+    "sheets",            # Domain Tech Sheet, blacklist sheet, partner feedback
+    "otd_billing",       # parse OTD account statement -> core.otd_* + cost_ledger rate fix
+    "im_bookings",       # nightly mirror of the bookings-portal im_bookings table (Scope A)
+    "account_truth",     # snapshot from droplet account-truth duckdb
+    "dns_sweep",         # MX/A/SPF/DKIM/DMARC/PTR + DNSBLs + redirects
+    "canonical",         # rebuild canonical tables from raw (incl. core.reply, lead spine, conversions)
     # "intent" phase removed — LLM reply-intent classifier uses Anthropic API; needs explicit Sam go-ahead before enabling
-    "iam_response_time", # 05:35 — IAM response latency per prospect reply (after canonical)
-    "derived",           # 05:40 — materialize derived views (incl. lead_intel)
-    "account_tags_late", # LAST — slow (~3-8h) rate-limited per-inbox Instantly tag pull; isolated at
-                         #        the very end so it can NEVER block/kill the critical phases above.
-                         #        [2026-06-30] moved here from position 6 ('instantly'), where its
-                         #        runtime strangled account_census..derived (nightly never finished).
+    "iam_response_time", # IAM response latency per prospect reply (after canonical)
+    "derived",           # materialize derived views (incl. lead_intel)
 ]
