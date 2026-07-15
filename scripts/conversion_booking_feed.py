@@ -184,33 +184,40 @@ def main() -> None:
                     LEFT JOIN om ON om.ws = COALESCE(lab.ws, nat.ws)
                     ORDER BY 1
                 """)
-                # Coverage — like-for-like at LEAD grain (the labeling lane's own measure):
-                # numerator = canonical replying leads with ANY label event in-window (ALL event
-                # classes count as read — auto/bot/unreadable gates included, those replies WERE
-                # read); denominator = canonical human-reply leads for the day from
-                # derived.v_reply_canonical (is_auto_reply=false, uuid->slug normalized).
-                # The old core.email_message denominator included auto-replying leads that the
-                # 4-label numerator could never contain, so 100% was unreachable by construction.
-                if exists("derived", "v_reply_canonical"):
+                # Coverage — like-for-like at LEAD grain (the labeling lane's measure):
+                # denominator = the day's canonical replying leads from core.reply (BOTH
+                # workspace_id encodings — UUID and slug — mapped via core.workspace_alias;
+                # this is derived.v_reply_canonical's own base, queried directly because the
+                # view is a slow full-scan and its is_auto_reply flag is a documented-BROKEN
+                # heuristic that returns zero rows). numerator = those leads with ANY label
+                # event in-window (ALL classes count as read — auto/bot/unreadable gates
+                # included, those replies WERE read). Same universe on both sides, so 100%
+                # is reachable exactly when the completion pass has covered the day.
+                try:
                     cov = q(f"""
-                        WITH ev AS (
+                        WITH wmap AS (
+                          SELECT instantly_uuid AS wid, warehouse_slug AS slug
+                          FROM core.workspace_alias
+                          WHERE warehouse_slug IN {WS_IN} AND instantly_uuid IS NOT NULL
+                          UNION ALL
+                          SELECT warehouse_slug, warehouse_slug FROM core.workspace_alias
+                          WHERE warehouse_slug IN {WS_IN}),
+                        canon AS (
+                          SELECT DISTINCT m.slug AS ws, lower(r.lead_email) AS lead_email
+                          FROM core.reply r JOIN wmap m ON m.wid = r.workspace_id
+                          WHERE CAST(CAST(r.reply_timestamp AS DATE) AS VARCHAR) IN {days_in}),
+                        ev AS (
                           SELECT DISTINCT workspace_slug AS ws, lower(lead_email) AS lead_email
                           FROM main.raw_reply_label_event
                           WHERE workspace_slug IN {WS_IN}
-                            AND CAST(CAST(message_ts AS DATE) AS VARCHAR) IN {days_in}),
-                        canon AS (
-                          -- workspace_id_canonical is the Instantly UUID -> map back to slug
-                          SELECT DISTINCT wa.warehouse_slug AS ws, lower(rc.lead_email) AS lead_email
-                          FROM derived.v_reply_canonical rc
-                          JOIN core.workspace_alias wa ON wa.instantly_uuid = rc.workspace_id_canonical
-                          WHERE wa.warehouse_slug IN {WS_IN}
-                            AND rc.is_auto_reply = FALSE
-                            AND CAST(CAST(rc.reply_timestamp AS DATE) AS VARCHAR) IN {days_in})
+                            AND CAST(CAST(message_ts AS DATE) AS VARCHAR) IN {days_in})
                         SELECT (SELECT COUNT(*) FROM canon)::BIGINT AS replying_leads,
                                (SELECT COUNT(*) FROM canon c JOIN ev e USING (ws, lead_email))::BIGINT AS read_leads
                     """)[0]
                     read_n, denom = cov["read_leads"], cov["replying_leads"]
-                else:  # pre-canonical fallback (legacy grain; 100% not guaranteed reachable)
+                except Exception as e:
+                    notes_unused = str(e)
+                    log(f"coverage compute failed ({e}) — falling back to legacy grain")
                     denom = q(f"""
                         SELECT COUNT(DISTINCT (workspace_id, lower(lead_email)))::BIGINT AS n
                         FROM core.email_message
