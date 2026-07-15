@@ -140,11 +140,17 @@ def main() -> None:
             days = [r["d"] for r in q(f"SELECT DISTINCT d FROM ({scoped}) ORDER BY d")]
             if days:
                 days_in = "('" + "','".join(days) + "')"
-                meeting_leads = ("SELECT DISTINCT lower(lead_email) AS lead_email FROM core.v_meeting_truth "
-                                 "WHERE channel_norm = 'Email' AND is_ours AND lead_email IS NOT NULL"
+                # POST-REPLY conversion (Sam 2026-07-15): an opp lead counts as converted only
+                # if a meeting is booked ON OR AFTER the labeled reply date — a prior booking is
+                # not a conversion of this reply (the lifetime join inflated warm-leads most).
+                meeting_leads = ("SELECT DISTINCT lower(lead_email) AS lead_email, meeting_date "
+                                 "FROM core.v_meeting_truth "
+                                 "WHERE channel_norm = 'Email' AND is_ours AND lead_email IS NOT NULL "
+                                 "AND meeting_date IS NOT NULL"
                                  ) if exists("core", "v_meeting_truth") else (
-                                 "SELECT DISTINCT lower(lead_email) AS lead_email FROM core.meeting "
-                                 "WHERE lead_email IS NOT NULL")
+                                 "SELECT DISTINCT lower(lead_email) AS lead_email, "
+                                 "COALESCE(meeting_date, CAST(posted_at AS DATE)) AS meeting_date "
+                                 "FROM core.meeting WHERE lead_email IS NOT NULL")
                 rows = q(f"""
                     WITH s AS ({scoped}), ml AS ({meeting_leads}),
                     lab AS (
@@ -159,7 +165,7 @@ def main() -> None:
                     om AS (
                       SELECT s.ws, COUNT(DISTINCT s.lead_email) AS opp_leads,
                              COUNT(DISTINCT CASE WHEN ml.lead_email IS NOT NULL THEN s.lead_email END) AS opp_met
-                      FROM s LEFT JOIN ml ON ml.lead_email = s.lead_email
+                      FROM s LEFT JOIN ml ON ml.lead_email = s.lead_email AND ml.meeting_date >= s.d
                       WHERE s.label = 'opportunity' GROUP BY 1),
                     nat AS (
                       SELECT workspace_id AS ws,
