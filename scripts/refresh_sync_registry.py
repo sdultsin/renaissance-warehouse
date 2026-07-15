@@ -126,8 +126,13 @@ OVERRIDES: dict[str, dict] = {
     "raw_pipeline_contact_frequency_campaign_daily": dict(cadence="retired", status="retired", notes="ARCHIVED 2026-06-26 (Sam): sync stopped, spec commented in pipeline_mirror.py, table kept"),
     "raw_cloudflare_zones_bak": dict(cadence="once", status="retired", notes="rolling backup of raw_cloudflare_zones; not a feed"),
     "raw_registrar_domains": dict(
-        cadence="once", source="registrar",
-        notes="one-time registrar snapshot; no automated loader; refresh manually"),
+        cadence="weekly", source="registrar",
+        notes="full domain list from all Porkbun/Spaceship/Dynadot accounts; loader = "
+              "scripts/sync_registrar_domains.py (nightly, reads the weekly registrar date caches)"),
+    "core.registrar_snapshot": dict(
+        cadence="daily", source="registrar",
+        notes="the Data Hub's registrar/account view; rebuilt nightly by scripts/sync_registrar_domains.py "
+              "from raw_registrar_domains caches (shrink-guarded atomic swap)"),
     # ── Daily-report centralization mirrors (DDL 1061, 2026-07-01). Explicit
     # biz-date SLAs so the litmus alert fires on DATA staleness (the outcome),
     # not just "the sync ran" — these back the report's §1/§1b/§2 sections once
