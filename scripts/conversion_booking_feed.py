@@ -111,10 +111,10 @@ def main() -> None:
         relname, rc = rel
         c_ws    = pick(rc, "workspace", "workspace_slug", "workspace_id")
         c_email = pick(rc, "lead_email", "email")
-        c_label = pick(rc, "label", "label_current", "verdict")
-        c_opt   = pick(rc, "opt_out", "is_opt_out", "optout")
+        c_label = pick(rc, "label", "current_label", "label_current", "verdict")
+        c_opt   = pick(rc, "opt_out", "current_opt_out", "is_opt_out", "optout")
         c_ver   = pick(rc, "labeler_version", "version", "prompt_version")
-        c_date  = pick(rc, "reply_date", "reply_at", "message_at", "labeled_at", "event_at", "created_at")
+        c_date  = pick(rc, "reply_date", "reply_at", "message_ts", "current_label_message_ts", "message_at", "labeled_at", "event_at", "created_at")
         if c_ws and c_email and c_label and c_date:
             dedup = "" if "current" in relname else \
                 f"QUALIFY row_number() OVER (PARTITION BY {c_ws}, lower({c_email}) ORDER BY {c_date} DESC) = 1"
