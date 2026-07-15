@@ -32,6 +32,7 @@ import duckdb
 DB = os.environ.get("CORE_DB_PATH", "/opt/duckdb/warehouse_current.duckdb")
 WORKER_ENV = os.environ.get("WORKER_ENV_FILE", "/root/renaissance-worker/.env")
 HARD_MAX_DAY = "2026-07-14"            # MVP: the one Sam-approved completed labeled day
+HARD_MIN_DAY = "2026-07-14"            # floor: excludes the partial Jul-13 sliver (backfill entered Jul-13 at 23:21 only); a day renders only if FULLY labeled
 
 FUNDING_WS = ('renaissance-2', 'renaissance-4', 'renaissance-5',
               'prospects-power', 'koi-and-destroy')
@@ -103,7 +104,7 @@ def main() -> None:
         "snapshot_id": os.path.basename(os.path.realpath(DB)),
         "status": "pending_labels",
         "labeler_version": None,
-        "scope": {"mode": "completed_days_only", "max_day": cap, "days": []},
+        "scope": {"mode": "completed_days_only", "max_day": cap, "min_day": HARD_MIN_DAY, "days": []},
         "coverage": None, "totals": None, "rows": [],
     }
 
@@ -130,7 +131,7 @@ def main() -> None:
             scoped = f"""
                 WITH b AS ({base})
                 SELECT * FROM b
-                WHERE ws IN {WS_IN} AND d <= DATE '{cap}'
+                WHERE ws IN {WS_IN} AND d <= DATE '{cap}' AND d >= DATE '{HARD_MIN_DAY}'
                   AND label IN ('opportunity','engagement','confused','not_interested','not interested')
             """
             days = [r["d"] for r in q(f"SELECT DISTINCT d FROM ({scoped}) ORDER BY d")]
@@ -187,7 +188,7 @@ def main() -> None:
                 payload.update({
                     "status": "ok",
                     "labeler_version": meta["ver"],
-                    "scope": {"mode": "completed_days_only", "max_day": cap, "days": days},
+                    "scope": {"mode": "completed_days_only", "max_day": cap, "min_day": HARD_MIN_DAY, "days": days},
                     "coverage": {"labeled": meta["n"], "replying_leads_days": denom,
                                  "pct": round(100.0 * meta["n"] / denom, 1) if denom else None},
                     "totals": tot, "rows": rows,

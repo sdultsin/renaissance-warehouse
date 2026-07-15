@@ -204,6 +204,7 @@ if rel:
                    CAST({c_date} AS DATE) AS d
                    {f', {c_camp} AS campaign_id' if c_camp else ', NULL AS campaign_id'}
             FROM {relname}
+            WHERE CAST({c_date} AS DATE) BETWEEN DATE '2026-07-14' AND DATE '2026-07-14'  -- LABEL_DAY_WINDOW: completed fully-labeled days only (Sam R11); extend when increments resume
             {dedup}
         """
         try:
