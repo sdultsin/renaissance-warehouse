@@ -84,6 +84,13 @@ fi
 # until the labeling lane's views (core.v_reply_label_current et al.) exist in the snapshot —
 # no wiring change needed when they land. [2026-07-15 cold-email-BI §9.3]
 lensgen conversion_dashboard_data.py "$REPO/dashboards/conversion/data.json"
+# booking-site Conversion tab feed (renaissance-booking.com): day-grain, COMPLETED-days-only
+# (hard-capped 2026-07-14 until Sam greenlights extension — see the script header). Writes to
+# the PORTAL Supabase dashboard_feeds row key='conversion' (service key from
+# /root/renaissance-worker/.env), NOT the portal repo. Non-fatal by contract (script exits 0
+# on any failure; the booking tab keeps the last-known-good row).
+CORE_DB_PATH="$SNAP" "$PY" "$WH/scripts/conversion_booking_feed.py" 2>>/root/lens_feeds.err \
+  || echo "  WARN conversion-booking-feed failed — keeping last-known-good" >&2
 
 # 3) Commit if changed.
 cd "$REPO" || exit 1
