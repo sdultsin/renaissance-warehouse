@@ -66,6 +66,50 @@ UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
       "(KHTML, like Gecko) Chrome/120.0 Safari/537.36")
 
 
+def _yn(v):
+    """Normalise a registrar's auto-renew flag to 'yes'/'no'/None."""
+    if v is None:
+        return None
+    sv = str(v).strip().lower()
+    if sv in ("1", "true", "yes", "on", "enabled"):
+        return "yes"
+    if sv in ("0", "false", "no", "off", "disabled", ""):
+        return "no"
+    return None
+
+
+def _dyn_renew(v):
+    """Dynadot RenewOption -> yes/no. 'auto*' = auto-renew on; everything else off."""
+    if v is None:
+        return None
+    sv = str(v).strip().lower()
+    return "yes" if "auto" in sv else "no"
+
+
+def _ns_join(v):
+    """Extract nameserver HOSTNAMES from whatever shape the API returned (string, list, or a
+    nested dict like Dynadot's NameServerSettings), as a clean comma string. Anything that is
+    not a bare hostname (brackets, spaces, the literal 'custom') is dropped."""
+    hosts = []
+
+    def walk(x):
+        if isinstance(x, str):
+            h = x.strip().lower()
+            if "." in h and not any(c in h for c in "[] ,'\""):
+                hosts.append(h)
+        elif isinstance(x, (list, tuple)):
+            for i in x:
+                walk(i)
+        elif isinstance(x, dict):
+            for i in x.values():
+                walk(i)
+
+    walk(v)
+    seen = set()
+    uniq = [h for h in hosts if not (h in seen or seen.add(h))]
+    return ",".join(uniq) or None
+
+
 def load_env() -> dict:
     env: dict[str, str] = {}
     for cand in ENV_CANDIDATES:
@@ -147,7 +191,8 @@ def fetch_porkbun(label, ak, sk) -> list[tuple]:
         for d in page:
             dom = (d.get("domain") or "").lower()
             if dom:
-                out.append((dom, d.get("createDate"), d.get("expireDate")))
+                out.append((dom, d.get("createDate"), d.get("expireDate"),
+                            _yn(d.get("autoRenew")), None, d.get("status")))
         if len(page) < 1000:
             break
         start += 1000
@@ -166,7 +211,9 @@ def fetch_spaceship(label, ak, sk) -> list[tuple]:
         for d in items:
             dom = (d.get("name") or "").lower()
             if dom:
-                out.append((dom, d.get("registrationDate"), d.get("expirationDate")))
+                out.append((dom, d.get("registrationDate"), d.get("expirationDate"),
+                            _yn(d.get("autoRenew")), _ns_join(d.get("nameservers")),
+                            d.get("lifecycleStatus")))
         total = r.get("total", 0)
         skip += take
         if skip >= total or not items:
@@ -190,7 +237,9 @@ def fetch_dynadot(label, ak) -> list[tuple]:
             continue
         reg, exp = d.get("Registration"), d.get("Expiration")
         # epoch millis -> ISO (let DuckDB cast). Keep as int strings; parsed at load.
-        out.append((dom, f"epoch_ms:{reg}" if reg else None, f"epoch_ms:{exp}" if exp else None))
+        out.append((dom, f"epoch_ms:{reg}" if reg else None, f"epoch_ms:{exp}" if exp else None,
+                    _dyn_renew(d.get("RenewOption")), _ns_join(d.get("NameServerSettings")),
+                    d.get("Status")))
     return out
 
 
@@ -214,10 +263,14 @@ def fetch_registrar(reg: str, env: dict) -> list[tuple]:
         return rows
     for acct in accts:
         label = acct[0]
+        # normalise the discovery label to registrar_snapshot form: 'porkbun.2'->'porkbun2',
+        # 'porkbun.default'/'porkbun.vendorB' are the default (unnumbered) account = #1.
+        _rg, _sfx = (label.split(".", 1) + [""])[:2]
+        acct_id = f"{_rg}{_sfx}" if _sfx.isdigit() else (f"{_rg}1" if _sfx in ("default", "vendorB") else label.replace(".", ""))
         try:
             got = fn(acct)
             logger.info("%s: %d domains", label, len(got))
-            rows.extend(got)
+            rows.extend((g[0], g[1], g[2], g[3], g[4], g[5], acct_id) for g in got)
         except urllib.error.HTTPError as e:
             logger.error("%s: HTTP %s (%s) — skipping account", label, e.code, e.reason)
         except Exception as e:  # noqa: BLE001
@@ -226,9 +279,12 @@ def fetch_registrar(reg: str, env: dict) -> list[tuple]:
 
 
 def write_cache(reg: str, rows: list[tuple], cache: str) -> None:
+    # rows are 7-tuples: (domain, create_raw, expire_raw, auto_renew, nameservers, domain_status, account_id)
     mem = duckdb.connect()
-    mem.execute("CREATE TABLE d (domain VARCHAR, create_raw VARCHAR, expire_raw VARCHAR, registrar VARCHAR)")
-    mem.executemany("INSERT INTO d VALUES (?,?,?,?)", [(d, c, e, reg) for (d, c, e) in rows])
+    mem.execute("CREATE TABLE d (domain VARCHAR, create_raw VARCHAR, expire_raw VARCHAR, registrar VARCHAR, "
+                "registrar_account VARCHAR, auto_renew VARCHAR, nameservers VARCHAR, domain_status VARCHAR)")
+    mem.executemany("INSERT INTO d VALUES (?,?,?,?,?,?,?,?)",
+                    [(d, c, e, reg, acct, ar, ns, st) for (d, c, e, ar, ns, st, acct) in rows])
     mem.execute(f"COPY d TO '{cache}' (FORMAT PARQUET)")
     mem.close()
     logger.info("%s: cached %d rows -> %s", reg, len(rows), cache)
@@ -247,6 +303,8 @@ def main(argv=None) -> int:
                     help="hit the registrar APIs and rewrite the per-registrar caches")
     ap.add_argument("--from-cache", action="store_true",
                     help="load from existing caches without hitting the APIs")
+    ap.add_argument("--no-load", action="store_true",
+                    help="fetch + write caches only; skip the DuckDB date-load (isolated testing)")
     ap.add_argument("--registrars", default="porkbun,spaceship,dynadot")
     ap.add_argument("--cache-dir", default=CACHE_DIR)
     args = ap.parse_args(argv)
@@ -262,6 +320,9 @@ def main(argv=None) -> int:
                 write_cache(r, rows, caches[r])
             elif not Path(caches[r]).exists():
                 logger.warning("%s: no rows and no existing cache — will be skipped at load", r)
+        if args.no_load:
+            logger.info("--no-load: caches written, skipping DB load")
+            return 0
 
     # ---- load (needs writer lock) ----
     available = [c for c in caches.values() if Path(c).exists()]

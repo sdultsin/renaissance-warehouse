@@ -459,6 +459,14 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
             || echo "WARN registrars_purchased_at_failed (continuing)" | tee -a "$LOG_FILE"
     fi
 
+    # Track I — turn the fetched registrar domain lists into the full raw_registrar_domains
+    # table + rebuild core.registrar_snapshot (the Data Hub's registrar / account view). Reads
+    # the enriched date caches the backfill just wrote (no extra API calls); shrink-guarded +
+    # atomic-swap so a bad run never empties the live tables. [2026-07-14]
+    echo "syncing registrar domains -> raw_registrar_domains + registrar_snapshot" | tee -a "$LOG_FILE"
+    "$PYTHON" scripts/sync_registrar_domains.py 2>&1 | tee -a "$LOG_FILE" \
+        || echo "WARN registrar_domains_sync_failed (continuing)" | tee -a "$LOG_FILE"
+
     # Track I — fill remaining purchased_at (+ expires_at) from the Domain Tech Sheet
     # mirror (expiration − 1y, per Sam). Runs AFTER the exact-registrar fills so exact
     # dates win; the sheet fills the rest as purchased_at_is_derived=TRUE.
