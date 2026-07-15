@@ -199,11 +199,13 @@ def main() -> None:
                           WHERE workspace_slug IN {WS_IN}
                             AND CAST(CAST(message_ts AS DATE) AS VARCHAR) IN {days_in}),
                         canon AS (
-                          SELECT DISTINCT workspace_id_canonical AS ws, lower(lead_email) AS lead_email
-                          FROM derived.v_reply_canonical
-                          WHERE workspace_id_canonical IN {WS_IN}
-                            AND is_auto_reply = FALSE
-                            AND CAST(CAST(reply_timestamp AS DATE) AS VARCHAR) IN {days_in})
+                          -- workspace_id_canonical is the Instantly UUID -> map back to slug
+                          SELECT DISTINCT wa.warehouse_slug AS ws, lower(rc.lead_email) AS lead_email
+                          FROM derived.v_reply_canonical rc
+                          JOIN core.workspace_alias wa ON wa.instantly_uuid = rc.workspace_id_canonical
+                          WHERE wa.warehouse_slug IN {WS_IN}
+                            AND rc.is_auto_reply = FALSE
+                            AND CAST(CAST(rc.reply_timestamp AS DATE) AS VARCHAR) IN {days_in})
                         SELECT (SELECT COUNT(*) FROM canon)::BIGINT AS replying_leads,
                                (SELECT COUNT(*) FROM canon c JOIN ev e USING (ws, lead_email))::BIGINT AS read_leads
                     """)[0]
