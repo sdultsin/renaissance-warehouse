@@ -61,6 +61,14 @@ export WAREHOUSE_ACCOUNT_TAGS_DEADLINE_MIN="${WAREHOUSE_ACCOUNT_TAGS_DEADLINE_MI
 promote_serving() {
     local reason="$1"
     PROMOTE_RC=0
+    # A just-finished orchestrator/phase leaves a STALE writer-lock marker (its pid is now dead).
+    # The publisher aborts on ANY marker ("warehouse_writer_lock_held") — unlike core.db it does not
+    # validate the pid — so the mid-run PASS-A "portal-am" promote never lands and the Hub serves
+    # YESTERDAY's fleet health until PASS B finishes ~9am ET. Clear a dead-pid marker first:
+    # core.db._clear_stale_lock_marker ONLY ever clears a DEAD pid (never a live writer's lock) and
+    # never raises, so this is safe by construction; on any error the promote proceeds unchanged
+    # (degrades to the old behaviour, never worse). [2026-07-15 — fixes the missed 8am morning promote]
+    "$PYTHON" -c "from pathlib import Path; from core import db; db._clear_stale_lock_marker(Path(db._WRITE_LOCK_PATH))" 2>&1 | tee -a "$LOG_FILE" || true
     local PUBLISHER_BIN="${PUBLISHER_BIN:-/opt/duckdb/bin/publisher.py}"
     local PUBLISHER_PY="${PUBLISHER_PY:-/opt/duckdb/venv/bin/python}"
     local PROMOTE_TIMEOUT_S="${PROMOTE_TIMEOUT_S:-2400}"  # serving copy ~118GiB (~16min measured 2026-07-07);
