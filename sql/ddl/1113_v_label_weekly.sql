@@ -42,27 +42,30 @@ SELECT
     workspace_slug,
     campaign_id,
     -- label stats (gate classes excluded)
-    count(*) FILTER (label = 'opportunity')                       AS opportunity,
-    count(*) FILTER (label = 'engagement')                        AS engagement,
-    count(*) FILTER (label = 'confused')                          AS confused,
-    count(*) FILTER (label = 'not_interested')                    AS not_interested,
-    count(*) FILTER (label IN ('opportunity','engagement','confused','not_interested'))
+    count(*) FILTER (WHERE label = 'opportunity')                 AS opportunity,
+    count(*) FILTER (WHERE label = 'engagement')                  AS engagement,
+    count(*) FILTER (WHERE label = 'confused')                    AS confused,
+    count(*) FILTER (WHERE label = 'not_interested')              AS not_interested,
+    count(*) FILTER (WHERE label IN ('opportunity','engagement','confused','not_interested'))
                                                                   AS labeled_threads,
-    count(DISTINCT lead_email) FILTER (label IN ('opportunity','engagement','confused','not_interested'))
-                                                                  AS labeled_leads,
-    count(*) FILTER (opt_out)                                     AS opt_out_events,
+    -- DISTINCT inside CASE (not DISTINCT+FILTER, which some engine versions reject at
+    -- query time): count(DISTINCT CASE ...) ignores the NULL arm — identical semantics.
+    count(DISTINCT CASE WHEN label IN ('opportunity','engagement','confused','not_interested')
+                        THEN lead_email END)                      AS labeled_leads,
+    count(*) FILTER (WHERE opt_out)                               AS opt_out_events,
     -- collected separately, never in label stats (charter §4)
-    count(*) FILTER (label = 'auto')                              AS auto_collected,
-    count(*) FILTER (label = 'bot')                               AS bot_collected,
+    count(*) FILTER (WHERE label = 'auto')                        AS auto_collected,
+    count(*) FILTER (WHERE label = 'bot')                         AS bot_collected,
     -- honesty columns
-    round(count(*) FILTER (confidence < 70 AND label IN ('opportunity','engagement','confused','not_interested'))
-          * 1.0 / nullif(count(*) FILTER (label IN ('opportunity','engagement','confused','not_interested')), 0), 4)
+    round(count(*) FILTER (WHERE confidence < 70 AND label IN ('opportunity','engagement','confused','not_interested'))
+          * 1.0 / nullif(count(*) FILTER (WHERE label IN ('opportunity','engagement','confused','not_interested')), 0), 4)
                                                                   AS share_low_confidence,
-    round(count(*) FILTER (refute_fired AND refute_agree = FALSE)
-          * 1.0 / nullif(count(*) FILTER (refute_fired), 0), 4)   AS share_refute_disagree,
-    round(count(*) FILTER (deterministic_gate IS NOT NULL) * 1.0 / nullif(count(*), 0), 4)
+    round(count(*) FILTER (WHERE refute_fired AND refute_agree = FALSE)
+          * 1.0 / nullif(count(*) FILTER (WHERE refute_fired), 0), 4)
+                                                                  AS share_refute_disagree,
+    round(count(*) FILTER (WHERE deterministic_gate IS NOT NULL) * 1.0 / nullif(count(*), 0), 4)
                                                                   AS deterministic_share,
-    count(*) FILTER (flag_human)                                  AS flagged_for_human,
+    count(*) FILTER (WHERE flag_human)                            AS flagged_for_human,
     list_sort(list(DISTINCT labeler_version))                     AS labeler_versions
 FROM events
 GROUP BY 1, 2, 3;

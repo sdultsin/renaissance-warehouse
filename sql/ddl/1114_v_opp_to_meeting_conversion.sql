@@ -61,7 +61,7 @@ SELECT
     round(count(first_meeting_ts) * 1.0 / nullif(count(*), 0), 4)
                                                       AS opp_to_meeting_rate,
     median(date_diff('day', first_opportunity_ts, first_meeting_ts))
-        FILTER (first_meeting_ts IS NOT NULL)         AS median_days_opp_to_meeting,
+        FILTER (WHERE first_meeting_ts IS NOT NULL)   AS median_days_opp_to_meeting,
     min(first_opportunity_ts)                         AS cohort_first_opp_ts,
     max(first_opportunity_ts)                         AS cohort_last_opp_ts
 FROM joined

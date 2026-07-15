@@ -54,10 +54,12 @@ _COLS = [
     "labeled_at",
 ]
 
+# Named parameters ($run_id / $escrow_path): binding is BY NAME, immune to any
+# positional-order ambiguity between the SELECT-list and FROM-clause placeholders.
 _LOAD = f"""
 INSERT INTO main.raw_reply_label_event ({', '.join(_COLS)}, _run_id)
-SELECT {', '.join('e.' + c for c in _COLS)}, ?
-FROM read_parquet(?) e
+SELECT {', '.join('e.' + c for c in _COLS)}, $run_id
+FROM read_parquet($escrow_path) e
 ANTI JOIN main.raw_reply_label_event t
   USING (message_ref_table, message_ref_id, labeler_version)
 """
@@ -101,7 +103,7 @@ def run(ctx: RunContext) -> PhaseResult:
             "append-only escrow should only grow; loading the delta anyway (anti-join is safe).",
             src_rows, before)
 
-    conn.execute(_LOAD, [ctx.run_id, str(escrow)])
+    conn.execute(_LOAD, {"run_id": ctx.run_id, "escrow_path": str(escrow)})
     after = conn.execute("SELECT count(*) FROM main.raw_reply_label_event").fetchone()[0]
     loaded = after - before
 
