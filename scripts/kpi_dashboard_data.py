@@ -54,6 +54,22 @@ sends AS (
   -- sent in the window; core.campaign_daily only has currently-listable campaigns.
   SELECT cd.date, d.infra, d.cm, d.is_mca,
     SUM(cd.sent)                       AS sent,
+    -- TODO(label-swap, cold-email-BI §9.3, armed 2026-07-15): swap this Instantly-native
+    -- opportunity count (measured ~69% true-positive precision) for the label-derived TRUE
+    -- opp count once reply-label coverage spans this feed's FULL window (KPI_DAYS=92d;
+    -- the page displays 30d cuts of it).
+    -- Deploy condition (check against the serving snapshot before flipping):
+    --   SELECT min(reply_date) <= current_date - 92
+    --      AND count(*) >= 0.95 * (SELECT count(DISTINCT (workspace_id, lower(lead_email)))
+    --                              FROM core.email_message
+    --                              WHERE direction='inbound' AND message_at >= current_date - 92)
+    --   FROM core.v_reply_label_current WHERE label IN
+    --     ('opportunity','engagement','confused','not_interested');
+    -- The swap: replace the SUM below with a per-(date,campaign) count of label='opportunity'
+    -- events (v_reply_label_current at lead grain, dated by reply_date, campaign_id join to
+    -- dims) AND change the lens-kpi page tiles/columns to read "Opps (labeled)"
+    -- (Renaissance-Portal dashboards/lens-kpi/index.html hero sub + Opps column headers).
+    -- Until then this stays Instantly-native — do NOT mix sources silently.
     SUM(cd.unique_opportunities)       AS opportunities,
     SUM(cd.unique_replies)             AS replies_human,
     SUM(cd.unique_replies_automatic)   AS replies_auto,

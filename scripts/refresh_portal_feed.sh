@@ -79,11 +79,16 @@ if CORE_DB_PATH="$SNAP" "$PY" "$WH/scripts/sending_truth_dashboard_data.py" \
 else
   echo "  WARN sending-truth feed failed — keeping last-known-good" >&2
 fi
+# conversion (reply labels): TRUE conversion metrics from the 4-label reply classification.
+# Self-activating: emits status='pending_labels' (honest backfill-in-progress state on the tab)
+# until the labeling lane's views (core.v_reply_label_current et al.) exist in the snapshot —
+# no wiring change needed when they land. [2026-07-15 cold-email-BI §9.3]
+lensgen conversion_dashboard_data.py "$REPO/dashboards/conversion/data.json"
 
 # 3) Commit if changed.
 cd "$REPO" || exit 1
 git config --global --add safe.directory "$REPO" 2>/dev/null
-git add portal_data.js dashboards/lens-overview/data.json dashboards/lens-kpi/data.json dashboards/lens-sms/data/latest.json dashboards/lens-sms-performance/data/latest.json dashboards/lens-campaign-performance/data/latest.json dashboards/lens-campaign-performance/data/workspaces.json dashboards/lens-sending-truth/data.json.gz 2>/dev/null
+git add portal_data.js dashboards/lens-overview/data.json dashboards/lens-kpi/data.json dashboards/lens-sms/data/latest.json dashboards/lens-sms-performance/data/latest.json dashboards/lens-campaign-performance/data/latest.json dashboards/lens-campaign-performance/data/workspaces.json dashboards/lens-sending-truth/data.json.gz dashboards/conversion/data.json 2>/dev/null
 if git diff --cached --quiet; then
   echo "[3/4] no change in portal feed or Lens data — nothing to publish"; exit 0
 fi
