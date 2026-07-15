@@ -178,11 +178,43 @@ def main() -> None:
                     LEFT JOIN om ON om.ws = COALESCE(lab.ws, nat.ws)
                     ORDER BY 1
                 """)
-                denom = q(f"""
-                    SELECT COUNT(DISTINCT (workspace_id, lower(lead_email)))::BIGINT AS n
-                    FROM core.email_message
-                    WHERE direction = 'inbound' AND workspace_id IN {WS_IN}
-                      AND CAST(CAST(message_at AS DATE) AS VARCHAR) IN {days_in}
+                # Coverage — like-for-like at LEAD grain (the labeling lane's own measure):
+                # numerator = canonical replying leads with ANY label event in-window (ALL event
+                # classes count as read — auto/bot/unreadable gates included, those replies WERE
+                # read); denominator = canonical human-reply leads for the day from
+                # derived.v_reply_canonical (is_auto_reply=false, uuid->slug normalized).
+                # The old core.email_message denominator included auto-replying leads that the
+                # 4-label numerator could never contain, so 100% was unreachable by construction.
+                if exists("derived", "v_reply_canonical"):
+                    cov = q(f"""
+                        WITH ev AS (
+                          SELECT DISTINCT workspace_slug AS ws, lower(lead_email) AS lead_email
+                          FROM main.raw_reply_label_event
+                          WHERE workspace_slug IN {WS_IN}
+                            AND CAST(CAST(message_ts AS DATE) AS VARCHAR) IN {days_in}),
+                        canon AS (
+                          SELECT DISTINCT workspace_id_canonical AS ws, lower(lead_email) AS lead_email
+                          FROM derived.v_reply_canonical
+                          WHERE workspace_id_canonical IN {WS_IN}
+                            AND is_auto_reply = FALSE
+                            AND CAST(CAST(reply_timestamp AS DATE) AS VARCHAR) IN {days_in})
+                        SELECT (SELECT COUNT(*) FROM canon)::BIGINT AS replying_leads,
+                               (SELECT COUNT(*) FROM canon c JOIN ev e USING (ws, lead_email))::BIGINT AS read_leads
+                    """)[0]
+                    read_n, denom = cov["read_leads"], cov["replying_leads"]
+                else:  # pre-canonical fallback (legacy grain; 100% not guaranteed reachable)
+                    denom = q(f"""
+                        SELECT COUNT(DISTINCT (workspace_id, lower(lead_email)))::BIGINT AS n
+                        FROM core.email_message
+                        WHERE direction = 'inbound' AND workspace_id IN {WS_IN}
+                          AND CAST(CAST(message_at AS DATE) AS VARCHAR) IN {days_in}
+                    """)[0]["n"]
+                    read_n = None
+                unreadable_n = q(f"""
+                    SELECT COUNT(*)::BIGINT AS n FROM main.raw_reply_label_event
+                    WHERE workspace_slug IN {WS_IN}
+                      AND CAST(CAST(message_ts AS DATE) AS VARCHAR) IN {days_in}
+                      AND (label = 'unreadable' OR deterministic_gate = 'unreadable_no_text')
                 """)[0]["n"]
                 meta = q(f"SELECT MAX(labeler_version) AS ver, COUNT(*) AS n FROM ({scoped})")[0]
                 for r in rows:
@@ -194,8 +226,10 @@ def main() -> None:
                     "status": "ok",
                     "labeler_version": meta["ver"],
                     "scope": {"mode": "completed_days_only", "max_day": cap, "min_day": HARD_MIN_DAY, "days": days},
-                    "coverage": {"labeled": meta["n"], "replying_leads_days": denom,
-                                 "pct": round(100.0 * meta["n"] / denom, 1) if denom else None},
+                    "coverage": {"labeled": (read_n if read_n is not None else meta["n"]),
+                                 "replying_leads_days": denom,
+                                 "pct": round(100.0 * (read_n if read_n is not None else meta["n"]) / denom, 1) if denom else None,
+                                 "unreadable": unreadable_n},
                     "totals": tot, "rows": rows,
                 })
             else:
