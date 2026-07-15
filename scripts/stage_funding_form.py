@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# [RETIRED 2026-07-14 per Sam] Funding Form sheet phased out early July (portal im_bookings is SoT; staged CSV frozen at 2026-07-01). Mac launchd producer disabled. Do NOT wire to the new SA.
 """PRODUCE step for the Funding-Form meetings sheet mirror — run on the Mac (has the Google token).
 
 This is the source-of-truth feed for core.meeting from 2026-06-01 onward (WS-E re-platform,

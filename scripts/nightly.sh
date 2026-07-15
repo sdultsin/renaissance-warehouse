@@ -546,6 +546,21 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
             ":warning: *serving snapshot promote-at-completion rc=$PROMOTE_RC* — the nightly tried to promote the freshly-built serving snapshot but the publisher returned non-zero (could be a benign no-op if an earlier promote already published this build; check /opt/duckdb/logs). The 06:30 timer + 07:15/09:00 success-watchdog still cover serving freshness. Investigate /opt/duckdb/bin/publisher.py if serving is stale." \
             2>&1 | tee -a "$LOG_FILE" || true
     fi
+    # [2026-07-14] MotherDuck write-path kick — the MD publish fires ON PROMOTE, regardless of
+    # hour. WHY: the wrapper's */30 cron ticks race the promote (today's 8.7h nightly promoted
+    # at 14:15Z and warehouse_current flipped at 14:31 — 30 SECONDS after the 14:30 tick read
+    # it, so the day's MD publish only happened because a human ran it manually). This removes
+    # the race and the window-edge entirely: a successful promote-at-completion immediately
+    # launches the wrapper DETACHED (nohup; survives this script exiting). Safe by construction:
+    # flock -n no-ops if a cron tick is already publishing, the wrapper's snapshot-identity
+    # stamp no-ops if this snapshot is already published, and the runner's GATE +
+    # last_success_snapshot dedup make a double-publish impossible. The (extended, 6-17Z)
+    # cron remains the retry path if this kicked run fails (rc>=2 alerts #cc-sam itself).
+    if [[ "$PROMOTE_RC" -eq 0 && -x /root/md-migration/md_write_path.sh ]]; then
+        nohup /usr/bin/flock -n /tmp/md_write_path.lock /root/md-migration/md_write_path.sh \
+            >> /root/md-migration/md_write_path.log 2>&1 &
+        echo "kicked MotherDuck write-path publish (detached pid $!)" | tee -a "$LOG_FILE"
+    fi
 fi
 
 echo "exit=$FINAL_EXIT (orchestrator=$EXIT_CODE degraded=$NIGHTLY_DEGRADED)" | tee -a "$LOG_FILE"

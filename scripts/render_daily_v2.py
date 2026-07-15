@@ -48,7 +48,7 @@ import json, os, sys, datetime, statistics, urllib.request, urllib.parse, collec
 
 # ------------------------------ config ------------------------------
 SID = "1vL77hVTY3P5_0e-K34qjWWpes_hymx4XiC630llyF34"
-TOK = os.environ.get("GOOGLE_TOKEN", "/root/.config/mcp-google-sheets/token.json")
+TOK = os.environ.get("GOOGLE_SA_KEY", "/root/.config/gcp-sa/droplet-sheets-sync.json")  # [2026-07-14 creds-rebuild] service-account key
 BASE = f"https://sheets.googleapis.com/v4/spreadsheets/{SID}"
 
 _flags = {a for a in sys.argv[1:] if a.startswith("--")}
@@ -155,7 +155,8 @@ def _scalar(sql, default=0):
 # ------------------------------ google sheets api ------------------------------
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request as _GReq
-_g_creds = Credentials.from_authorized_user_file(TOK)
+from google.oauth2 import service_account as _sa  # [2026-07-14 creds-rebuild]
+_g_creds = _sa.Credentials.from_service_account_file(TOK, scopes=["https://www.googleapis.com/auth/spreadsheets"])
 try:
     _g_creds.refresh(_GReq())
 except Exception as _e:

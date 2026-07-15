@@ -26,7 +26,7 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 TOKEN_PATH = os.path.expanduser("~/.config/mcp-google-sheets/token.json")
-LOCAL_DIR = "/tmp/partner-booking-staging"
+LOCAL_DIR = os.environ.get("LOCAL_STAGING_DIR", "/tmp/partner-booking-staging")  # [2026-07-14] droplet-run: /root/core/sheets_staging + --no-scp
 DROPLET_HOST = "renaissance-worker"
 DROPLET_STAGING = os.environ.get("DROPLET_STAGING", "/root/core/sheets_staging")
 
@@ -61,7 +61,11 @@ def main(argv=None):
     ap.add_argument("--no-scp", action="store_true", help="write CSVs locally only")
     args = ap.parse_args(argv)
 
-    creds = Credentials.from_authorized_user_file(TOKEN_PATH)
+    # [2026-07-14 creds-rebuild] SA auth; runs on the DROPLET now (Mac OAuth client destroyed)
+    from google.oauth2 import service_account
+    creds = service_account.Credentials.from_service_account_file(
+        os.environ.get("GOOGLE_SA_KEY", "/root/.config/gcp-sa/droplet-sheets-sync.json"),
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly"])
     svc = build("sheets", "v4", credentials=creds)
     api = svc.spreadsheets().values()
 

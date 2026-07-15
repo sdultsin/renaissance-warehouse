@@ -113,7 +113,12 @@ def _load_token(path: str) -> str:
         from google.auth.transport.requests import Request
     except ImportError:
         sys.exit("google-auth not installed: pip install google-auth")
-    creds = Credentials.from_authorized_user_file(path)
+    # [2026-07-14 creds-rebuild] service-account auth; `path` arg ignored (old OAuth token destroyed)
+    from google.oauth2 import service_account
+    creds = service_account.Credentials.from_service_account_file(
+        "/root/.config/gcp-sa/droplet-sheets-sync.json",
+        scopes=["https://www.googleapis.com/auth/spreadsheets.readonly",
+                "https://www.googleapis.com/auth/drive.readonly"])
     creds.refresh(Request())
     return creds.token
 
