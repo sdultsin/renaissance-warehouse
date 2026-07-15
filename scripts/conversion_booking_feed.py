@@ -160,13 +160,15 @@ def main() -> None:
                       WHERE s.label = 'opportunity' GROUP BY 1),
                     nat AS (
                       SELECT workspace_id AS ws,
-                             SUM(unique_replies)::BIGINT       AS replies_native,
-                             SUM(unique_opportunities)::BIGINT AS native_opps
+                             SUM(sent)::BIGINT                          AS sent,
+                             SUM(unique_replies)::BIGINT                AS replies_native,
+                             SUM(unique_replies_automatic)::BIGINT      AS replies_auto,
+                             SUM(unique_opportunities)::BIGINT          AS native_opps
                       FROM raw_pipeline_campaign_daily_metrics
                       WHERE workspace_id IN {WS_IN} AND CAST(date AS VARCHAR) IN {days_in}
                       GROUP BY 1)
                     SELECT COALESCE(lab.ws, nat.ws) AS ws,
-                           nat.replies_native, nat.native_opps,
+                           nat.sent, nat.replies_native, nat.replies_auto, nat.native_opps,
                            lab.labeled, lab.opp, lab.eng, lab.conf, lab.ni, lab.opt_outs,
                            om.opp_leads, om.opp_met
                     FROM lab FULL JOIN nat ON nat.ws = lab.ws
@@ -183,8 +185,8 @@ def main() -> None:
                 for r in rows:
                     r["name"] = ws_names.get(r["ws"], r["ws"])
                 tot = {k: sum(int(r[k] or 0) for r in rows) for k in
-                       ("replies_native", "native_opps", "labeled", "opp", "eng", "conf", "ni",
-                        "opt_outs", "opp_leads", "opp_met")}
+                       ("sent", "replies_native", "replies_auto", "native_opps", "labeled",
+                        "opp", "eng", "conf", "ni", "opt_outs", "opp_leads", "opp_met")}
                 payload.update({
                     "status": "ok",
                     "labeler_version": meta["ver"],
