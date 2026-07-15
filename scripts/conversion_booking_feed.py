@@ -34,8 +34,11 @@ WORKER_ENV = os.environ.get("WORKER_ENV_FILE", "/root/renaissance-worker/.env")
 HARD_MAX_DAY = "2026-07-14"            # MVP: the one Sam-approved completed labeled day
 HARD_MIN_DAY = "2026-07-14"            # floor: excludes the partial Jul-13 sliver (backfill entered Jul-13 at 23:21 only); a day renders only if FULLY labeled
 
+# 7 workspaces (Sam 2026-07-15): the 5 funding slugs + warm-leads + renaissance-1.
+# The KPIs tab's "Warm Leads excluded" convention does NOT apply to the Conversion view —
+# Sam explicitly wants both included here. (NOT the-gatekeepers.)
 FUNDING_WS = ('renaissance-2', 'renaissance-4', 'renaissance-5',
-              'prospects-power', 'koi-and-destroy')
+              'prospects-power', 'koi-and-destroy', 'warm-leads', 'renaissance-1')
 WS_IN = "('" + "','".join(FUNDING_WS) + "')"
 
 def log(msg: str) -> None:
