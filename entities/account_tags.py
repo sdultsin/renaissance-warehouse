@@ -202,6 +202,66 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
         logger.info("account_tags %s (slug=%s): full-replace %d inboxes across %d tags",
                     slug, canon_slug, new_n, r.get("n_tags"))
 
+    # ---- daily stage-history snapshot (DDL 1115) --------------------------------------------
+    # core.account_tags is CURRENT-STATE ONLY: each inbox's row is overwritten with its current
+    # tags, so yesterday's tag state is unrecoverable. The lifecycle stage (Warmup/Rampup/Active/
+    # Rehab) is carried ENTIRELY by tags, so without a dated copy the warehouse can never answer
+    # "which stage was this inbox in on <date>?" or "when did it start ramping up?". Instantly
+    # cannot report tag-apply dates, so observing daily is the only way to build that history.
+    #
+    # Snapshots ONLY the inboxes refreshed in THIS run (_run_id = ctx.run_id) — i.e. the ones
+    # actually seen live tonight — so the ghost rows account_tags deliberately retains do NOT
+    # pollute the history. tags_arr is stored verbatim alongside the derived stage so the stage
+    # can always be recomputed if the derivation ever changes.
+    #
+    # STAGE PRECEDENCE — Rehab > Warmup > Rampup > Active. An inbox is supposed to carry exactly
+    # ONE status tag, so precedence only decides TRANSIENT double-tagged rows (a flip caught
+    # mid-flight: the pipeline adds the new tag and removes the old one, and a nightly landing
+    # between those two writes sees both). The rule is "record the EARLIER stage": a half-applied
+    # flip has not completed, so claiming the inbox already graduated would date its stage entry
+    # too early — and stage-entry dates are the whole point of this table. Rehab is checked first
+    # because it is the one stage that does NOT sit on the linear Warmup→Rampup→Active line (an
+    # old inbox re-entering rehab), so it can legitimately co-occur with any of them and must win.
+    # This is a tie-break for a rare, transient state, NOT a claim about normal lifecycle order —
+    # and it is reversible: tags_arr is stored verbatim, so any row can be re-derived if wrong.
+    #
+    # DEGRADES GRACEFULLY: wrapped so a snapshot failure can NEVER fail the tags phase. Worst
+    # case is a one-day hole in the history; the tags themselves are already committed above.
+    snapshot_rows = 0
+    try:
+        snap_date = now.date()
+        ctx.db.execute(
+            """
+            INSERT INTO core.account_tags_daily
+              (snapshot_date, email, workspace_uuid, workspace_slug, tags_arr, n_tags, stage,
+               _loaded_at, _run_id)
+            SELECT ?::DATE, t.email, t.workspace_uuid, t.workspace_slug, t.tags_arr, t.n_tags,
+                   CASE WHEN list_contains(t.tags_arr, 'Rehab')  THEN 'Rehab'
+                        WHEN list_contains(t.tags_arr, 'Warmup') THEN 'Warmup'
+                        WHEN list_contains(t.tags_arr, 'Rampup') THEN 'Rampup'
+                        WHEN list_contains(t.tags_arr, 'Active') THEN 'Active'
+                        ELSE NULL END,
+                   ?, ?
+            FROM core.account_tags t
+            WHERE t._run_id = ?
+              AND NOT EXISTS (
+                    SELECT 1 FROM core.account_tags_daily d
+                    WHERE d.snapshot_date = ?::DATE
+                      AND d.email = t.email
+                      AND d.workspace_uuid = t.workspace_uuid
+              )
+            """,
+            [snap_date, now, ctx.run_id, ctx.run_id, snap_date],
+        )
+        snapshot_rows = ctx.db.execute(
+            "SELECT COUNT(*) FROM core.account_tags_daily WHERE snapshot_date = ?::DATE",
+            [snap_date],
+        ).fetchone()[0]
+        logger.info("account_tags_daily: snapshot for %s now holds %d rows", snap_date, snapshot_rows)
+    except Exception:  # noqa: BLE001
+        # Never re-raise: the tag write above is what the phase exists for and it already succeeded.
+        logger.exception("account_tags_daily: snapshot failed — one-day history gap; tags unaffected")
+
     return PhaseResult(rows_out=inboxes_written, notes={
         "inboxes_written": inboxes_written,
         "workspaces_done": workspaces_done,
@@ -209,4 +269,5 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
         "workers": _WORKERS,
         "deadline_min": _DEADLINE_S // 60,
         "skipped_on_deadline": skipped,
+        "stage_snapshot_rows": snapshot_rows,
     })
