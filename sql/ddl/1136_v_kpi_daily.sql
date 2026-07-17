@@ -39,8 +39,28 @@
 -- an opportunity (resp. opp-or-engagement) label EVENT whose reply falls on
 -- the day, across ALL labeler versions (ever-labeled never decrements);
 -- labeled/opp/eng/conf/ni are day-grain CURRENT-state (latest labeled_at per
--- workspace×lead×day). Gate classes (auto/bot/labeler_error) excluded from
--- every stat. opp_met = post-reply meeting join (meeting_date >= reply day).
+-- workspace×lead×day; deterministic tie-break labeled_at/message_ts/ref_id).
+-- Gate classes (auto/bot/labeler_error) excluded from every stat.
+-- opp_met = post-reply meeting join (meeting_date >= reply day).
+--
+-- REVIEWER-SETTLED SEMANTICS (two-key round 1, 2026-07-17 — explicit design
+-- choices, not oversights):
+--   * labels_sound/labels_state in v_kpi_daily are PER-WORKSPACE: the row gate
+--     uses that workspace's OWN label watermark (MAX labeled reply-day), never
+--     a global day watermark — a lagging workspace can never be marked sound by
+--     other workspaces' progress. v_kpi_coverage_daily stays DAY-grain EVIDENCE
+--     (aggregate ratios + global watermark) and is deliberately NOT joined into
+--     the fact rows (also removes any fan-out surface).
+--   * opp_met attributes a meeting to EVERY opp-reply day on/before it (per-day
+--     cohort semantics; NOT additive across days — summing opp_met over a range
+--     double-counts multi-day repliers by design; range-level conversion must
+--     recompute at lead grain or use the feed/tab range logic).
+--   * settling days (within D+2 of the workspace watermark = the rolling
+--     re-sweep window) ARE labels_sound=TRUE — the escrow-direct feed's
+--     slice-coverage gate decides their DISPLAY; labels_state exposes the
+--     distinction for consumers that want to exclude them.
+--   * completed_day uses the fixed EST offset (now()-5h): never marks a day
+--     complete early; during EDT it flips up to 1h late. Accepted (ICU-free).
 --
 -- NOTE (freshness): this view reads main.raw_reply_label_event (nightly escrow
 -- load) — canonical, promote-cadence. The booking feed stays ESCROW-DIRECT for
@@ -111,6 +131,8 @@ SELECT
   wm.wm_day AS labels_watermark_day,
   (s.day >= DATE '2024-01-15')                                   AS sends_sound,
   (s.day >= DATE '2024-01-01')                                   AS meetings_sound,
+  -- DAY-GRAIN aggregate verdicts — EVIDENCE ONLY (global watermark); the
+  -- row-level gate consumers must use is v_kpi_daily's PER-WORKSPACE flags
   CASE WHEN s.day <  DATE '2026-05-15'                THEN 'pre_boundary'
        WHEN s.day >  wm.wm_day                        THEN 'unlabeled'
        WHEN s.day >  wm.wm_day - INTERVAL 2 DAY       THEN 'settling'   -- D+2 rolling re-sweep window
@@ -134,12 +156,14 @@ WITH nat AS (
 ),
 real_ev AS (
   SELECT workspace_slug, lower(lead_email) AS le, CAST(message_ts AS DATE) AS day,
-         lower(CAST(label AS VARCHAR)) AS label, labeled_at
+         lower(CAST(label AS VARCHAR)) AS label, labeled_at, message_ts, message_ref_id
   FROM main.raw_reply_label_event
   WHERE lower(CAST(label AS VARCHAR)) IN
         ('opportunity', 'engagement', 'confused', 'not_interested', 'not interested')
 ),
 cur AS (  -- day-grain CURRENT state: latest labeled_at per workspace×lead×day
+          -- (tie-break fully deterministic: same-batch equal labeled_at resolved
+          --  by latest message then ref id — matches the v4 feed)
   SELECT workspace_slug, day,
          COUNT(*) AS labeled,
          SUM(CASE WHEN label = 'opportunity' THEN 1 ELSE 0 END) AS opp,
@@ -148,11 +172,15 @@ cur AS (  -- day-grain CURRENT state: latest labeled_at per workspace×lead×day
          SUM(CASE WHEN label IN ('not_interested', 'not interested') THEN 1 ELSE 0 END) AS ni
   FROM (
     SELECT workspace_slug, le, day, label,
-           row_number() OVER (PARTITION BY workspace_slug, le, day ORDER BY labeled_at DESC) AS rn
+           row_number() OVER (PARTITION BY workspace_slug, le, day
+                              ORDER BY labeled_at DESC, message_ts DESC, message_ref_id DESC) AS rn
     FROM real_ev
   )
   WHERE rn = 1
   GROUP BY 1, 2
+),
+ws_wm AS (  -- PER-WORKSPACE label watermark (the row-level soundness gate)
+  SELECT workspace_slug, MAX(day) AS wm_day FROM real_ev GROUP BY 1
 ),
 coh AS (  -- append-only event cohorts (ever-labeled, never decrements)
   SELECT workspace_slug, day,
@@ -198,12 +226,20 @@ SELECT
   coh.opp_cohort, coh.pos_cohort,
   om.opp_leads, om.opp_met,
   mt.meetings_booked,
-  cov.sends_sound, cov.labels_sound, cov.labels_state, cov.meetings_sound, cov.completed_day
+  (s.day >= DATE '2024-01-15')                                    AS sends_sound,
+  -- PER-WORKSPACE label gate (reviewer-settled): this workspace's own watermark
+  (s.day >= DATE '2026-05-15' AND s.day <= ww.wm_day)             AS labels_sound,
+  CASE WHEN s.day <  DATE '2026-05-15'                     THEN 'pre_boundary'
+       WHEN ww.wm_day IS NULL OR s.day > ww.wm_day         THEN 'unlabeled'
+       WHEN s.day >  ww.wm_day - INTERVAL 2 DAY            THEN 'settling'  -- D+2 re-sweep window
+       ELSE 'sound' END                                           AS labels_state,
+  (s.day >= DATE '2024-01-01')                                    AS meetings_sound,
+  (s.day <  CAST(now() - INTERVAL 5 HOUR AS DATE))                AS completed_day
 FROM spine s
-LEFT JOIN nat ON nat.day = s.day AND nat.workspace_slug = s.workspace_slug
-LEFT JOIN cur ON cur.day = s.day AND cur.workspace_slug = s.workspace_slug
-LEFT JOIN coh ON coh.day = s.day AND coh.workspace_slug = s.workspace_slug
-LEFT JOIN om  ON om.day  = s.day AND om.workspace_slug  = s.workspace_slug
-LEFT JOIN mt  ON mt.day  = s.day AND mt.workspace_slug  = s.workspace_slug
-LEFT JOIN core.workspace w ON w.slug = s.workspace_slug
-LEFT JOIN core.v_kpi_coverage_daily cov ON cov.day = s.day;
+LEFT JOIN nat   ON nat.day = s.day AND nat.workspace_slug = s.workspace_slug
+LEFT JOIN cur   ON cur.day = s.day AND cur.workspace_slug = s.workspace_slug
+LEFT JOIN coh   ON coh.day = s.day AND coh.workspace_slug = s.workspace_slug
+LEFT JOIN om    ON om.day  = s.day AND om.workspace_slug  = s.workspace_slug
+LEFT JOIN mt    ON mt.day  = s.day AND mt.workspace_slug  = s.workspace_slug
+LEFT JOIN ws_wm ww ON ww.workspace_slug = s.workspace_slug
+LEFT JOIN core.workspace w ON w.slug = s.workspace_slug;
