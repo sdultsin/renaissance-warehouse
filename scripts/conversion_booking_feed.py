@@ -231,9 +231,50 @@ def main() -> None:
                 except Exception as e:
                     log(f"coverage compute failed (non-fatal): {e}")
 
+                # ── DAY-READINESS GATE [2026-07-17, Sam-caught incident]: the 07:30Z conductor
+                # can run BEFORE the nightly loads yesterday's native facts — labels without
+                # denominators rendered sent=0 / positive-RR>100% nonsense. A day renders only
+                # when native facts are complete AND labels are ready; not-ready days are
+                # OMITTED (they self-heal on a later refresh). Hard sanity assertions drop a
+                # whole day loudly rather than ever rendering nonsense.
+                ready_days = []
+                for dday in days:
+                    drows = [r for r in rows if r["day"] == dday]
+                    tot_sent = sum(int(r["sent"] or 0) for r in drows)
+                    tot_h    = sum(int(r["replies_human"] or 0) for r in drows)
+                    tot_a    = sum(int(r["replies_auto"] or 0) for r in drows)
+                    reasons = []
+                    if tot_sent <= 0:
+                        reasons.append("native sent=0 — nightly facts not loaded yet")
+                    if tot_h <= 0:
+                        reasons.append("native human replies=0 — nightly facts not loaded yet")
+                    if tot_sent > 0 and (tot_h + tot_a) > 0.05 * tot_sent:
+                        reasons.append(f"replies {tot_h+tot_a} > 5% of sent {tot_sent} — implausible")
+                    for r in drows:
+                        pos = int(r["opp"] or 0) + int(r["eng"] or 0)
+                        if pos > int(r["replies_human"] or 0):
+                            reasons.append(f"{r['ws']}: positives {pos} > human replies {r['replies_human']}")
+                    if dday > FULL_READ_THROUGH:
+                        # positive-slice day: the daily labeler's sweep must have run AFTER the
+                        # day ended (max labeled_at past the day) or the evening tail is missing.
+                        try:
+                            wm = q(f"""SELECT CAST(MAX(labeled_at) AS VARCHAR) AS wm
+                                       FROM main.raw_reply_label_event
+                                       WHERE workspace_slug IN {WS_IN}
+                                         AND CAST(CAST(message_ts AS DATE) AS VARCHAR) = '{dday}'""")[0]["wm"]
+                            if not wm or wm[:10] <= dday:
+                                reasons.append(f"daily-labeler watermark {wm} not past {dday} — sweep incomplete")
+                        except Exception as e:
+                            reasons.append(f"watermark check failed: {e}")
+                    if reasons:
+                        log(f"DAY GATE: DROPPING {dday}: " + " | ".join(reasons))
+                    else:
+                        ready_days.append(dday)
+                rows = [r for r in rows if r["day"] in ready_days]
+                days = ready_days
                 ver = q(f"SELECT MAX(labeler_version) AS ver FROM ({scoped})")[0]["ver"]
                 payload.update({
-                    "status": "ok",
+                    "status": "ok" if days else "pending_labels",
                     "labeler_version": ver,
                     "scope": {"mode": "completed_days_only", "max_day": cap, "days": days},
                     "day_meta": [day_meta[d] for d in days],
