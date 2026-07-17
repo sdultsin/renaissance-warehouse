@@ -51,6 +51,14 @@ PASS_B_PHASES="${PASS_B_PHASES:-comms_mirror,sendivo,iskra,outreachify,replies_l
 export WAREHOUSE_ACCOUNT_TAGS_WORKERS="${WAREHOUSE_ACCOUNT_TAGS_WORKERS:-8}"
 export WAREHOUSE_ACCOUNT_TAGS_DEADLINE_MIN="${WAREHOUSE_ACCOUNT_TAGS_DEADLINE_MIN:-75}"
 
+# Tariffs rides the Instantly analytics/dim pull WITHOUT joining the shared report
+# roster (config/daily_report_sources.json drives the daily report render — adding
+# tariffs there would change the report). The analytics entity reads this gate from
+# the PROCESS environment only, so it must be exported here (R32 sending-infra
+# attribution needs tariffs' campaign tag_labels in raw_instantly_campaign_dim;
+# key = INSTANTLY_KEY_TARIFFS, present in the box .env since 2026-07-14).
+export WAREHOUSE_INSTANTLY_ANALYTICS_EXTRA_SLUGS="${WAREHOUSE_INSTANTLY_ANALYTICS_EXTRA_SLUGS:-tariffs}"
+
 # ─── promote_serving <reason> ─────────────────────────────────────────────────────────────────
 # Publishes the serving snapshot. Extracted into a function (2026-07-14) so it can be called TWICE:
 # once after PASS A (reason=portal-am) and once at nightly completion (reason=nightly-complete).
