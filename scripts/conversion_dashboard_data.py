@@ -175,8 +175,17 @@ LABEL_CANON = {"opportunity": "opp", "engagement": "eng", "confused": "conf",
                "not_interested": "ni", "not interested": "ni"}
 
 def find_label_relation() -> tuple[str, list[str]] | None:
-    """Newest-first preference: current-state view, then raw event table."""
-    for schema, name in (("core", "v_reply_label_current"), ("main", "v_reply_label_current"),
+    """Newest-first preference: REPLY-ONLY current-state view, then raw event table.
+
+    [2026-07-17 R34a] core.v_reply_label_current now overlays meeting_booked as a
+    terminal-positive CURRENT state (booked leads read current_label='meeting_booked').
+    This feed's label mix / opp->meeting math must stay reply-label-based, so it pins
+    to core.v_reply_label_current_replyonly (DDL 1125 — the pre-overlay 1111 semantics,
+    verbatim) and deliberately NEVER reads the overlaid core.v_reply_label_current
+    (booked leads would silently leave the label mix). Fallback = the raw event table
+    (the QUALIFY dedup below reproduces identical current-state numbers).
+    """
+    for schema, name in (("core", "v_reply_label_current_replyonly"),
                          ("main", "raw_reply_label_event"), ("core", "raw_reply_label_event")):
         if exists(schema, name):
             return f"{schema}.{name}", cols_of(schema, name)
