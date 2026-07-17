@@ -30,6 +30,9 @@ import duckdb
 DB = os.environ.get("CORE_DB_PATH", "/opt/duckdb/warehouse_current.duckdb")
 WORKER_ENV = os.environ.get("WORKER_ENV_FILE", "/root/renaissance-worker/.env")
 FULL_READ_THROUGH = "2026-07-14"   # R18 boundary: <= this day = full-read; after = positive-slice
+MIN_DAY = "2026-07-14"             # R11 floor: the Jul-13 sliver (labels whose anchoring reply
+                                   # trailed into Jul-13 during the Jul-14 batch) is NOT a
+                                   # presentable day — first fully-covered day = 2026-07-14.
 
 # 7 workspaces (Sam 2026-07-15): 5 funding slugs + warm-leads + renaissance-1 (NOT the-gatekeepers).
 FUNDING_WS = ('renaissance-2', 'renaissance-4', 'renaissance-5',
@@ -130,7 +133,7 @@ def main() -> None:
             scoped = f"""
                 WITH b AS ({base})
                 SELECT * FROM b
-                WHERE ws IN {WS_IN} AND d <= DATE '{cap}'
+                WHERE ws IN {WS_IN} AND d BETWEEN DATE '{MIN_DAY}' AND DATE '{cap}'
                   AND label IN ('opportunity','engagement','confused','not_interested','not interested')
             """
             days = [r["d"] for r in q(f"SELECT DISTINCT CAST(d AS VARCHAR) AS d FROM ({scoped}) ORDER BY d")]
