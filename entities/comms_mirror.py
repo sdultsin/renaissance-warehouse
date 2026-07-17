@@ -127,6 +127,13 @@ _TABLES: list[tuple[str, str, str]] = [
     # columns → no casts. Full-refresh REPLACE like the rest (source is
     # append-only, so the snapshot only grows).
     ("comms", "instantly_lead_state_event", "raw_comms_instantly_lead_state_event"),
+    # ── Instantly email-event webhook capture (comms mig 045, 2026-07-17): the real-time
+    # email-BODY push feed (email_sent OUTBOUND body / reply_received INBOUND body) that
+    # replaces the rate-limited per-lead /emails?lead= drain for keeping outbound thread
+    # bodies current. Forensic warehouse-native snapshot; entities/instantly_email_webhook_atom.py
+    # drains it into raw_instantly_email_message (collapse on message_id == email_id). DDL in
+    # sql/ddl/1124_instantly_email_event_mirror.sql. raw_json is jsonb → VARCHAR cast below.
+    ("comms", "instantly_email_event", "raw_comms_instantly_email_event"),
 ]
 
 # Columns that must be CAST to VARCHAR for postgres_scanner -> DuckDB. Covers
@@ -151,6 +158,8 @@ _CAST_TO_VARCHAR: dict[str, set[str]] = {
     # ── coverage-audit gap #3 (2026-07-09): jsonb columns on the new tables.
     "raw_comms_meeting_reminder": {"metadata"},
     "raw_comms_sendivo_outbound_log": {"raw"},
+    # ── instantly_email_event (2026-07-17): raw_json is jsonb.
+    "raw_comms_instantly_email_event": {"raw_json"},
 }
 
 # Per-table column-expression overrides for the mirror SELECT. Unlike
