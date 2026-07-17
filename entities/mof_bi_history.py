@@ -120,10 +120,55 @@ _SEEDS = [
     ),
 ]
 
-_OFFER_SCOPE_APPEND = """
+# Owner derivation = Sam ruling R31 [2026-07-17], DETERMINISTIC two-step — keep
+# byte-for-byte in sync with sql/ddl/1119_owner_deterministic_r31.sql (which
+# recomputed the whole table with the same function; this append applies it to
+# every NEW campaign forever). Tiers: parenthetical token > bare trailing token >
+# unique standalone token anywhere > workspace contains-rules (F2 SAM / r1 IDO) >
+# workspace default > alias-map dominant CM (unambiguous) > unattributed.
+_OWNER_TOKENS = (
+    "['SAM','IDO','LEO','EYVER','SAMUEL','TOMI','CARLOS','SHAAN','MAX',"
+    "'LAUTARO','MARCOS','ANDRES','BRENDAN','AYMAN','WL','JESSICA','KEN','ISAAC']"
+)
+
+_OFFER_SCOPE_APPEND = f"""
 INSERT INTO core.campaign_offer_scope
   (campaign_id, campaign_name, workspace_slug, offer_class, in_funding_scope,
    classified_by, confidence, evidence, owner_cm, owner_basis, source_table, _source)
+WITH alias_cm AS (
+    SELECT warehouse_slug, any_value(owner_cm) AS ws_cm
+    FROM core.workspace_alias_unified
+    GROUP BY 1
+),
+base AS (
+    SELECT d.*,
+           a.ws_cm,
+           list_filter(
+               regexp_extract_all(COALESCE(d.campaign_name,''), '\\(([A-Za-z]{{2,10}})\\)', 1),
+               x -> list_contains({_OWNER_TOKENS}, upper(x))
+           )[1] AS paren_tok,
+           upper(regexp_extract(COALESCE(d.campaign_name,''), '([A-Za-z]+)[^A-Za-z]*$', 1)) AS trail_tok,
+           regexp_matches(COALESCE(d.campaign_name,''), '(^|[^A-Za-z])[Ss][Aa][Mm]([^A-Za-z]|$)') AS has_sam,
+           regexp_matches(COALESCE(d.campaign_name,''), '(^|[^A-Za-z])[Ii][Dd][Oo]([^A-Za-z]|$)') AS has_ido,
+           list_distinct(list_filter(
+               regexp_extract_all(upper(COALESCE(d.campaign_name,'')), '[A-Z]+'),
+               x -> list_contains({_OWNER_TOKENS}, x)
+           )) AS anywhere_toks
+    FROM raw_instantly_campaign_dim d
+    LEFT JOIN alias_cm a ON a.warehouse_slug = d.workspace_slug
+),
+derived AS (
+    SELECT *,
+        CASE
+            WHEN paren_tok IS NOT NULL THEN upper(paren_tok)
+            WHEN list_contains({_OWNER_TOKENS}, trail_tok) THEN trail_tok
+            WHEN len(anywhere_toks) = 1 THEN anywhere_toks[1]
+            WHEN workspace_slug = 'renaissance-5' AND has_sam THEN 'SAM'
+            WHEN workspace_slug = 'renaissance-1' AND has_ido THEN 'IDO'
+            ELSE NULL
+        END AS name_owner
+    FROM base
+)
 SELECT d.campaign_id,
        d.campaign_name,
        d.workspace_slug,
@@ -149,19 +194,30 @@ SELECT d.campaign_id,
          || CAST(d.first_seen_at AS VARCHAR)
          || '; OFFER-TAG-SPEC untagged=Funding convention; tags=' || COALESCE(d.tag_labels, '(none)'),
        CASE
-         WHEN regexp_extract(COALESCE(d.campaign_name, ''), '\\(([A-Z]{2,10})\\)', 1) <> ''
-           THEN regexp_extract(COALESCE(d.campaign_name, ''), '\\(([A-Z]{2,10})\\)', 1)
-         WHEN d.workspace_slug = 'warm-leads' THEN 'WL'
-         ELSE NULL  -- Sam ruling 2026-07-16 (DDL 1118): no-parenthetical = UNATTRIBUTED, never the old IDO fallback
+         WHEN d.name_owner IS NOT NULL THEN d.name_owner
+         WHEN d.workspace_slug = 'renaissance-4'   THEN 'SAMUEL'
+         WHEN d.workspace_slug = 'renaissance-5'   THEN 'IDO'
+         WHEN d.workspace_slug = 'prospects-power' THEN 'LEO'
+         WHEN d.workspace_slug = 'koi-and-destroy' THEN 'SAM'
+         WHEN d.workspace_slug = 'renaissance-2'   THEN 'EYVER'
+         WHEN d.workspace_slug = 'the-gatekeepers' THEN 'MAX'
+         WHEN d.workspace_slug = 'tariffs'         THEN 'IDO'
+         WHEN d.workspace_slug = 'renaissance-1'   THEN 'INSTANTLY_DFY'
+         WHEN d.workspace_slug = 'warm-leads'      THEN 'WL'
+         WHEN d.ws_cm IS NOT NULL AND d.ws_cm NOT LIKE '%/%' THEN d.ws_cm
+         ELSE NULL  -- R31: genuinely nothing -> unattributed (never the old IDO fallback)
        END,
        CASE
-         WHEN regexp_extract(COALESCE(d.campaign_name, ''), '\\(([A-Z]{2,10})\\)', 1) <> '' THEN 'name'
-         WHEN d.workspace_slug = 'warm-leads' THEN 'workspace'
-         ELSE 'unattributed'  -- was 'default' (pre-1118)
+         WHEN d.name_owner IS NOT NULL THEN 'name_parse'
+         WHEN d.workspace_slug IN ('renaissance-4','renaissance-5','prospects-power','koi-and-destroy',
+                                   'renaissance-2','the-gatekeepers','tariffs','renaissance-1','warm-leads')
+           THEN 'workspace_default'
+         WHEN d.ws_cm IS NOT NULL AND d.ws_cm NOT LIKE '%/%' THEN 'alias_dominant'
+         ELSE 'unattributed'
        END,
        'raw_instantly_campaign_dim(auto-append)',
        'mof_bi_history_auto_append'
-FROM raw_instantly_campaign_dim d
+FROM derived d
 WHERE NOT EXISTS (SELECT 1 FROM core.campaign_offer_scope s WHERE s.campaign_id = d.campaign_id)
 ON CONFLICT (campaign_id) DO NOTHING
 """
