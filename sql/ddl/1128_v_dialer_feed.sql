@@ -72,18 +72,22 @@ lead_phone_fallback AS (
     GROUP BY 1
 ),
 message_current AS (
+    -- latest verdict per message, ranked across the FULL verdict set (incl. gate
+    -- classes auto/bot; only 'labeler_error' ignored) so a re-gated message can
+    -- never fall back to a stale positive label (two-key reviewer finding).
     SELECT *,
            row_number() OVER (
                PARTITION BY message_ref_table, message_ref_id
                ORDER BY labeled_at DESC, labeler_version DESC
            ) AS rn
     FROM main.raw_reply_label_event
-    WHERE label IN ('opportunity', 'engagement', 'confused', 'not_interested')
+    WHERE label <> 'labeler_error'
       AND message_ts IS NOT NULL
 ),
 episodes AS (
     -- opportunity EPISODES per person: an opportunity verdict whose previous
-    -- message-grain verdict (any workspace) was not opportunity starts an episode
+    -- message-grain verdict (any workspace; auto/bot verdicts count as
+    -- non-opportunity boundaries) was not opportunity starts an episode
     SELECT lead_email, count(*) AS opp_episodes
     FROM (
         SELECT lower(lead_email) AS lead_email, label,
