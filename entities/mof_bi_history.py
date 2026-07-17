@@ -152,12 +152,12 @@ SELECT d.campaign_id,
          WHEN regexp_extract(COALESCE(d.campaign_name, ''), '\\(([A-Z]{2,10})\\)', 1) <> ''
            THEN regexp_extract(COALESCE(d.campaign_name, ''), '\\(([A-Z]{2,10})\\)', 1)
          WHEN d.workspace_slug = 'warm-leads' THEN 'WL'
-         ELSE 'IDO'
+         ELSE NULL  -- Sam ruling 2026-07-16 (DDL 1118): no-parenthetical = UNATTRIBUTED, never the old IDO fallback
        END,
        CASE
          WHEN regexp_extract(COALESCE(d.campaign_name, ''), '\\(([A-Z]{2,10})\\)', 1) <> '' THEN 'name'
          WHEN d.workspace_slug = 'warm-leads' THEN 'workspace'
-         ELSE 'default'
+         ELSE 'unattributed'  -- was 'default' (pre-1118)
        END,
        'raw_instantly_campaign_dim(auto-append)',
        'mof_bi_history_auto_append'
