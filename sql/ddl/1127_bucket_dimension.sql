@@ -29,14 +29,19 @@ CREATE SCHEMA IF NOT EXISTS core;
 
 CREATE OR REPLACE VIEW core.v_positive_reply_event_bucket AS
 WITH message_current AS (
-    -- one row per labeled inbound message = its latest labeler verdict
+    -- one row per labeled inbound message = its latest labeler VERDICT, ranked
+    -- across the FULL verdict set (4 real labels + gate classes 'auto'/'bot');
+    -- only 'labeler_error' rows (runner failures, not verdicts) are ignored.
+    -- Ranking the full set is what guarantees "latest verdict wins": a message
+    -- re-gated to auto/bot under a newer labeler version must NOT fall back to a
+    -- stale positive label (two-key reviewer finding, 2026-07-17).
     SELECT *,
            row_number() OVER (
                PARTITION BY message_ref_table, message_ref_id
                ORDER BY labeled_at DESC, labeler_version DESC
            ) AS rn
     FROM main.raw_reply_label_event
-    WHERE label IN ('opportunity', 'engagement', 'confused', 'not_interested')
+    WHERE label <> 'labeler_error'
       AND message_ts IS NOT NULL
 )
 SELECT
