@@ -1,7 +1,40 @@
 """Push the booking-site conversion feed — portal Supabase dashboard_feeds key='conversion'.
 
+v4 (R36 all-sound-history backfill, 2026-07-17): the feed now emits ALL SOUND HISTORY
+(day x workspace) — not just recent days — so the KPIs tab computes every range preset
+by summing day rows and never mixes coverages (the MTD-bug class: 3 days of labeled opps
+against a full month of meetings). Day paths:
+
+  * day >= 2026-07-14 ("live path"): the v3 pipeline VERBATIM — native facts from
+    raw_pipeline_campaign_daily_metrics, modes full_read / positive_slice /
+    ledger_provisional, day-readiness gate, slice-coverage gate, per-ws assertions.
+    Jul-14..16 rows are regression-frozen (byte-identical to the v3 output).
+  * 2026-05-15 <= day < 2026-07-14 ("backfill_slice"): labels COMPLETE via the all-time
+    backfill (522,328 events, 78,523/78,526 pool leads, COMPLETION-REPORT verified) —
+    label columns from the escrow parquets with the exact v3 query shapes (cohorts +
+    current-state), native denominators from core.v_sends_truth_daily (the 1105 MAX-stitch
+    API restatement — the honest source for settled history; raw_pipeline undercounts the
+    frozen region). Per-ws sanity (positives <= human) enforced; a violating day ships
+    NATIVE-ONLY with mode='backfill_assert_failed' (labels wiped for the day, loud log).
+  * 2024-01-15 <= day < 2026-05-15 ("pre_boundary"): native facts + meetings only; ALL
+    label columns None — 100%-or-wipe. Boundary grounds (measured 2026-07-17): Instantly
+    native positive marks are positive truth >= 2026-05-15 only (standing invariant), and
+    event-basis mark recovery is ~0 before 2026-03-26 (webhook start), 0.64 in the Apr-13
+    outage week, >=0.88 multi-source from May. Never partial label counts.
+
+  SOUNDNESS CONTRACT for the tab: label columns are summable ONLY over day_meta modes
+  {full_read, positive_slice, backfill_slice}; native columns over any shipped row.
+  scope carries native_min_day / labels_sound_from / live_path_from so the tab can
+  compute "N of M days" coverage per range.
+
+  NEW row key: meetings = v_meeting_truth email-ours bookings by MEETING day x workspace,
+  with the campaign-dim workspace backstop applied INLINE (DDL 1135's fix; inline so the
+  feed is correct regardless of promote timing). Additive key — existing consumers safe.
+  Canonical warehouse home of these semantics = DDL 1136 core.v_kpi_daily (promote
+  cadence); the feed stays escrow-direct for label freshness.
+
 v3 (Sam KPI-merge + cohort ruling, 2026-07-17): DAY x WORKSPACE grain, COHORT semantics.
-This feed now powers the merged KPIs tab on renaissance-booking.com (the separate
+This feed powers the merged KPIs tab on renaissance-booking.com (the separate
 Conversion tab UI is retired; the feed lives on for the KPI columns + any consumer).
 
 METRIC CONTRACT (Sam cohort ruling 2026-07-17 — the 19-vs-20 problem):
@@ -15,34 +48,20 @@ METRIC CONTRACT (Sam cohort ruling 2026-07-17 — the 19-vs-20 problem):
   - Current-state fields (opp/eng/conf/ni/labeled) remain for lineage/consumers.
   - Denominators stay native Instantly daily facts (sent / unique_replies / auto).
 
-DAY MODES (day_meta.mode):
-  - 'full_read' (<= 2026-07-14) / 'positive_slice': labels COMPLETE for the day —
-    completeness = >=90% of the day's LABELABLE ledger positive-mark cohort
-    (raw_comms_instantly_lead_state_event, observed_status>=1, never decrements) carries
-    a same-day label event, AND the daily-labeler watermark is past the day.
-    LABELABLE denominator (definition fix 2026-07-17, Jul-16 decomposition): the day's
-    positive marks MINUS same-day auto/bot-gated leads MINUS mark-lag leads whose labeled
-    reply belongs to an EARLIER day. Autos are structurally unlabelable by design (gate
-    classes are excluded from every label stat); mark-lag leads ARE labeled — in their
-    correct reply-day cohorts (Instantly's positive mark just landed later than the
-    reply). Counting either against the day compares mismatched denominators and made
-    fully-labeled days (Jul-16: 663 marks = 575 same-day-labeled + 13 auto + 75 mark-lag
-    + 0 unlabeled) sit at 87% forever. The 90% threshold itself is unchanged.
-  - 'ledger_provisional': completed sending day whose labels are still landing — the row
-    carries the LEDGER cohort instead (opp_cohort/opp_leads = ever-marked-positive that
-    day; opp_met = post-reply meetings of that cohort). Replaced in place by the labeled
-    row once the sweep completes. The KPIs tab renders these days as '—' in the three
-    labeled columns (Sam labeled-only ruling 2026-07-17 — no provisional display).
+DAY MODES (day_meta.mode): full_read | positive_slice | ledger_provisional (v3, live path)
+  + backfill_slice | pre_boundary | backfill_assert_failed (v4, history). Live-path mode
+  semantics are unchanged from v3 (see git history for the full v3 docstring);
+  'ledger_provisional' days render '—' in the labeled columns (Sam labeled-only ruling
+  2026-07-17 — no provisional display).
 
-DAY-READINESS GATE [Sam-caught 2026-07-17 incident]: a day ships ONLY with complete native
-facts (sent>0, human>0; replies<=5% of sent when sent>=100k — low-send weekend days are
-exempt from the ratio check). Labeled-mode days additionally assert per-ws positives<=human
-and opp_met<=opp_leads; any violation drops the day loudly. Days that pass native checks
-but are label-incomplete ship as ledger_provisional; days failing native checks are omitted
-entirely and self-heal on a later run.
+DAY-READINESS GATE [Sam-caught 2026-07-17 incident]: live-path days ship ONLY with
+complete native facts (sent>0, human>0; replies<=5% of sent when sent>=100k). History
+days are settled — they keep the ratio sanity check but NOT the sent>0/human>0 checks
+(89 real zero-send weekend days exist in the 2024 era with genuine replies).
 
 SCOPE: COMPLETED SENDING DAYS ONLY — cap = yesterday-ET, always. Override down with
-BOOKING_CONV_MAX_DAY=YYYY-MM-DD; the cap can never exceed yesterday-ET.
+BOOKING_CONV_MAX_DAY=YYYY-MM-DD; the cap can never exceed yesterday-ET. History floor
+BOOKING_CONV_MIN_DAY (default 2024-01-15 = the 1105 restatement floor).
 Workspaces: 5 funding slugs + warm-leads + renaissance-1 + the-gatekeepers (Max's —
 added 2026-07-17 for the KPI merge).
 
@@ -79,7 +98,9 @@ ESCROW_DAILY = os.environ.get("REPLY_LABEL_ESCROW_PARQUET",
 ESCROW_ALLTIME = os.environ.get("REPLY_LABEL_ESCROW_ALLTIME_PARQUET",
                                 "/root/mof/labeling/backfill_alltime/escrow/events.parquet")
 FULL_READ_THROUGH = "2026-07-14"   # R18 boundary: <= this day = full-read; after = positive-slice
-MIN_DAY = "2026-07-14"             # R11 floor: first fully-covered presentable day
+LIVE_PATH_FROM = "2026-07-14"      # >= this day: the v3 live pipeline verbatim (regression-frozen)
+LABEL_SOUND_FROM = "2026-05-15"    # R36 measured boundary: labels sound from here (see docstring)
+NATIVE_MIN_DAY_DEFAULT = "2024-01-15"  # 1105 API-restatement floor (earliest stitched day)
 SLICE_COMPLETE = 0.90              # labeled share of the day's ledger positive cohort => labels complete
 
 # 8 workspaces (Sam 2026-07-17: +the-gatekeepers for the KPI merge)
@@ -121,6 +142,7 @@ def ledger_ws_key(name: str) -> str:
 
 def main() -> None:
     cap = effective_max_day()
+    min_day = min(os.environ.get("BOOKING_CONV_MIN_DAY") or NATIVE_MIN_DAY_DEFAULT, cap)
     conn = duckdb.connect(DB, read_only=True)
 
     def exists(schema: str, name: str) -> bool:
@@ -173,7 +195,10 @@ def main() -> None:
         "cohort_basis": "label_events",          # v3: append-only event cohorts (Sam ruling 07-17)
         "label_source": label_source,            # escrow_parquet | warehouse_snapshot_fallback
         "labeler_version": None,
-        "scope": {"mode": "completed_days_only", "max_day": cap, "days": []},
+        "scope": {"mode": "completed_days_only", "max_day": cap, "days": [],
+                  "native_min_day": min_day,               # v4: earliest sound native day
+                  "labels_sound_from": LABEL_SOUND_FROM,   # v4: R36 measured label boundary
+                  "live_path_from": LIVE_PATH_FROM},
         "day_meta": [], "rows": [],
     }
 
@@ -186,8 +211,11 @@ def main() -> None:
     days_out: list[str] = []
 
     if have_events:
-        rng = f"BETWEEN DATE '{MIN_DAY}' AND DATE '{cap}'"
+        rng = f"BETWEEN DATE '{LIVE_PATH_FROM}' AND DATE '{cap}'"        # live path (v3, frozen)
+        rng_lab = f"BETWEEN DATE '{LABEL_SOUND_FROM}' AND DATE '{cap}'"  # label-sound span (v4)
         # ── native Instantly daily facts (denominators) ─────────────────────────────
+        # live path (>= LIVE_PATH_FROM): raw_pipeline verbatim (v3 regression-frozen);
+        # history (< LIVE_PATH_FROM): core.v_sends_truth_daily MAX-stitch restatement.
         nat = {(r["day"], r["ws"]): r for r in q(f"""
             SELECT CAST(date AS VARCHAR) AS day, workspace_id AS ws,
                    SUM(sent)::BIGINT AS sent, SUM(unique_replies)::BIGINT AS h,
@@ -196,12 +224,37 @@ def main() -> None:
             FROM raw_pipeline_campaign_daily_metrics
             WHERE workspace_id IN {WS_IN} AND CAST(date AS DATE) {rng}
             GROUP BY 1, 2""")}
+        nat_hist = {(r["day"], r["ws"]): r for r in q(f"""
+            SELECT CAST(date AS VARCHAR) AS day, workspace_slug AS ws,
+                   SUM(sent_stitched)::BIGINT AS sent, SUM(replies_human_stitched)::BIGINT AS h,
+                   SUM(replies_auto_stitched)::BIGINT AS a, SUM(opps_stitched)::BIGINT AS native_opps
+            FROM core.v_sends_truth_daily
+            WHERE workspace_slug IN {WS_IN}
+              AND date >= DATE '{min_day}' AND date < DATE '{LIVE_PATH_FROM}' AND date <= DATE '{cap}'
+            GROUP BY 1, 2""")}
+        # ── meetings by MEETING day x workspace (email, ours) — campaign-dim workspace
+        # backstop INLINE (= DDL 1135's fix; inline so correctness never waits on a promote)
+        mtg = {(r["day"], r["ws"]): int(r["meetings"] or 0) for r in q(f"""
+            WITH campdim AS (
+              SELECT campaign_id, MAX(workspace_slug) AS ws_slug
+              FROM core.v_campaign_dim_unified
+              WHERE campaign_id IS NOT NULL AND workspace_slug IS NOT NULL AND workspace_slug <> ''
+              GROUP BY 1)
+            SELECT CAST(mt.meeting_date AS VARCHAR) AS day,
+                   COALESCE(NULLIF(mt.workspace_slug, ''), cd.ws_slug) AS ws,
+                   COUNT(*) AS meetings
+            FROM core.v_meeting_truth mt
+            LEFT JOIN campdim cd ON cd.campaign_id = mt.campaign_id
+            WHERE mt.channel_norm = 'Email' AND mt.is_ours AND mt.meeting_date IS NOT NULL
+              AND mt.meeting_date BETWEEN DATE '{min_day}' AND DATE '{cap}'
+              AND COALESCE(NULLIF(mt.workspace_slug, ''), cd.ws_slug) IN {WS_IN}
+            GROUP BY 1, 2""")} if exists("core", "v_meeting_truth") else {}
         # ── label events (escrow-fresh): append-only cohorts + current-state lineage ────
         ev_base = f"""
             SELECT DISTINCT workspace_slug AS ws, lower(lead_email) AS le,
                    CAST(message_ts AS DATE) AS d, lower(CAST(label AS VARCHAR)) AS label
             FROM {ev_table} ev
-            WHERE workspace_slug IN {WS_IN} AND CAST(message_ts AS DATE) {rng}
+            WHERE workspace_slug IN {WS_IN} AND CAST(message_ts AS DATE) {rng_lab}
               AND lower(CAST(label AS VARCHAR)) IN {LABELS_IN}
         """
         cur_state = f"""
@@ -209,11 +262,16 @@ def main() -> None:
                    CAST(message_ts AS DATE) AS d,
                    lower(CAST(label AS VARCHAR)) AS label, labeler_version
             FROM {ev_table} ev
-            WHERE workspace_slug IN {WS_IN} AND CAST(message_ts AS DATE) {rng}
+            WHERE workspace_slug IN {WS_IN} AND CAST(message_ts AS DATE) {rng_lab}
               AND lower(CAST(label AS VARCHAR)) IN {LABELS_IN}
             QUALIFY row_number() OVER (PARTITION BY workspace_slug, lower(lead_email),
-                                       CAST(message_ts AS DATE) ORDER BY labeled_at DESC) = 1
+                                       CAST(message_ts AS DATE)
+                                       ORDER BY labeled_at DESC, message_ts DESC, message_ref_id DESC) = 1
         """
+        # ^ tie-break made fully deterministic 2026-07-17 (v4): equal labeled_at ties
+        #   (same-batch labels on multi-message lead-days) previously resolved by scan
+        #   order — current-state opp/eng/conf/ni flapped ±handfuls run-to-run. Cohort
+        #   fields (the tab's display) were always tie-free. Latest MESSAGE now wins ties.
         labc = {(r["day"], r["ws"]): r for r in q(f"""
             SELECT CAST(d AS VARCHAR) AS day, ws, COUNT(*) AS labeled,
                    SUM(CASE WHEN label = 'opportunity' THEN 1 ELSE 0 END) AS opp,
@@ -260,7 +318,7 @@ def main() -> None:
             # Counting either against the day compares mismatched denominators (Jul-16 sat
             # at 87% forever while 0 leads were actually unlabeled). Threshold unchanged.
             # gate_day/first_real read {ev_table} unfiltered: gates aren't in LABELS_IN and
-            # mark-lag labels can predate MIN_DAY / sit in another workspace.
+            # mark-lag labels can predate the sound floor / sit in another workspace.
             led_rows = q(f"""
                 WITH lp AS (
                   SELECT DISTINCT CAST(status_changed_at AS DATE) AS d, workspace AS lw,
@@ -303,91 +361,145 @@ def main() -> None:
             log("ledger table missing — label-incomplete days will be omitted, not provisional")
 
         # ── per-day gate + mode + row assembly ──────────────────────────────────────
-        all_days = sorted({d for d, _ in nat} | {d for d, _ in coh} | {d for d, _ in led})
+        all_days = sorted({d for d, _ in nat} | {d for d, _ in nat_hist} | {d for d, _ in coh}
+                          | {d for d, _ in led} | {d for d, _ in mtg if d < LIVE_PATH_FROM})
         for dday in all_days:
-            tot_sent = sum(int(r["sent"] or 0) for (d, _), r in nat.items() if d == dday)
-            tot_h    = sum(int(r["h"] or 0)    for (d, _), r in nat.items() if d == dday)
-            tot_a    = sum(int(r["a"] or 0)    for (d, _), r in nat.items() if d == dday)
-            tot_lab  = sum(int(r["labeled"] or 0) for (d, _), r in labc.items() if d == dday)
-            reasons = []
-            if tot_sent <= 0: reasons.append("native sent=0 — nightly facts not loaded yet")
-            if tot_h <= 0: reasons.append("native human replies=0 — nightly facts not loaded yet")
-            if tot_sent >= 100_000 and (tot_h + tot_a) > 0.05 * tot_sent:
-                reasons.append(f"replies {tot_h+tot_a} > 5% of sent {tot_sent} — implausible")
-            if reasons:
-                log(f"DAY GATE: DROPPING {dday}: " + " | ".join(reasons))
-                continue
-            w = wm.get(dday)
-            wm_ok = bool(w) and w[:10] > dday
-            cov = led_cov.get(dday)
-            # denominator = labelable marks only; all-excluded (labelable=0) with marks
-            # present = vacuously complete (nothing left that could carry a same-day label)
-            labelable = (cov["cohort"] - cov.get("unlabelable", 0)) if cov else None
-            slice_cov = ((cov["labeled"] / labelable) if labelable > 0 else
-                         (1.0 if cov["cohort"] > 0 else None)) if cov else None
-            labels_complete = tot_lab > 0 and wm_ok and (
-                dday <= FULL_READ_THROUGH or (slice_cov is not None and slice_cov >= SLICE_COMPLETE))
-
-            if labels_complete:
-                a_reasons = []
-                for slug in FUNDING_WS:
-                    lc, om_, nr = labc.get((dday, slug)), omv.get((dday, slug)), nat.get((dday, slug))
-                    pos = int((lc or {}).get("opp") or 0) + int((lc or {}).get("eng") or 0)
-                    if pos > int((nr or {}).get("h") or 0):
-                        a_reasons.append(f"{slug}: positives {pos} > human {(nr or {}).get('h')}")
-                    if int((om_ or {}).get("opp_met") or 0) > int((om_ or {}).get("opp_leads") or 0):
-                        a_reasons.append(f"{slug}: opp_met > opp_leads")
-                if a_reasons:
-                    log(f"DAY GATE: DROPPING {dday} (labeled-mode assertion): " + " | ".join(a_reasons))
+            if dday >= LIVE_PATH_FROM:
+                # ═══ LIVE PATH — v3 verbatim (regression-frozen) ═══
+                tot_sent = sum(int(r["sent"] or 0) for (d, _), r in nat.items() if d == dday)
+                tot_h    = sum(int(r["h"] or 0)    for (d, _), r in nat.items() if d == dday)
+                tot_a    = sum(int(r["a"] or 0)    for (d, _), r in nat.items() if d == dday)
+                tot_lab  = sum(int(r["labeled"] or 0) for (d, _), r in labc.items() if d == dday)
+                reasons = []
+                if tot_sent <= 0: reasons.append("native sent=0 — nightly facts not loaded yet")
+                if tot_h <= 0: reasons.append("native human replies=0 — nightly facts not loaded yet")
+                if tot_sent >= 100_000 and (tot_h + tot_a) > 0.05 * tot_sent:
+                    reasons.append(f"replies {tot_h+tot_a} > 5% of sent {tot_sent} — implausible")
+                if reasons:
+                    log(f"DAY GATE: DROPPING {dday}: " + " | ".join(reasons))
                     continue
-                mode = "full_read" if dday <= FULL_READ_THROUGH else "positive_slice"
-                for slug in FUNDING_WS:
-                    lc = labc.get((dday, slug)); cc = coh.get((dday, slug))
-                    om_ = omv.get((dday, slug)); nr = nat.get((dday, slug))
-                    if not (lc or cc or nr):
+                w = wm.get(dday)
+                wm_ok = bool(w) and w[:10] > dday
+                cov = led_cov.get(dday)
+                # denominator = labelable marks only; all-excluded (labelable=0) with marks
+                # present = vacuously complete (nothing left that could carry a same-day label)
+                labelable = (cov["cohort"] - cov.get("unlabelable", 0)) if cov else None
+                slice_cov = ((cov["labeled"] / labelable) if labelable > 0 else
+                             (1.0 if cov["cohort"] > 0 else None)) if cov else None
+                labels_complete = tot_lab > 0 and wm_ok and (
+                    dday <= FULL_READ_THROUGH or (slice_cov is not None and slice_cov >= SLICE_COMPLETE))
+
+                if labels_complete:
+                    a_reasons = []
+                    for slug in FUNDING_WS:
+                        lc, om_, nr = labc.get((dday, slug)), omv.get((dday, slug)), nat.get((dday, slug))
+                        pos = int((lc or {}).get("opp") or 0) + int((lc or {}).get("eng") or 0)
+                        if pos > int((nr or {}).get("h") or 0):
+                            a_reasons.append(f"{slug}: positives {pos} > human {(nr or {}).get('h')}")
+                        if int((om_ or {}).get("opp_met") or 0) > int((om_ or {}).get("opp_leads") or 0):
+                            a_reasons.append(f"{slug}: opp_met > opp_leads")
+                    if a_reasons:
+                        log(f"DAY GATE: DROPPING {dday} (labeled-mode assertion): " + " | ".join(a_reasons))
                         continue
-                    rows.append({
-                        "day": dday, "ws": slug, "name": ws_names.get(slug, slug),
-                        "sent": int((nr or {}).get("sent") or 0),
-                        "replies_human": int((nr or {}).get("h") or 0),
-                        "replies_auto": int((nr or {}).get("a") or 0),
-                        "native_opps": int((nr or {}).get("native_opps") or 0),
-                        "labeled": int((lc or {}).get("labeled") or 0),
-                        "opp": int((lc or {}).get("opp") or 0),
-                        "eng": int((lc or {}).get("eng") or 0),
-                        "conf": int((lc or {}).get("conf") or 0),
-                        "ni": int((lc or {}).get("ni") or 0),
-                        "opp_cohort": int((cc or {}).get("opp_cohort") or 0),
-                        "pos_cohort": int((cc or {}).get("pos_cohort") or 0),
-                        "opp_leads": int((om_ or {}).get("opp_leads") or 0),
-                        "opp_met": int((om_ or {}).get("opp_met") or 0),
-                    })
-            elif any((dday, slug) in led for slug in FUNDING_WS):
-                mode = "ledger_provisional"
-                log(f"DAY {dday}: labels incomplete (slice_cov="
-                    f"{round(slice_cov, 3) if slice_cov is not None else None} = "
-                    f"{(cov or {}).get('labeled')}/{labelable} labelable "
-                    f"[marks={(cov or {}).get('cohort')}, unlabelable={(cov or {}).get('unlabelable')}], "
-                    f"wm_ok={wm_ok}) — shipping LEDGER-provisional cohorts")
-                for slug in FUNDING_WS:
-                    lr = led.get((dday, slug)); nr = nat.get((dday, slug))
-                    if not (lr or nr):
-                        continue
-                    lcoh = int((lr or {}).get("led_cohort") or 0)
-                    rows.append({
-                        "day": dday, "ws": slug, "name": ws_names.get(slug, slug),
-                        "sent": int((nr or {}).get("sent") or 0),
-                        "replies_human": int((nr or {}).get("h") or 0),
-                        "replies_auto": int((nr or {}).get("a") or 0),
-                        "native_opps": int((nr or {}).get("native_opps") or 0),
-                        "labeled": None, "opp": None, "eng": None, "conf": None, "ni": None,
-                        "opp_cohort": lcoh, "pos_cohort": None,
-                        "opp_leads": lcoh,
-                        "opp_met": min(int((lr or {}).get("led_met") or 0), lcoh),
-                    })
+                    mode = "full_read" if dday <= FULL_READ_THROUGH else "positive_slice"
+                    for slug in FUNDING_WS:
+                        lc = labc.get((dday, slug)); cc = coh.get((dday, slug))
+                        om_ = omv.get((dday, slug)); nr = nat.get((dday, slug))
+                        if not (lc or cc or nr):
+                            continue
+                        rows.append({
+                            "day": dday, "ws": slug, "name": ws_names.get(slug, slug),
+                            "sent": int((nr or {}).get("sent") or 0),
+                            "replies_human": int((nr or {}).get("h") or 0),
+                            "replies_auto": int((nr or {}).get("a") or 0),
+                            "native_opps": int((nr or {}).get("native_opps") or 0),
+                            "labeled": int((lc or {}).get("labeled") or 0),
+                            "opp": int((lc or {}).get("opp") or 0),
+                            "eng": int((lc or {}).get("eng") or 0),
+                            "conf": int((lc or {}).get("conf") or 0),
+                            "ni": int((lc or {}).get("ni") or 0),
+                            "opp_cohort": int((cc or {}).get("opp_cohort") or 0),
+                            "pos_cohort": int((cc or {}).get("pos_cohort") or 0),
+                            "opp_leads": int((om_ or {}).get("opp_leads") or 0),
+                            "opp_met": int((om_ or {}).get("opp_met") or 0),
+                            "meetings": mtg.get((dday, slug), 0),
+                        })
+                elif any((dday, slug) in led for slug in FUNDING_WS):
+                    mode = "ledger_provisional"
+                    log(f"DAY {dday}: labels incomplete (slice_cov="
+                        f"{round(slice_cov, 3) if slice_cov is not None else None} = "
+                        f"{(cov or {}).get('labeled')}/{labelable} labelable "
+                        f"[marks={(cov or {}).get('cohort')}, unlabelable={(cov or {}).get('unlabelable')}], "
+                        f"wm_ok={wm_ok}) — shipping LEDGER-provisional cohorts")
+                    for slug in FUNDING_WS:
+                        lr = led.get((dday, slug)); nr = nat.get((dday, slug))
+                        if not (lr or nr):
+                            continue
+                        lcoh = int((lr or {}).get("led_cohort") or 0)
+                        rows.append({
+                            "day": dday, "ws": slug, "name": ws_names.get(slug, slug),
+                            "sent": int((nr or {}).get("sent") or 0),
+                            "replies_human": int((nr or {}).get("h") or 0),
+                            "replies_auto": int((nr or {}).get("a") or 0),
+                            "native_opps": int((nr or {}).get("native_opps") or 0),
+                            "labeled": None, "opp": None, "eng": None, "conf": None, "ni": None,
+                            "opp_cohort": lcoh, "pos_cohort": None,
+                            "opp_leads": lcoh,
+                            "opp_met": min(int((lr or {}).get("led_met") or 0), lcoh),
+                            "meetings": mtg.get((dday, slug), 0),
+                        })
+                else:
+                    log(f"DAY GATE: DROPPING {dday}: labels incomplete and no ledger rows")
+                    continue
             else:
-                log(f"DAY GATE: DROPPING {dday}: labels incomplete and no ledger rows")
-                continue
+                # ═══ HISTORY PATH (v4): settled days — stitched natives, escrow labels ═══
+                tot_sent = sum(int(r["sent"] or 0) for (d, _), r in nat_hist.items() if d == dday)
+                tot_h    = sum(int(r["h"] or 0)    for (d, _), r in nat_hist.items() if d == dday)
+                tot_a    = sum(int(r["a"] or 0)    for (d, _), r in nat_hist.items() if d == dday)
+                if tot_sent >= 100_000 and (tot_h + tot_a) > 0.05 * tot_sent:
+                    log(f"DAY GATE: DROPPING {dday}: replies {tot_h+tot_a} > 5% of sent {tot_sent} — implausible")
+                    continue
+                slice_cov = None
+                if dday < LABEL_SOUND_FROM:
+                    mode = "pre_boundary"        # labels 100%-or-wipe: pre-boundary => None
+                else:
+                    mode = "backfill_slice"      # all-time backfill => labels complete
+                    a_reasons = []
+                    for slug in FUNDING_WS:
+                        lc, nr = labc.get((dday, slug)), nat_hist.get((dday, slug))
+                        pos = int((lc or {}).get("opp") or 0) + int((lc or {}).get("eng") or 0)
+                        if pos > int((nr or {}).get("h") or 0):
+                            a_reasons.append(f"{slug}: positives {pos} > human {(nr or {}).get('h')}")
+                    if a_reasons:
+                        mode = "backfill_assert_failed"   # labels wiped for the day, natives kept
+                        log(f"HISTORY ASSERT: {dday} labels WIPED (native-only row ships): "
+                            + " | ".join(a_reasons))
+                labeled_mode = (mode == "backfill_slice")
+                for slug in FUNDING_WS:
+                    nr = nat_hist.get((dday, slug))
+                    lc = labc.get((dday, slug)) if labeled_mode else None
+                    cc = coh.get((dday, slug)) if labeled_mode else None
+                    om_ = omv.get((dday, slug)) if labeled_mode else None
+                    mg = mtg.get((dday, slug), 0)
+                    if not (nr or lc or cc or mg):
+                        continue
+                    rows.append({
+                        "day": dday, "ws": slug, "name": ws_names.get(slug, slug),
+                        "sent": int((nr or {}).get("sent") or 0),
+                        "replies_human": int((nr or {}).get("h") or 0),
+                        "replies_auto": int((nr or {}).get("a") or 0),
+                        "native_opps": int((nr or {}).get("native_opps") or 0),
+                        "labeled": int((lc or {}).get("labeled") or 0) if labeled_mode else None,
+                        "opp": int((lc or {}).get("opp") or 0) if labeled_mode else None,
+                        "eng": int((lc or {}).get("eng") or 0) if labeled_mode else None,
+                        "conf": int((lc or {}).get("conf") or 0) if labeled_mode else None,
+                        "ni": int((lc or {}).get("ni") or 0) if labeled_mode else None,
+                        "opp_cohort": int((cc or {}).get("opp_cohort") or 0) if labeled_mode else None,
+                        "pos_cohort": int((cc or {}).get("pos_cohort") or 0) if labeled_mode else None,
+                        "opp_leads": int((om_ or {}).get("opp_leads") or 0) if labeled_mode else None,
+                        "opp_met": int((om_ or {}).get("opp_met") or 0) if labeled_mode else None,
+                        "meetings": mg,
+                    })
             days_out.append(dday)
             day_meta_out.append({"day": dday, "mode": mode,
                                  "slice_cov": round(slice_cov, 3) if slice_cov is not None else None})
@@ -400,7 +512,7 @@ def main() -> None:
             payload.update({
                 "status": "ok",
                 "labeler_version": ver,
-                "scope": {"mode": "completed_days_only", "max_day": cap, "days": days_out},
+                "scope": {**payload["scope"], "max_day": cap, "days": days_out},
                 "day_meta": day_meta_out,
                 "rows": rows,
             })
@@ -419,15 +531,19 @@ def main() -> None:
     body = json.dumps([{"key": "conversion", "data": payload,
                         "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}],
                       default=str).encode()
+    log(f"payload {len(body)/1048576:.2f} MiB · {len(rows)} rows · {len(days_out)} days "
+        f"({days_out[0] if days_out else '-'} .. {days_out[-1] if days_out else '-'})")
     req = urllib.request.Request(
         purl.rstrip("/") + "/rest/v1/dashboard_feeds", data=body, method="POST",
         headers={"apikey": pkey, "Authorization": "Bearer " + pkey,
                  "Content-Type": "application/json",
                  "Prefer": "resolution=merge-duplicates,return=minimal"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
+    with urllib.request.urlopen(req, timeout=120) as resp:
+        modes: dict = {}
+        for m in day_meta_out:
+            modes[m["mode"]] = modes.get(m["mode"], 0) + 1
         print(f"  ok conversion-booking-feed upserted (status={payload['status']}, "
-              f"days={payload['scope']['days']}, modes={[m['mode'] for m in payload['day_meta']]}, "
-              f"HTTP {resp.status})")
+              f"days={len(days_out)}, mode_counts={modes}, HTTP {resp.status})")
 
 
 if __name__ == "__main__":
