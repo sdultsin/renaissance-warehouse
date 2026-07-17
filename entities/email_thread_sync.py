@@ -523,6 +523,15 @@ def discover_replied_leads(
     # per-lead history); a NEW reply moves the lead's key past its committed max -> re-pulled.
     # A late-arriving OLD inbound row (discovery-source lag) has no committed row at/after its
     # ts -> still pulled: the 2d overlap's guard is preserved, minus the redundant re-pulls.
+    # OUTBOUND GUARD [2026-07-17]: the 'committed proves a full-thread pull' premise was VIOLATED
+    # once email_thread_bulk's received-only lane (2026-07-14) began committing ue2-ONLY rows
+    # WITHOUT a per-lead full-thread pull: max(message_at) then equals the lead's last reply, so
+    # EVERY replied lead looked 'already committed' and got skipped -> its ue1 cold-send + ue3
+    # our-reply were NEVER pulled (measured 2026-07-17: 7698/7698 prospects-power repliers skipped,
+    # 92% with zero committed outbound; warehouse ue1/ue3 -> 0 from 07-15). FIX: only treat a lead
+    # as fully captured if it also has >=1 committed OUTBOUND row (outbound_committed>0) — a
+    # received-only lane NEVER produces one, so ue2-only leads are (re)pulled and their outbound
+    # lands; genuinely full-pulled leads (which always have the ue1 cold send) still skip.
     # Kill-switch: WAREHOUSE_THREADS_NO_SKIP_COMMITTED=1 restores the historic full re-pull.
     skip_committed = ws_slug is not None and os.environ.get(
         "WAREHOUSE_THREADS_NO_SKIP_COMMITTED") != "1"
@@ -542,10 +551,12 @@ def discover_replied_leads(
             rows = read_conn.execute(
                 f"WITH cand AS ({base_sql}), "
                 f"comm AS (SELECT lower(trim(lead_email)) AS lead, "
-                f"         max(message_at) AS committed_through "
+                f"         max(message_at) AS committed_through, "
+                f"         count(*) FILTER (WHERE direction = 'outbound') AS outbound_committed "
                 f"         FROM raw_instantly_email_message WHERE workspace_id = ? GROUP BY 1) "
                 f"SELECT c.lead, c.last_reply, "
                 f"       (m.committed_through IS NOT NULL "
+                f"        AND m.outbound_committed > 0 "
                 f"        AND c.last_reply IS NOT NULL "
                 f"        AND c.last_reply <= m.committed_through) AS already_committed "
                 f"FROM cand c LEFT JOIN comm m USING (lead)",
