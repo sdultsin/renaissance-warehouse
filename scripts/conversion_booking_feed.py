@@ -17,9 +17,17 @@ METRIC CONTRACT (Sam cohort ruling 2026-07-17 — the 19-vs-20 problem):
 
 DAY MODES (day_meta.mode):
   - 'full_read' (<= 2026-07-14) / 'positive_slice': labels COMPLETE for the day —
-    completeness = >=90% of the day's ledger positive-mark cohort
+    completeness = >=90% of the day's LABELABLE ledger positive-mark cohort
     (raw_comms_instantly_lead_state_event, observed_status>=1, never decrements) carries
     a same-day label event, AND the daily-labeler watermark is past the day.
+    LABELABLE denominator (definition fix 2026-07-17, Jul-16 decomposition): the day's
+    positive marks MINUS same-day auto/bot-gated leads MINUS mark-lag leads whose labeled
+    reply belongs to an EARLIER day. Autos are structurally unlabelable by design (gate
+    classes are excluded from every label stat); mark-lag leads ARE labeled — in their
+    correct reply-day cohorts (Instantly's positive mark just landed later than the
+    reply). Counting either against the day compares mismatched denominators and made
+    fully-labeled days (Jul-16: 663 marks = 575 same-day-labeled + 13 auto + 75 mark-lag
+    + 0 unlabeled) sit at 87% forever. The 90% threshold itself is unchanged.
   - 'ledger_provisional': completed sending day whose labels are still landing — the row
     carries the LEDGER cohort instead (opp_cohort/opp_leads = ever-marked-positive that
     day; opp_met = post-reply meetings of that cohort). Replaced in place by the labeled
@@ -244,6 +252,15 @@ def main() -> None:
         led: dict = {}
         led_cov: dict = {}
         if have_ledger:
+            # Coverage denominator = LABELABLE marks only (definition fix 2026-07-17):
+            # exclude same-day auto/bot-gated leads (structurally unlabelable by design —
+            # gate classes never enter label stats) and mark-lag leads whose labeled reply
+            # belongs to an EARLIER day (they ARE labeled, in their correct reply-day
+            # cohorts; Instantly's positive mark just landed later than the reply).
+            # Counting either against the day compares mismatched denominators (Jul-16 sat
+            # at 87% forever while 0 leads were actually unlabeled). Threshold unchanged.
+            # gate_day/first_real read {ev_table} unfiltered: gates aren't in LABELS_IN and
+            # mark-lag labels can predate MIN_DAY / sit in another workspace.
             led_rows = q(f"""
                 WITH lp AS (
                   SELECT DISTINCT CAST(status_changed_at AS DATE) AS d, workspace AS lw,
@@ -251,22 +268,37 @@ def main() -> None:
                   FROM raw_comms_instantly_lead_state_event
                   WHERE observed_status >= 1 AND CAST(status_changed_at AS DATE) {rng}),
                 ml AS ({meeting_leads}),
-                ev AS (SELECT DISTINCT le, d FROM ({ev_base}))
+                ev AS (SELECT DISTINCT le, d FROM ({ev_base})),
+                gate_day AS (
+                  SELECT DISTINCT lower(lead_email) AS le, CAST(message_ts AS DATE) AS d
+                  FROM {ev_table} g
+                  WHERE lower(CAST(label AS VARCHAR)) IN ('auto','bot','labeler_error')),
+                first_real AS (
+                  SELECT lower(lead_email) AS le, MIN(CAST(message_ts AS DATE)) AS first_d
+                  FROM {ev_table} fr
+                  WHERE lower(CAST(label AS VARCHAR)) IN {LABELS_IN}
+                  GROUP BY 1)
                 SELECT CAST(lp.d AS VARCHAR) AS day, lp.lw,
                        COUNT(DISTINCT lp.le) AS led_cohort,
                        COUNT(DISTINCT CASE WHEN ml.le IS NOT NULL THEN lp.le END) AS led_met,
-                       COUNT(DISTINCT CASE WHEN ev.le IS NOT NULL THEN lp.le END) AS led_labeled
+                       COUNT(DISTINCT CASE WHEN ev.le IS NOT NULL THEN lp.le END) AS led_labeled,
+                       COUNT(DISTINCT CASE WHEN ev.le IS NULL
+                                            AND (gd.le IS NOT NULL OR fr.first_d < lp.d)
+                                           THEN lp.le END) AS led_unlabelable
                 FROM lp
                 LEFT JOIN ml ON ml.le = lp.le AND ml.meeting_date >= lp.d
                 LEFT JOIN ev ON ev.le = lp.le AND ev.d = lp.d
+                LEFT JOIN gate_day gd ON gd.le = lp.le AND gd.d = lp.d
+                LEFT JOIN first_real fr ON fr.le = lp.le
                 GROUP BY 1, 2""")
             for r in led_rows:
                 slug = led_to_slug.get(r["lw"])
                 if slug:
                     led[(r["day"], slug)] = r
-                c = led_cov.setdefault(r["day"], {"cohort": 0, "labeled": 0})
+                c = led_cov.setdefault(r["day"], {"cohort": 0, "labeled": 0, "unlabelable": 0})
                 c["cohort"] += int(r["led_cohort"] or 0)
                 c["labeled"] += int(r["led_labeled"] or 0)
+                c["unlabelable"] += int(r["led_unlabelable"] or 0)
         else:
             log("ledger table missing — label-incomplete days will be omitted, not provisional")
 
@@ -288,7 +320,11 @@ def main() -> None:
             w = wm.get(dday)
             wm_ok = bool(w) and w[:10] > dday
             cov = led_cov.get(dday)
-            slice_cov = (cov["labeled"] / cov["cohort"]) if cov and cov["cohort"] else None
+            # denominator = labelable marks only; all-excluded (labelable=0) with marks
+            # present = vacuously complete (nothing left that could carry a same-day label)
+            labelable = (cov["cohort"] - cov.get("unlabelable", 0)) if cov else None
+            slice_cov = ((cov["labeled"] / labelable) if labelable > 0 else
+                         (1.0 if cov["cohort"] > 0 else None)) if cov else None
             labels_complete = tot_lab > 0 and wm_ok and (
                 dday <= FULL_READ_THROUGH or (slice_cov is not None and slice_cov >= SLICE_COMPLETE))
 
@@ -329,8 +365,10 @@ def main() -> None:
             elif any((dday, slug) in led for slug in FUNDING_WS):
                 mode = "ledger_provisional"
                 log(f"DAY {dday}: labels incomplete (slice_cov="
-                    f"{round(slice_cov, 3) if slice_cov is not None else None}, wm_ok={wm_ok}) — "
-                    f"shipping LEDGER-provisional cohorts")
+                    f"{round(slice_cov, 3) if slice_cov is not None else None} = "
+                    f"{(cov or {}).get('labeled')}/{labelable} labelable "
+                    f"[marks={(cov or {}).get('cohort')}, unlabelable={(cov or {}).get('unlabelable')}], "
+                    f"wm_ok={wm_ok}) — shipping LEDGER-provisional cohorts")
                 for slug in FUNDING_WS:
                     lr = led.get((dday, slug)); nr = nat.get((dday, slug))
                     if not (lr or nr):
