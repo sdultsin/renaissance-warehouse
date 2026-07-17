@@ -22,7 +22,19 @@ from core.sync_run import PhaseResult
 
 logger = logging.getLogger("entities.batch_registry")
 
-_HUB_URL = os.environ.get("HUB_BATCH_EXPORT_URL", "")   # full token-gated export URL, incl. ?token=
+def _hub_url() -> str:
+    """The token-gated Hub export URL. Read from os.environ first, then fall back to the repo .env via
+    dotenv_values — because nightly.sh does NOT shell-source .env (a ')' in a comment breaks `source`),
+    so a plain os.environ lookup would miss it and the mirror would silently no-op. [2026-07-17]"""
+    u = os.environ.get("HUB_BATCH_EXPORT_URL", "")
+    if u:
+        return u
+    try:
+        from dotenv import dotenv_values
+        from core.config import REPO_ROOT
+        return (dotenv_values(str(REPO_ROOT / ".env")) or {}).get("HUB_BATCH_EXPORT_URL", "") or ""
+    except Exception:
+        return ""
 _COLS = ["batch_key", "provider", "workspace", "n_domains", "n_inboxes", "sip_date",
          "warmup_start", "cold_start", "billing_date", "offer", "email_provider",
          "batch_url", "notes", "updated_at", "updated_by"]
@@ -39,11 +51,12 @@ def run_batch_registry(ctx: RunContext) -> PhaseResult:
     if not _table_exists(conn):
         logger.error("batch_registry SKIP: table missing (ddl 1123 not applied yet).")
         return PhaseResult(rows_in=0, rows_out=0, notes={"skipped": "no_table"})
-    if not _HUB_URL:
-        logger.error("batch_registry SKIP: HUB_BATCH_EXPORT_URL not set.")
+    hub_url = _hub_url()
+    if not hub_url:
+        logger.error("batch_registry SKIP: HUB_BATCH_EXPORT_URL not set (env or .env).")
         return PhaseResult(rows_in=0, rows_out=0, notes={"skipped": "no_url"})
     try:
-        with urllib.request.urlopen(_HUB_URL, timeout=60) as resp:
+        with urllib.request.urlopen(hub_url, timeout=60) as resp:
             rows = (json.loads(resp.read()) or {}).get("rows", [])
     except Exception as exc:  # one optional mirror must never break the nightly run
         logger.error("batch_registry SKIP: hub fetch failed: %s", str(exc)[:140])
