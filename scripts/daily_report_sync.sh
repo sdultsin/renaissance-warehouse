@@ -237,7 +237,7 @@ PUB_PID=$!
 # wait for it to finish, else it reads the OLD snapshot (§1 shows 0s). Poll up to ~40 min for the
 # snapshot_id to change; also break early if the publisher PID exits (failed/finished).
 NEW_SNAP="$PREV_SNAP"
-for _ in $(seq 1 240); do          # up to ~40 min (10s each)
+for _ in $(seq 1 450); do          # up to ~75 min (10s each) [2026-07-16: publisher lock-hold+wait]
     sleep 10
     CUR="$(snap_id)"
     if [[ -n "$CUR" && "$CUR" != "$PREV_SNAP" ]]; then NEW_SNAP="$CUR"; break; fi

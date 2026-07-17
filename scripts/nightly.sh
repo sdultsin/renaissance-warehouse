@@ -71,7 +71,10 @@ promote_serving() {
     "$PYTHON" -c "from pathlib import Path; from core import db; db._clear_stale_lock_marker(Path(db._WRITE_LOCK_PATH))" 2>&1 | tee -a "$LOG_FILE" || true
     local PUBLISHER_BIN="${PUBLISHER_BIN:-/opt/duckdb/bin/publisher.py}"
     local PUBLISHER_PY="${PUBLISHER_PY:-/opt/duckdb/venv/bin/python}"
-    local PROMOTE_TIMEOUT_S="${PROMOTE_TIMEOUT_S:-2400}"  # serving copy ~118GiB (~16min measured 2026-07-07);
+    local PROMOTE_TIMEOUT_S="${PROMOTE_TIMEOUT_S:-4500}"  # serving copy ~118GiB (~16min measured 2026-07-07);
+                                                          # [2026-07-16] 2400->4500: publisher now
+                                                          # waits (<=1800s) for + HOLDS the writer
+                                                          # flock across copy+validate+swap.
                                                           # 900s got the copy KILLED at 110/126GB -> serving
                                                           # stale ~17h. 40m = ~2.5x headroom, then bound.
     if [[ ! -x "$PUBLISHER_PY" || ! -f "$PUBLISHER_BIN" ]]; then

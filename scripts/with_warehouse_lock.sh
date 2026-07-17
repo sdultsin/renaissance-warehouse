@@ -20,14 +20,16 @@
 #
 # Env:
 #   WAREHOUSE_LOCK_FILE   (default /root/core/warehouse.write.lock)
-#   WAREHOUSE_LOCK_WAIT_S (default 1800 — seconds to wait for the lock; flock -w)
+#   WAREHOUSE_LOCK_WAIT_S (default 3600 [2026-07-16, was 1800] — seconds to wait for the lock;
+#                          flock -w. Raised because publisher.py now HOLDS this flock across its
+#                          entire ~25-30min copy+validate+swap — writers queue behind a promote.)
 #
 # Exit codes: the wrapped command's exit code; 75 (EX_TEMPFAIL) if the lock could not be
 # acquired within the wait window (so a cron can be retried without masking a real failure).
 set -uo pipefail
 
 LOCK_FILE="${WAREHOUSE_LOCK_FILE:-/root/core/warehouse.write.lock}"
-WAIT_S="${WAREHOUSE_LOCK_WAIT_S:-1800}"
+WAIT_S="${WAREHOUSE_LOCK_WAIT_S:-3600}"
 
 if [ "$#" -lt 1 ]; then
   echo "usage: with_warehouse_lock.sh <command> [args...]" >&2

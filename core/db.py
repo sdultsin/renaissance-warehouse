@@ -49,9 +49,10 @@ _MEMORY_LIMIT = os.environ.get("WAREHOUSE_DUCKDB_MEMORY_LIMIT", "16GB")
 # Reversible: deleting this block + the connect() call restores prior behaviour.
 # ---------------------------------------------------------------------------
 _WRITE_LOCK_PATH = os.environ.get("WAREHOUSE_WRITE_LOCK_PATH", "/root/core/warehouse.write.lock")
-# Max seconds to wait for the lock before giving up loudly (default 30 min — a full
-# nightly/heal can legitimately hold it that long). 0 = wait forever.
-_WRITE_LOCK_WAIT_S = int(os.environ.get("WAREHOUSE_WRITE_LOCK_WAIT_S", "1800"))
+# Max seconds to wait for the lock before giving up loudly (default 60 min [2026-07-16, was 30] —
+# a full nightly/heal can hold it long, AND the publisher now HOLDS this flock for its entire
+# ~25-30min copy+validate+swap (torn-snapshot fix), so writers must out-wait a promote). 0 = forever.
+_WRITE_LOCK_WAIT_S = int(os.environ.get("WAREHOUSE_WRITE_LOCK_WAIT_S", "3600"))
 _held_lock_fd: int | None = None  # module-level so the fd (and the lock) outlive connect()
 
 

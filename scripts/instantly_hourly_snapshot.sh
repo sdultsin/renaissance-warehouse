@@ -18,7 +18,8 @@ mkdir -p "$WH/logs"
 
 echo "==== instantly hourly snapshot $(date -u +%FT%TZ) ===="
 
-WAREHOUSE_LOCK_WAIT_S="${WAREHOUSE_LOCK_WAIT_S:-540}" \
+# [2026-07-16] 540->2700: queue behind a publisher promote lock-hold (~25-30 min) instead of skipping the tick
+WAREHOUSE_LOCK_WAIT_S="${WAREHOUSE_LOCK_WAIT_S:-2700}" \
   bash "$WH/scripts/with_warehouse_lock.sh" \
   "$WH/.venv/bin/python" "$WH/scripts/instantly_hourly_snapshot.py"
 rc=$?
