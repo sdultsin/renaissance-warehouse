@@ -11,12 +11,13 @@ Reuses the poller's WORKSPACES map + page_accounts (no parallel pull path). Read
 Run after the nightly census promote (cron), or ad-hoc: python scripts/reconcile_census_live.py [--alert]
 """
 from __future__ import annotations
-import argparse, os, sys, subprocess
+import argparse, glob, os, sys, subprocess
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor
 import duckdb
 
 POLLER_DIR = "/root/renaissance-worker/jobs/live-accounts-snapshot"
+CENSUS_DIR = "/root/core/live_accounts"   # the hourly poller's raw parquets = the ONLY backfill route
 
 
 def load_env(path="/root/Renaissance/.env.instantly") -> dict:
@@ -37,12 +38,42 @@ def live_count(slug: str, key: str) -> dict:
         return {"slug": slug, "ok": False, "err": str(e)[:80]}
 
 
+def census_gaps(con, lookback: int) -> tuple[list[str], int]:
+    """Days in the last `lookback` days with NO census row + how stale the newest day is.
+
+    WHY: the drift check below grades whatever max(census_date) happens to be, so a day that never
+    landed is INVISIBLE to it — it compares an OLDER day against live Instantly, finds them equal,
+    and prints "verified". That is exactly how 2026-06-30 was lost while this very check ran daily.
+    Silence is not proof the history advanced. Read-only.
+    """
+    missing = [r[0] for r in con.execute(f"""
+        SELECT CAST(day AS VARCHAR) FROM (
+            SELECT unnest(generate_series(CURRENT_DATE - INTERVAL {int(lookback)} DAY,
+                                          CURRENT_DATE - INTERVAL 1 DAY,
+                                          INTERVAL 1 DAY))::DATE AS day
+        ) s
+        WHERE day NOT IN (SELECT DISTINCT census_date FROM core.account_census)
+        ORDER BY 1
+    """).fetchall()]
+    stale = con.execute(
+        "SELECT date_diff('day', max(census_date), CURRENT_DATE) FROM core.account_census").fetchone()[0]
+    return missing, int(stale or 0)
+
+
+def raw_poll_exists(day: str) -> bool:
+    """True if the poller's raw parquet for `day` is still on disk — i.e. the gap is still
+    BACKFILLABLE. Lets the alert say "fix it today" vs "that history is gone"."""
+    return bool(glob.glob(f"{CENSUS_DIR}/accounts_live_{day.replace('-', '')}T*.parquet"))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default="/root/core/warehouse.duckdb")
     ap.add_argument("--threshold", type=float, default=0.08, help="fractional drift that triggers a flag")
     ap.add_argument("--alert", action="store_true", help="post a #cc-sam alert on any drift")
     ap.add_argument("--workers", type=int, default=4)
+    ap.add_argument("--lookback", type=int, default=14,
+                    help="days back to verify every census day is present")
     args = ap.parse_args()
 
     sys.path.insert(0, POLLER_DIR)   # box-only; imported at runtime so the module loads anywhere (CI)
@@ -54,6 +85,12 @@ def main() -> int:
                               WHERE census_date=(SELECT max(census_date) FROM core.account_census)
                               GROUP BY 1""").fetchall())
     cen_day = con.execute("SELECT CAST(max(census_date) AS VARCHAR) FROM core.account_census").fetchone()[0]
+    # Additive + fail-soft: a gap-check error must never take down the drift check that works.
+    try:
+        missing_days, stale_days = census_gaps(con, args.lookback)
+    except Exception as exc:  # noqa: BLE001
+        missing_days, stale_days = [], 0
+        print(f"WARN census gap-check unavailable ({exc}) — drift check continues")
     con.close()
 
     jobs = [(s, env.get(WORKSPACES_G[s][1])) for s in WORKSPACES_G if env.get(WORKSPACES_G[s][1])]
@@ -84,7 +121,47 @@ def main() -> int:
         if alert.exists():
             subprocess.run([sys.executable, str(alert), msg], check=False)
         print("ALERTED #cc-sam")
-    return 2 if drifts else 0
+
+    # Continuity check LAST + fail-soft: the drift check above is the pre-existing, working
+    # behaviour and must never be suppressed by anything new. See feedback_no_breaking_guards.
+    gap_problem = False
+    try:
+        gap_problem = bool(missing_days) or stale_days > 1
+        if gap_problem:
+            recoverable = [d for d in missing_days if raw_poll_exists(d)]
+            lost = [d for d in missing_days if d not in recoverable]
+            print(f"CENSUS CONTINUITY: newest={cen_day} ({stale_days}d old); "
+                  f"{len(missing_days)} missing day(s) in last {args.lookback}: {', '.join(missing_days) or '-'}")
+            if recoverable:
+                print(f"  backfillable (raw poll still on disk): {', '.join(recoverable)}")
+            if lost:
+                print(f"  NOT recoverable (no raw poll on disk): {', '.join(lost)}")
+        else:
+            print(f"census continuity: OK — no missing days in last {args.lookback}, newest={cen_day}")
+
+        if gap_problem and args.alert:
+            bits = []
+            if stale_days > 1:
+                bits.append(f"newest census day is {cen_day} ({stale_days} days old) — the daily history "
+                            f"has STOPPED ADVANCING")
+            if missing_days:
+                rec = [d for d in missing_days if raw_poll_exists(d)]
+                lst = [d for d in missing_days if d not in rec]
+                if rec:
+                    bits.append(f"missing day(s) {', '.join(rec)} — raw poll still on disk, BACKFILLABLE now")
+                if lst:
+                    bits.append(f"missing day(s) {', '.join(lst)} — no raw poll on disk, that history is GONE")
+            msg = (":rotating_light: *census history gap* — " + "; ".join(bits)
+                   + ". We cannot reconstruct what was live on a missing day. Backfill from the raw poll "
+                     "before it ages out.")
+            alert = Path(__file__).resolve().parents[1] / "scripts" / "alert_slack.py"
+            if alert.exists():
+                subprocess.run([sys.executable, str(alert), msg], check=False)
+            print("ALERTED #cc-sam (census gap)")
+
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARN census continuity report failed ({exc}) — drift result above stands")
+    return 2 if drifts else (3 if gap_problem else 0)
 
 
 if __name__ == "__main__":
