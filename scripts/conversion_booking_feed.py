@@ -20,6 +20,13 @@ Instantly's own opportunity auto-count carried only as a comparison field. opp->
 meetings booked ON/AFTER the labeled reply date (grows for days).
 
 Never hard-fails the conductor: any error prints WARN to stderr and exits 0.
+
+ALSO [2026-07-17, Sam KPI-merge]: pushes portal public.kpi_labels_daily — per (day x
+kpi_workspaces.name) labeled counts (sent/human_replies/positive/opps_labeled) that portal
+kpi_compute() reads to serve the merged KPIs tab (labeled opps for completed gate-passed
+days; Instantly auto-count only as the provisional fallback for not-yet-labeled days).
+Scope = FUNDING_WS + the-gatekeepers (Max's). Same day-readiness gate + assertions.
+Daily incremental (last 5 completed days); BOOKING_KPI_LABELS_SINCE=YYYY-MM-DD backfills.
 """
 from __future__ import annotations
 import json, os, sys, urllib.request
@@ -100,6 +107,8 @@ def main() -> None:
             rel = (f"{schema}.{name}", cols_of(schema, name))
             break
 
+    label_base = None    # set when the label relation's columns are recognized (KPI push uses it)
+
     payload: dict = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "snapshot_id": os.path.basename(os.path.realpath(DB)),
@@ -130,6 +139,7 @@ def main() -> None:
                        CAST({c_date} AS DATE) AS d
                 FROM {relname} {dedup}
             """
+            label_base = base
             scoped = f"""
                 WITH b AS ({base})
                 SELECT * FROM b
@@ -307,6 +317,103 @@ def main() -> None:
     with urllib.request.urlopen(req, timeout=60) as resp:
         print(f"  ok conversion-booking-feed upserted (status={payload['status']}, "
               f"days={payload['scope']['days']}, HTTP {resp.status})")
+
+    # ── KPI labeled-opps cache → portal kpi_labels_daily [2026-07-17 Sam KPI-merge] ────────
+    # Powers the merged KPIs tab: kpi_compute() uses these labeled counts for completed days
+    # and falls back to Instantly's auto-count (provisional, asterisked) where no row exists.
+    # Same data-honesty rules as the conversion feed: day-readiness gate + hard assertions;
+    # a not-ready day is simply not pushed (KPI shows provisional until it lands — self-heals).
+    try:
+        if label_base is None:
+            log("kpi-labels: label relation not usable — skipped")
+            return
+        kpi_ws = FUNDING_WS + ("the-gatekeepers",)          # + Max's; Tariffs/S125 have no labels
+        kws_in = "('" + "','".join(kpi_ws) + "')"
+        since = os.environ.get("BOOKING_KPI_LABELS_SINCE") or \
+            (datetime.strptime(cap, "%Y-%m-%d").date() - timedelta(days=4)).isoformat()
+        since = min(since, cap)
+        # portal workspace names (kpi_workspaces.name) — only push rows the KPI table knows
+        preq = urllib.request.Request(
+            purl.rstrip("/") + "/rest/v1/kpi_workspaces?select=name",
+            headers={"apikey": pkey, "Authorization": "Bearer " + pkey})
+        with urllib.request.urlopen(preq, timeout=30) as resp:
+            portal_names = {r["name"] for r in json.load(resp)}
+        slug_name = {r["slug"]: r["name"] for r in q(
+            f"SELECT slug, name FROM core.workspace WHERE slug IN {kws_in}")}
+        scoped2 = f"""
+            WITH b AS ({label_base})
+            SELECT * FROM b
+            WHERE ws IN {kws_in} AND d BETWEEN DATE '{since}' AND DATE '{cap}'
+              AND label IN ('opportunity','engagement','confused','not_interested','not interested')
+        """
+        lab = {(r["day"], r["ws"]): r for r in q(f"""
+            SELECT CAST(d AS VARCHAR) AS day, ws, COUNT(*) AS labeled,
+                   SUM(CASE WHEN label = 'opportunity' THEN 1 ELSE 0 END) AS opp,
+                   SUM(CASE WHEN label IN ('opportunity','engagement') THEN 1 ELSE 0 END) AS pos
+            FROM ({scoped2}) GROUP BY 1, 2""")}
+        nat = {(r["day"], r["ws"]): r for r in q(f"""
+            SELECT CAST(date AS VARCHAR) AS day, workspace_id AS ws,
+                   SUM(sent)::BIGINT AS sent, SUM(unique_replies)::BIGINT AS h,
+                   SUM(unique_replies_automatic)::BIGINT AS a
+            FROM raw_pipeline_campaign_daily_metrics
+            WHERE workspace_id IN {kws_in} AND date BETWEEN DATE '{since}' AND DATE '{cap}'
+            GROUP BY 1, 2""")}
+        wm = {r["day"]: r["wm"] for r in q(f"""
+            SELECT CAST(CAST(message_ts AS DATE) AS VARCHAR) AS day,
+                   CAST(MAX(labeled_at) AS VARCHAR) AS wm
+            FROM main.raw_reply_label_event
+            WHERE workspace_slug IN {kws_in}
+              AND CAST(message_ts AS DATE) BETWEEN DATE '{since}' AND DATE '{cap}'
+            GROUP BY 1""")}
+        push_rows, dropped = [], 0
+        all_days = sorted({d for d, _ in lab} | {d for d, _ in nat})
+        for dday in all_days:
+            tot_sent = sum(int(r["sent"] or 0) for (d, _), r in nat.items() if d == dday)
+            tot_h    = sum(int(r["h"] or 0)    for (d, _), r in nat.items() if d == dday)
+            tot_a    = sum(int(r["a"] or 0)    for (d, _), r in nat.items() if d == dday)
+            tot_lab  = sum(int(r["labeled"] or 0) for (d, _), r in lab.items() if d == dday)
+            reasons = []
+            if tot_sent <= 0: reasons.append("native sent=0")
+            if tot_h <= 0: reasons.append("native human=0")
+            if tot_lab <= 0: reasons.append("no labels")
+            if tot_sent > 0 and (tot_h + tot_a) > 0.05 * tot_sent:
+                reasons.append(f"replies {tot_h+tot_a} > 5% of sent {tot_sent}")
+            w = wm.get(dday)
+            if not w or w[:10] <= dday: reasons.append(f"labeler watermark {w} not past day")
+            for slug in kpi_ws:
+                p_ = int((lab.get((dday, slug)) or {}).get("pos") or 0)
+                h_ = int((nat.get((dday, slug)) or {}).get("h") or 0)
+                if p_ > h_: reasons.append(f"{slug}: positives {p_} > human {h_}")
+            if reasons:
+                dropped += 1
+                log(f"KPI-LABELS GATE: skipping {dday}: " + " | ".join(reasons))
+                continue
+            for slug in kpi_ws:
+                name = slug_name.get(slug)
+                if name not in portal_names:
+                    continue
+                lr, nr = lab.get((dday, slug)), nat.get((dday, slug))
+                if not lr and not nr:
+                    continue
+                push_rows.append({"date": dday, "workspace": name,
+                                  "sent": int((nr or {}).get("sent") or 0),
+                                  "human_replies": int((nr or {}).get("h") or 0),
+                                  "positive": int((lr or {}).get("pos") or 0),
+                                  "opps_labeled": int((lr or {}).get("opp") or 0),
+                                  "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
+        for i in range(0, len(push_rows), 500):
+            body2 = json.dumps(push_rows[i:i+500], default=str).encode()
+            req2 = urllib.request.Request(
+                purl.rstrip("/") + "/rest/v1/kpi_labels_daily?on_conflict=date,workspace",
+                data=body2, method="POST",
+                headers={"apikey": pkey, "Authorization": "Bearer " + pkey,
+                         "Content-Type": "application/json",
+                         "Prefer": "resolution=merge-duplicates,return=minimal"})
+            urllib.request.urlopen(req2, timeout=120).read()
+        print(f"  ok kpi_labels_daily upserted: {len(push_rows)} rows "
+              f"({since} → {cap}, {dropped} day(s) gate-skipped)")
+    except Exception as e:
+        log(f"WARN kpi-labels push failed (KPI tab falls back to provisional counts): {e}")
 
 
 if __name__ == "__main__":
