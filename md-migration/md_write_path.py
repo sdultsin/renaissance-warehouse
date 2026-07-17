@@ -214,8 +214,15 @@ for i, (s, n, est) in enumerate(tbls, 1):
         ct = con.execute(f'SELECT count(*) FROM {sq}').fetchone()[0]
         if ct > BIG:
             con.execute(f'CREATE OR REPLACE TABLE {fq} AS SELECT * FROM {sq} LIMIT 0')
+            # Chunk over the ACTUAL rowid domain, not count(*): DuckDB rowids are
+            # physical and go SPARSE after UPDATE/DELETE churn — bounding by count
+            # silently drops every row with rowid >= count. Proven 2026-07-17:
+            # core.account_census count=10,292,972 max(rowid)=15,065,228 after DDL
+            # 1117's row rewrites -> 797,920 rows dropped = the parity_mismatch
+            # that failed this night's publish. Empty ranges cost ~nothing.
+            mx = con.execute(f'SELECT max(rowid) FROM {sq}').fetchone()[0]
             k = 0
-            while k < ct:
+            while k <= mx:
                 for attempt in range(4):
                     try:
                         con.execute(f'INSERT INTO {fq} SELECT * FROM {sq} WHERE rowid >= {k} AND rowid < {k+CHUNK}')
