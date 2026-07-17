@@ -258,7 +258,9 @@ def main() -> None:
                         reasons.append("native sent=0 — nightly facts not loaded yet")
                     if tot_h <= 0:
                         reasons.append("native human replies=0 — nightly facts not loaded yet")
-                    if tot_sent > 0 and (tot_h + tot_a) > 0.05 * tot_sent:
+                    if tot_sent >= 100_000 and (tot_h + tot_a) > 0.05 * tot_sent:
+                        # ratio check only on substantial send days: weekend/paused days
+                        # legitimately have replies >> sends (replies lag weekday sends)
                         reasons.append(f"replies {tot_h+tot_a} > 5% of sent {tot_sent} — implausible")
                     for r in drows:
                         pos = int(r["opp"] or 0) + int(r["eng"] or 0)
@@ -376,7 +378,7 @@ def main() -> None:
             if tot_sent <= 0: reasons.append("native sent=0")
             if tot_h <= 0: reasons.append("native human=0")
             if tot_lab <= 0: reasons.append("no labels")
-            if tot_sent > 0 and (tot_h + tot_a) > 0.05 * tot_sent:
+            if tot_sent >= 100_000 and (tot_h + tot_a) > 0.05 * tot_sent:
                 reasons.append(f"replies {tot_h+tot_a} > 5% of sent {tot_sent}")
             w = wm.get(dday)
             if not w or w[:10] <= dday: reasons.append(f"labeler watermark {w} not past day")
