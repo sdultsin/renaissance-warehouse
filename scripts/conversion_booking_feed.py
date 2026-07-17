@@ -1,35 +1,50 @@
-"""Push the booking-site Conversion tab feed — portal Supabase dashboard_feeds key='conversion'.
+"""Push the booking-site conversion feed — portal Supabase dashboard_feeds key='conversion'.
 
-v2 (Sam R30, 2026-07-17): DAY x WORKSPACE grain, rolling completed days (Jul 14/15/16 -> daily).
-Feeds the "Conversion" tab on renaissance-booking.com (generalrenaissance/booking-form).
-Runs inside refresh_portal_feed.sh (conductor job portal-feed-refresh, daily@07:30 UTC).
+v3 (Sam KPI-merge + cohort ruling, 2026-07-17): DAY x WORKSPACE grain, COHORT semantics.
+This feed now powers the merged KPIs tab on renaissance-booking.com (the separate
+Conversion tab UI is retired; the feed lives on for the KPI columns + any consumer).
+
+METRIC CONTRACT (Sam cohort ruling 2026-07-17 — the 19-vs-20 problem):
+  - opp_cohort  = distinct leads with an OPPORTUNITY LABEL EVENT whose reply falls on the
+                  day (main.raw_reply_label_event, append-only — a lead who later books
+                  STILL counts; never a current-state count).
+  - pos_cohort  = distinct leads with an opportunity OR engagement event that day.
+  - opp_leads / opp_met = the day's opp cohort and, of it, leads with a meeting booked
+                  ON/AFTER the reply (post-reply join; opp_met <= opp_leads by construction,
+                  so opp->booked can never exceed 100%; it grows for days as opps book).
+  - Current-state fields (opp/eng/conf/ni/labeled) remain for lineage/consumers.
+  - Denominators stay native Instantly daily facts (sent / unique_replies / auto).
+
+DAY MODES (day_meta.mode):
+  - 'full_read' (<= 2026-07-14) / 'positive_slice': labels COMPLETE for the day —
+    completeness = >=90% of the day's ledger positive-mark cohort
+    (raw_comms_instantly_lead_state_event, observed_status>=1, never decrements) carries
+    a same-day label event, AND the daily-labeler watermark is past the day.
+  - 'ledger_provisional': completed sending day whose labels are still landing — the row
+    carries the LEDGER cohort instead (opp_cohort/opp_leads = ever-marked-positive that
+    day; opp_met = post-reply meetings of that cohort). Replaced in place by the labeled
+    row once the sweep completes. The KPIs tab renders these asterisked.
+
+DAY-READINESS GATE [Sam-caught 2026-07-17 incident]: a day ships ONLY with complete native
+facts (sent>0, human>0; replies<=5% of sent when sent>=100k — low-send weekend days are
+exempt from the ratio check). Labeled-mode days additionally assert per-ws positives<=human
+and opp_met<=opp_leads; any violation drops the day loudly. Days that pass native checks
+but are label-incomplete ship as ledger_provisional; days failing native checks are omitted
+entirely and self-heal on a later run.
+
+SCOPE: COMPLETED SENDING DAYS ONLY — cap = yesterday-ET, always. Override down with
+BOOKING_CONV_MAX_DAY=YYYY-MM-DD; the cap can never exceed yesterday-ET.
+Workspaces: 5 funding slugs + warm-leads + renaissance-1 + the-gatekeepers (Max's —
+added 2026-07-17 for the KPI merge).
+
+Runs inside refresh_portal_feed.sh (conductor job portal-feed-refresh, daily@07:30 UTC,
+plus later same-day reruns — the 07:30 run predates the nightly's facts for yesterday).
 READ-ONLY on the warehouse (CORE_DB_PATH = serving snapshot); the only write is a PostgREST
-UPSERT into the PORTAL Supabase (pxrdmjjaxtqycuxhxmgi) public.dashboard_feeds
-(service key from /root/renaissance-worker/.env; RLS = authenticated read, service_role write).
-
-SCOPE RULE: COMPLETED SENDING DAYS ONLY — the cap is yesterday-ET, always (the Jul-14-only
-MVP pin is superseded by R30). A partial/in-flight day never ships. Override down with
-BOOKING_CONV_MAX_DAY=YYYY-MM-DD if a day must be held back; the cap can never exceed
-yesterday-ET regardless of config. Day rows appear automatically as label events land
-(R18: Jul-15+ is labeled on the Instantly-positive slice only; Jul-14 was a full-read day —
-per-day coverage 'mode' states which).
-
-METRIC CONTRACT (R30): positives = opportunity + engaged (labels); denominators = native
-Instantly daily facts (sent / unique_replies / unique_replies_automatic — complete facts);
-Instantly's own opportunity auto-count carried only as a comparison field. opp->meeting =
-meetings booked ON/AFTER the labeled reply date (grows for days).
-
+UPSERT into the PORTAL Supabase (pxrdmjjaxtqycuxhxmgi) public.dashboard_feeds.
 Never hard-fails the conductor: any error prints WARN to stderr and exits 0.
-
-ALSO [2026-07-17, Sam KPI-merge]: pushes portal public.kpi_labels_daily — per (day x
-kpi_workspaces.name) labeled counts (sent/human_replies/positive/opps_labeled) that portal
-kpi_compute() reads to serve the merged KPIs tab (labeled opps for completed gate-passed
-days; Instantly auto-count only as the provisional fallback for not-yet-labeled days).
-Scope = FUNDING_WS + the-gatekeepers (Max's). Same day-readiness gate + assertions.
-Daily incremental (last 5 completed days); BOOKING_KPI_LABELS_SINCE=YYYY-MM-DD backfills.
 """
 from __future__ import annotations
-import json, os, sys, urllib.request
+import json, os, re, sys, urllib.request
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 import duckdb
@@ -37,14 +52,16 @@ import duckdb
 DB = os.environ.get("CORE_DB_PATH", "/opt/duckdb/warehouse_current.duckdb")
 WORKER_ENV = os.environ.get("WORKER_ENV_FILE", "/root/renaissance-worker/.env")
 FULL_READ_THROUGH = "2026-07-14"   # R18 boundary: <= this day = full-read; after = positive-slice
-MIN_DAY = "2026-07-14"             # R11 floor: the Jul-13 sliver (labels whose anchoring reply
-                                   # trailed into Jul-13 during the Jul-14 batch) is NOT a
-                                   # presentable day — first fully-covered day = 2026-07-14.
+MIN_DAY = "2026-07-14"             # R11 floor: first fully-covered presentable day
+SLICE_COMPLETE = 0.90              # labeled share of the day's ledger positive cohort => labels complete
 
-# 7 workspaces (Sam 2026-07-15): 5 funding slugs + warm-leads + renaissance-1 (NOT the-gatekeepers).
+# 8 workspaces (Sam 2026-07-17: +the-gatekeepers for the KPI merge)
 FUNDING_WS = ('renaissance-2', 'renaissance-4', 'renaissance-5',
-              'prospects-power', 'koi-and-destroy', 'warm-leads', 'renaissance-1')
+              'prospects-power', 'koi-and-destroy', 'warm-leads', 'renaissance-1',
+              'the-gatekeepers')
 WS_IN = "('" + "','".join(FUNDING_WS) + "')"
+
+LABELS_IN = "('opportunity','engagement','confused','not_interested','not interested')"
 
 
 def log(msg: str) -> None:
@@ -70,6 +87,11 @@ def effective_max_day() -> str:
     return min(cap, yesterday_et)      # NEVER today, whatever the config says
 
 
+def ledger_ws_key(name: str) -> str:
+    """core.workspace.name -> raw_comms ledger 'workspace' slug (e.g. Max's workspace -> max-s-workspace)."""
+    return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
 def main() -> None:
     cap = effective_max_day()
     conn = duckdb.connect(DB, read_only=True)
@@ -79,17 +101,9 @@ def main() -> None:
             "SELECT count(*) FROM information_schema.tables WHERE table_schema=? AND table_name=?",
             [schema, name]).fetchone()[0] > 0
 
-    def cols_of(schema: str, name: str) -> list[str]:
-        return [r[0] for r in conn.execute(
-            "SELECT column_name FROM information_schema.columns WHERE table_schema=? AND table_name=?",
-            [schema, name]).fetchall()]
-
-    def pick(cols: list[str], *cands: str) -> str | None:
-        low = {c.lower(): c for c in cols}
-        for cand in cands:
-            if cand in low:
-                return low[cand]
-        return None
+    def table_known(name: str) -> bool:
+        return conn.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_name=?", [name]).fetchone()[0] > 0
 
     def q(sql: str) -> list[dict]:
         cur = conn.execute(sql)
@@ -98,206 +112,219 @@ def main() -> None:
                 for row in cur.fetchall()]
 
     ws_names = {r["slug"]: r["name"] for r in q(f"SELECT slug, name FROM core.workspace WHERE slug IN {WS_IN}")}
-
-    # ── label relation (self-activating; DDL 1110-1114 contract) ────────────────────
-    rel = None
-    for schema, name in (("core", "v_reply_label_current"), ("main", "v_reply_label_current"),
-                         ("main", "raw_reply_label_event"), ("core", "raw_reply_label_event")):
-        if exists(schema, name):
-            rel = (f"{schema}.{name}", cols_of(schema, name))
-            break
-
-    label_base = None    # set when the label relation's columns are recognized (KPI push uses it)
+    led_to_slug = {ledger_ws_key(name): slug for slug, name in ws_names.items()}
 
     payload: dict = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "snapshot_id": os.path.basename(os.path.realpath(DB)),
         "status": "pending_labels",
         "grain": "day_x_workspace",
+        "cohort_basis": "label_events",          # v3: append-only event cohorts (Sam ruling 07-17)
         "labeler_version": None,
         "scope": {"mode": "completed_days_only", "max_day": cap, "days": []},
         "day_meta": [], "rows": [],
     }
 
-    if rel:
-        relname, rc = rel
-        c_ws    = pick(rc, "workspace", "workspace_slug", "workspace_id")
-        c_email = pick(rc, "lead_email", "email")
-        c_label = pick(rc, "label", "current_label", "label_current", "verdict")
-        c_opt   = pick(rc, "opt_out", "current_opt_out", "is_opt_out", "optout")
-        c_ver   = pick(rc, "labeler_version", "version", "prompt_version")
-        c_date  = pick(rc, "reply_date", "reply_at", "message_ts", "current_label_message_ts",
-                       "message_at", "labeled_at", "event_at", "created_at")
-        if c_ws and c_email and c_label and c_date:
-            dedup = "" if "current" in relname else \
-                f"QUALIFY row_number() OVER (PARTITION BY {c_ws}, lower({c_email}), CAST({c_date} AS DATE) ORDER BY {c_date} DESC) = 1"
-            base = f"""
-                SELECT {c_ws} AS ws, lower({c_email}) AS lead_email,
-                       lower(CAST({c_label} AS VARCHAR)) AS label,
-                       {f'COALESCE({c_opt}, FALSE)' if c_opt else 'FALSE'} AS opt_out,
-                       {f'CAST({c_ver} AS VARCHAR)' if c_ver else 'NULL'} AS labeler_version,
-                       CAST({c_date} AS DATE) AS d
-                FROM {relname} {dedup}
-            """
-            label_base = base
-            scoped = f"""
-                WITH b AS ({base})
-                SELECT * FROM b
-                WHERE ws IN {WS_IN} AND d BETWEEN DATE '{MIN_DAY}' AND DATE '{cap}'
-                  AND label IN ('opportunity','engagement','confused','not_interested','not interested')
-            """
-            days = [r["d"] for r in q(f"SELECT DISTINCT CAST(d AS VARCHAR) AS d FROM ({scoped}) ORDER BY d")]
-            if days:
-                days_in = "('" + "','".join(days) + "')"
-                meeting_leads = ("SELECT DISTINCT lower(lead_email) AS lead_email, meeting_date "
-                                 "FROM core.v_meeting_truth "
-                                 "WHERE channel_norm = 'Email' AND is_ours AND lead_email IS NOT NULL "
-                                 "AND meeting_date IS NOT NULL"
-                                 ) if exists("core", "v_meeting_truth") else (
-                                 "SELECT DISTINCT lower(lead_email) AS lead_email, "
-                                 "COALESCE(meeting_date, CAST(posted_at AS DATE)) AS meeting_date "
-                                 "FROM core.meeting WHERE lead_email IS NOT NULL")
-                # ── DAY x WORKSPACE rows: labels + POST-REPLY meetings + native daily facts ──
-                rows = q(f"""
-                    WITH s AS ({scoped}), ml AS ({meeting_leads}),
-                    lab AS (
-                      SELECT CAST(d AS VARCHAR) AS day, ws,
-                             COUNT(*)                                               AS labeled,
-                             SUM(CASE WHEN label = 'opportunity' THEN 1 ELSE 0 END) AS opp,
-                             SUM(CASE WHEN label = 'engagement' THEN 1 ELSE 0 END)  AS eng,
-                             SUM(CASE WHEN label = 'confused' THEN 1 ELSE 0 END)    AS conf,
-                             SUM(CASE WHEN label IN ('not_interested','not interested') THEN 1 ELSE 0 END) AS ni,
-                             SUM(CASE WHEN opt_out THEN 1 ELSE 0 END)               AS opt_outs
-                      FROM s GROUP BY 1, 2),
-                    om AS (
-                      SELECT CAST(s.d AS VARCHAR) AS day, s.ws,
-                             COUNT(DISTINCT s.lead_email) AS opp_leads,
-                             COUNT(DISTINCT CASE WHEN ml.lead_email IS NOT NULL THEN s.lead_email END) AS opp_met
-                      FROM s LEFT JOIN ml ON ml.lead_email = s.lead_email AND ml.meeting_date >= s.d
-                      WHERE s.label = 'opportunity' GROUP BY 1, 2),
-                    nat AS (
-                      SELECT CAST(date AS VARCHAR) AS day, workspace_id AS ws,
-                             SUM(sent)::BIGINT                     AS sent,
-                             SUM(unique_replies)::BIGINT           AS replies_human,
-                             SUM(unique_replies_automatic)::BIGINT AS replies_auto,
-                             SUM(unique_opportunities)::BIGINT     AS native_opps
-                      FROM raw_pipeline_campaign_daily_metrics
-                      WHERE workspace_id IN {WS_IN} AND CAST(date AS VARCHAR) IN {days_in}
-                      GROUP BY 1, 2)
-                    SELECT COALESCE(lab.day, nat.day) AS day, COALESCE(lab.ws, nat.ws) AS ws,
-                           nat.sent, nat.replies_human, nat.replies_auto, nat.native_opps,
-                           lab.labeled, lab.opp, lab.eng, lab.conf, lab.ni, lab.opt_outs,
-                           om.opp_leads, om.opp_met
-                    FROM lab FULL JOIN nat ON nat.day = lab.day AND nat.ws = lab.ws
-                    LEFT JOIN om ON om.day = COALESCE(lab.day, nat.day) AND om.ws = COALESCE(lab.ws, nat.ws)
-                    ORDER BY 1, 2
-                """)
-                for r in rows:
-                    r["name"] = ws_names.get(r["ws"], r["ws"])
+    have_events = exists("main", "raw_reply_label_event")
+    have_ledger = table_known("raw_comms_instantly_lead_state_event")
+    if not have_events:
+        log("raw_reply_label_event missing from snapshot — upserting pending_labels state")
 
-                # ── per-day coverage: read leads / canonical reply-lead universe (core.reply,
-                #    BOTH workspace_id encodings via core.workspace_alias — the fast base of
-                #    derived.v_reply_canonical; its is_auto_reply flag is documented-broken) ──
-                day_meta = {d: {"day": d, "read": 0, "replying": 0, "pct": None,
-                                "mode": "full_read" if d <= FULL_READ_THROUGH else "positive_slice",
-                                "unreadable": 0} for d in days}
-                try:
-                    for r in q(f"""
-                        WITH wmap AS (
-                          SELECT instantly_uuid AS wid, warehouse_slug AS slug
-                          FROM core.workspace_alias
-                          WHERE warehouse_slug IN {WS_IN} AND instantly_uuid IS NOT NULL
-                          UNION ALL
-                          SELECT warehouse_slug, warehouse_slug FROM core.workspace_alias
-                          WHERE warehouse_slug IN {WS_IN}),
-                        canon AS (
-                          SELECT DISTINCT CAST(CAST(r.reply_timestamp AS DATE) AS VARCHAR) AS day,
-                                 m.slug AS ws, lower(r.lead_email) AS lead_email
-                          FROM core.reply r JOIN wmap m ON m.wid = r.workspace_id
-                          WHERE CAST(CAST(r.reply_timestamp AS DATE) AS VARCHAR) IN {days_in}),
-                        ev AS (
-                          SELECT DISTINCT CAST(CAST(message_ts AS DATE) AS VARCHAR) AS day,
-                                 workspace_slug AS ws, lower(lead_email) AS lead_email
-                          FROM main.raw_reply_label_event
-                          WHERE workspace_slug IN {WS_IN}
-                            AND CAST(CAST(message_ts AS DATE) AS VARCHAR) IN {days_in})
-                        SELECT c.day, COUNT(*)::BIGINT AS replying,
-                               SUM(CASE WHEN e.lead_email IS NOT NULL THEN 1 ELSE 0 END)::BIGINT AS read
-                        FROM canon c LEFT JOIN ev e USING (day, ws, lead_email)
-                        GROUP BY 1"""):
-                        if r["day"] in day_meta:
-                            m = day_meta[r["day"]]
-                            m["replying"], m["read"] = r["replying"], r["read"]
-                            m["pct"] = round(100.0 * r["read"] / r["replying"], 1) if r["replying"] else None
-                    for r in q(f"""
-                        SELECT CAST(CAST(message_ts AS DATE) AS VARCHAR) AS day, COUNT(*)::BIGINT AS n
-                        FROM main.raw_reply_label_event
-                        WHERE workspace_slug IN {WS_IN}
-                          AND CAST(CAST(message_ts AS DATE) AS VARCHAR) IN {days_in}
-                          AND (label = 'unreadable' OR deterministic_gate = 'unreadable_no_text')
-                        GROUP BY 1"""):
-                        if r["day"] in day_meta:
-                            day_meta[r["day"]]["unreadable"] = r["n"]
-                except Exception as e:
-                    log(f"coverage compute failed (non-fatal): {e}")
+    rows: list[dict] = []
+    day_meta_out: list[dict] = []
+    days_out: list[str] = []
 
-                # ── DAY-READINESS GATE [2026-07-17, Sam-caught incident]: the 07:30Z conductor
-                # can run BEFORE the nightly loads yesterday's native facts — labels without
-                # denominators rendered sent=0 / positive-RR>100% nonsense. A day renders only
-                # when native facts are complete AND labels are ready; not-ready days are
-                # OMITTED (they self-heal on a later refresh). Hard sanity assertions drop a
-                # whole day loudly rather than ever rendering nonsense.
-                ready_days = []
-                for dday in days:
-                    drows = [r for r in rows if r["day"] == dday]
-                    tot_sent = sum(int(r["sent"] or 0) for r in drows)
-                    tot_h    = sum(int(r["replies_human"] or 0) for r in drows)
-                    tot_a    = sum(int(r["replies_auto"] or 0) for r in drows)
-                    reasons = []
-                    if tot_sent <= 0:
-                        reasons.append("native sent=0 — nightly facts not loaded yet")
-                    if tot_h <= 0:
-                        reasons.append("native human replies=0 — nightly facts not loaded yet")
-                    if tot_sent >= 100_000 and (tot_h + tot_a) > 0.05 * tot_sent:
-                        # ratio check only on substantial send days: weekend/paused days
-                        # legitimately have replies >> sends (replies lag weekday sends)
-                        reasons.append(f"replies {tot_h+tot_a} > 5% of sent {tot_sent} — implausible")
-                    for r in drows:
-                        pos = int(r["opp"] or 0) + int(r["eng"] or 0)
-                        if pos > int(r["replies_human"] or 0):
-                            reasons.append(f"{r['ws']}: positives {pos} > human replies {r['replies_human']}")
-                    if dday > FULL_READ_THROUGH:
-                        # positive-slice day: the daily labeler's sweep must have run AFTER the
-                        # day ended (max labeled_at past the day) or the evening tail is missing.
-                        try:
-                            wm = q(f"""SELECT CAST(MAX(labeled_at) AS VARCHAR) AS wm
-                                       FROM main.raw_reply_label_event
-                                       WHERE workspace_slug IN {WS_IN}
-                                         AND CAST(CAST(message_ts AS DATE) AS VARCHAR) = '{dday}'""")[0]["wm"]
-                            if not wm or wm[:10] <= dday:
-                                reasons.append(f"daily-labeler watermark {wm} not past {dday} — sweep incomplete")
-                        except Exception as e:
-                            reasons.append(f"watermark check failed: {e}")
-                    if reasons:
-                        log(f"DAY GATE: DROPPING {dday}: " + " | ".join(reasons))
-                    else:
-                        ready_days.append(dday)
-                rows = [r for r in rows if r["day"] in ready_days]
-                days = ready_days
-                ver = q(f"SELECT MAX(labeler_version) AS ver FROM ({scoped})")[0]["ver"]
-                payload.update({
-                    "status": "ok" if days else "pending_labels",
-                    "labeler_version": ver,
-                    "scope": {"mode": "completed_days_only", "max_day": cap, "days": days},
-                    "day_meta": [day_meta[d] for d in days],
-                    "rows": rows,
-                })
-            else:
-                log(f"label relation {relname} present but zero rows within cap {cap}")
+    if have_events:
+        rng = f"BETWEEN DATE '{MIN_DAY}' AND DATE '{cap}'"
+        # ── native Instantly daily facts (denominators) ─────────────────────────────
+        nat = {(r["day"], r["ws"]): r for r in q(f"""
+            SELECT CAST(date AS VARCHAR) AS day, workspace_id AS ws,
+                   SUM(sent)::BIGINT AS sent, SUM(unique_replies)::BIGINT AS h,
+                   SUM(unique_replies_automatic)::BIGINT AS a,
+                   SUM(unique_opportunities)::BIGINT AS native_opps
+            FROM raw_pipeline_campaign_daily_metrics
+            WHERE workspace_id IN {WS_IN} AND CAST(date AS DATE) {rng}
+            GROUP BY 1, 2""")}
+        # ── label events: append-only cohorts + current-state lineage counts ────────
+        ev_base = f"""
+            SELECT DISTINCT workspace_slug AS ws, lower(lead_email) AS le,
+                   CAST(message_ts AS DATE) AS d, lower(CAST(label AS VARCHAR)) AS label
+            FROM main.raw_reply_label_event
+            WHERE workspace_slug IN {WS_IN} AND CAST(message_ts AS DATE) {rng}
+              AND lower(CAST(label AS VARCHAR)) IN {LABELS_IN}
+        """
+        cur_state = f"""
+            SELECT workspace_slug AS ws, lower(lead_email) AS le,
+                   CAST(message_ts AS DATE) AS d,
+                   lower(CAST(label AS VARCHAR)) AS label, labeler_version
+            FROM main.raw_reply_label_event
+            WHERE workspace_slug IN {WS_IN} AND CAST(message_ts AS DATE) {rng}
+              AND lower(CAST(label AS VARCHAR)) IN {LABELS_IN}
+            QUALIFY row_number() OVER (PARTITION BY workspace_slug, lower(lead_email),
+                                       CAST(message_ts AS DATE) ORDER BY labeled_at DESC) = 1
+        """
+        labc = {(r["day"], r["ws"]): r for r in q(f"""
+            SELECT CAST(d AS VARCHAR) AS day, ws, COUNT(*) AS labeled,
+                   SUM(CASE WHEN label = 'opportunity' THEN 1 ELSE 0 END) AS opp,
+                   SUM(CASE WHEN label = 'engagement' THEN 1 ELSE 0 END)  AS eng,
+                   SUM(CASE WHEN label = 'confused' THEN 1 ELSE 0 END)    AS conf,
+                   SUM(CASE WHEN label IN ('not_interested','not interested') THEN 1 ELSE 0 END) AS ni
+            FROM ({cur_state}) GROUP BY 1, 2""")}
+        coh = {(r["day"], r["ws"]): r for r in q(f"""
+            SELECT CAST(d AS VARCHAR) AS day, ws,
+                   COUNT(DISTINCT CASE WHEN label = 'opportunity' THEN le END) AS opp_cohort,
+                   COUNT(DISTINCT CASE WHEN label IN ('opportunity','engagement') THEN le END) AS pos_cohort
+            FROM ({ev_base}) GROUP BY 1, 2""")}
+        meeting_leads = ("SELECT DISTINCT lower(lead_email) AS le, meeting_date "
+                        "FROM core.v_meeting_truth "
+                        "WHERE channel_norm = 'Email' AND is_ours AND lead_email IS NOT NULL "
+                        "AND meeting_date IS NOT NULL"
+                        ) if exists("core", "v_meeting_truth") else (
+                        "SELECT DISTINCT lower(lead_email) AS le, "
+                        "COALESCE(meeting_date, CAST(posted_at AS DATE)) AS meeting_date "
+                        "FROM core.meeting WHERE lead_email IS NOT NULL")
+        omv = {(r["day"], r["ws"]): r for r in q(f"""
+            WITH oc AS (SELECT DISTINCT ws, le, d FROM ({ev_base}) WHERE label = 'opportunity'),
+            ml AS ({meeting_leads})
+            SELECT CAST(oc.d AS VARCHAR) AS day, oc.ws,
+                   COUNT(DISTINCT oc.le) AS opp_leads,
+                   COUNT(DISTINCT CASE WHEN ml.le IS NOT NULL THEN oc.le END) AS opp_met
+            FROM oc LEFT JOIN ml ON ml.le = oc.le AND ml.meeting_date >= oc.d
+            GROUP BY 1, 2""")}
+        wm = {r["day"]: r["wm"] for r in q(f"""
+            SELECT CAST(CAST(message_ts AS DATE) AS VARCHAR) AS day,
+                   CAST(MAX(labeled_at) AS VARCHAR) AS wm
+            FROM main.raw_reply_label_event
+            WHERE workspace_slug IN {WS_IN} AND CAST(message_ts AS DATE) {rng}
+            GROUP BY 1""")}
+        # ── ledger: never-decrementing Instantly positive marks (provisional cohorts) ──
+        led: dict = {}
+        led_cov: dict = {}
+        if have_ledger:
+            led_rows = q(f"""
+                WITH lp AS (
+                  SELECT DISTINCT CAST(status_changed_at AS DATE) AS d, workspace AS lw,
+                         lower(lead_email) AS le
+                  FROM raw_comms_instantly_lead_state_event
+                  WHERE observed_status >= 1 AND CAST(status_changed_at AS DATE) {rng}),
+                ml AS ({meeting_leads}),
+                ev AS (SELECT DISTINCT le, d FROM ({ev_base}))
+                SELECT CAST(lp.d AS VARCHAR) AS day, lp.lw,
+                       COUNT(DISTINCT lp.le) AS led_cohort,
+                       COUNT(DISTINCT CASE WHEN ml.le IS NOT NULL THEN lp.le END) AS led_met,
+                       COUNT(DISTINCT CASE WHEN ev.le IS NOT NULL THEN lp.le END) AS led_labeled
+                FROM lp
+                LEFT JOIN ml ON ml.le = lp.le AND ml.meeting_date >= lp.d
+                LEFT JOIN ev ON ev.le = lp.le AND ev.d = lp.d
+                GROUP BY 1, 2""")
+            for r in led_rows:
+                slug = led_to_slug.get(r["lw"])
+                if slug:
+                    led[(r["day"], slug)] = r
+                c = led_cov.setdefault(r["day"], {"cohort": 0, "labeled": 0})
+                c["cohort"] += int(r["led_cohort"] or 0)
+                c["labeled"] += int(r["led_labeled"] or 0)
         else:
-            log(f"label relation {relname} columns unrecognized: {rc}")
-    else:
-        log("label views not in snapshot yet — upserting pending_labels state")
+            log("ledger table missing — label-incomplete days will be omitted, not provisional")
+
+        # ── per-day gate + mode + row assembly ──────────────────────────────────────
+        all_days = sorted({d for d, _ in nat} | {d for d, _ in coh} | {d for d, _ in led})
+        for dday in all_days:
+            tot_sent = sum(int(r["sent"] or 0) for (d, _), r in nat.items() if d == dday)
+            tot_h    = sum(int(r["h"] or 0)    for (d, _), r in nat.items() if d == dday)
+            tot_a    = sum(int(r["a"] or 0)    for (d, _), r in nat.items() if d == dday)
+            tot_lab  = sum(int(r["labeled"] or 0) for (d, _), r in labc.items() if d == dday)
+            reasons = []
+            if tot_sent <= 0: reasons.append("native sent=0 — nightly facts not loaded yet")
+            if tot_h <= 0: reasons.append("native human replies=0 — nightly facts not loaded yet")
+            if tot_sent >= 100_000 and (tot_h + tot_a) > 0.05 * tot_sent:
+                reasons.append(f"replies {tot_h+tot_a} > 5% of sent {tot_sent} — implausible")
+            if reasons:
+                log(f"DAY GATE: DROPPING {dday}: " + " | ".join(reasons))
+                continue
+            w = wm.get(dday)
+            wm_ok = bool(w) and w[:10] > dday
+            cov = led_cov.get(dday)
+            slice_cov = (cov["labeled"] / cov["cohort"]) if cov and cov["cohort"] else None
+            labels_complete = tot_lab > 0 and wm_ok and (
+                dday <= FULL_READ_THROUGH or (slice_cov is not None and slice_cov >= SLICE_COMPLETE))
+
+            if labels_complete:
+                a_reasons = []
+                for slug in FUNDING_WS:
+                    lc, om_, nr = labc.get((dday, slug)), omv.get((dday, slug)), nat.get((dday, slug))
+                    pos = int((lc or {}).get("opp") or 0) + int((lc or {}).get("eng") or 0)
+                    if pos > int((nr or {}).get("h") or 0):
+                        a_reasons.append(f"{slug}: positives {pos} > human {(nr or {}).get('h')}")
+                    if int((om_ or {}).get("opp_met") or 0) > int((om_ or {}).get("opp_leads") or 0):
+                        a_reasons.append(f"{slug}: opp_met > opp_leads")
+                if a_reasons:
+                    log(f"DAY GATE: DROPPING {dday} (labeled-mode assertion): " + " | ".join(a_reasons))
+                    continue
+                mode = "full_read" if dday <= FULL_READ_THROUGH else "positive_slice"
+                for slug in FUNDING_WS:
+                    lc = labc.get((dday, slug)); cc = coh.get((dday, slug))
+                    om_ = omv.get((dday, slug)); nr = nat.get((dday, slug))
+                    if not (lc or cc or nr):
+                        continue
+                    rows.append({
+                        "day": dday, "ws": slug, "name": ws_names.get(slug, slug),
+                        "sent": int((nr or {}).get("sent") or 0),
+                        "replies_human": int((nr or {}).get("h") or 0),
+                        "replies_auto": int((nr or {}).get("a") or 0),
+                        "native_opps": int((nr or {}).get("native_opps") or 0),
+                        "labeled": int((lc or {}).get("labeled") or 0),
+                        "opp": int((lc or {}).get("opp") or 0),
+                        "eng": int((lc or {}).get("eng") or 0),
+                        "conf": int((lc or {}).get("conf") or 0),
+                        "ni": int((lc or {}).get("ni") or 0),
+                        "opp_cohort": int((cc or {}).get("opp_cohort") or 0),
+                        "pos_cohort": int((cc or {}).get("pos_cohort") or 0),
+                        "opp_leads": int((om_ or {}).get("opp_leads") or 0),
+                        "opp_met": int((om_ or {}).get("opp_met") or 0),
+                    })
+            elif any((dday, slug) in led for slug in FUNDING_WS):
+                mode = "ledger_provisional"
+                log(f"DAY {dday}: labels incomplete (slice_cov="
+                    f"{round(slice_cov, 3) if slice_cov is not None else None}, wm_ok={wm_ok}) — "
+                    f"shipping LEDGER-provisional cohorts")
+                for slug in FUNDING_WS:
+                    lr = led.get((dday, slug)); nr = nat.get((dday, slug))
+                    if not (lr or nr):
+                        continue
+                    lcoh = int((lr or {}).get("led_cohort") or 0)
+                    rows.append({
+                        "day": dday, "ws": slug, "name": ws_names.get(slug, slug),
+                        "sent": int((nr or {}).get("sent") or 0),
+                        "replies_human": int((nr or {}).get("h") or 0),
+                        "replies_auto": int((nr or {}).get("a") or 0),
+                        "native_opps": int((nr or {}).get("native_opps") or 0),
+                        "labeled": None, "opp": None, "eng": None, "conf": None, "ni": None,
+                        "opp_cohort": lcoh, "pos_cohort": None,
+                        "opp_leads": lcoh,
+                        "opp_met": min(int((lr or {}).get("led_met") or 0), lcoh),
+                    })
+            else:
+                log(f"DAY GATE: DROPPING {dday}: labels incomplete and no ledger rows")
+                continue
+            days_out.append(dday)
+            day_meta_out.append({"day": dday, "mode": mode,
+                                 "slice_cov": round(slice_cov, 3) if slice_cov is not None else None})
+
+        if days_out:
+            try:
+                ver = q(f"SELECT MAX(labeler_version) AS ver FROM ({cur_state})")[0]["ver"]
+            except Exception:
+                ver = None
+            payload.update({
+                "status": "ok",
+                "labeler_version": ver,
+                "scope": {"mode": "completed_days_only", "max_day": cap, "days": days_out},
+                "day_meta": day_meta_out,
+                "rows": rows,
+            })
+        else:
+            log(f"no presentable days within cap {cap}")
 
     if os.environ.get("BOOKING_CONV_DRY") == "1":   # test mode: print, don't push
         print(json.dumps(payload, default=str))
@@ -318,104 +345,8 @@ def main() -> None:
                  "Prefer": "resolution=merge-duplicates,return=minimal"})
     with urllib.request.urlopen(req, timeout=60) as resp:
         print(f"  ok conversion-booking-feed upserted (status={payload['status']}, "
-              f"days={payload['scope']['days']}, HTTP {resp.status})")
-
-    # ── KPI labeled-opps cache → portal kpi_labels_daily [2026-07-17 Sam KPI-merge] ────────
-    # Powers the merged KPIs tab: kpi_compute() uses these labeled counts for completed days
-    # and falls back to Instantly's auto-count (provisional, asterisked) where no row exists.
-    # Same data-honesty rules as the conversion feed: day-readiness gate + hard assertions;
-    # a not-ready day is simply not pushed (KPI shows provisional until it lands — self-heals).
-    try:
-        if label_base is None:
-            log("kpi-labels: label relation not usable — skipped")
-            return
-        kpi_ws = FUNDING_WS + ("the-gatekeepers",)          # + Max's; Tariffs/S125 have no labels
-        kws_in = "('" + "','".join(kpi_ws) + "')"
-        since = os.environ.get("BOOKING_KPI_LABELS_SINCE") or \
-            (datetime.strptime(cap, "%Y-%m-%d").date() - timedelta(days=4)).isoformat()
-        since = min(since, cap)
-        # portal workspace names (kpi_workspaces.name) — only push rows the KPI table knows
-        preq = urllib.request.Request(
-            purl.rstrip("/") + "/rest/v1/kpi_workspaces?select=name",
-            headers={"apikey": pkey, "Authorization": "Bearer " + pkey})
-        with urllib.request.urlopen(preq, timeout=30) as resp:
-            portal_names = {r["name"] for r in json.load(resp)}
-        slug_name = {r["slug"]: r["name"] for r in q(
-            f"SELECT slug, name FROM core.workspace WHERE slug IN {kws_in}")}
-        scoped2 = f"""
-            WITH b AS ({label_base})
-            SELECT * FROM b
-            WHERE ws IN {kws_in} AND d BETWEEN DATE '{since}' AND DATE '{cap}'
-              AND label IN ('opportunity','engagement','confused','not_interested','not interested')
-        """
-        lab = {(r["day"], r["ws"]): r for r in q(f"""
-            SELECT CAST(d AS VARCHAR) AS day, ws, COUNT(*) AS labeled,
-                   SUM(CASE WHEN label = 'opportunity' THEN 1 ELSE 0 END) AS opp,
-                   SUM(CASE WHEN label IN ('opportunity','engagement') THEN 1 ELSE 0 END) AS pos
-            FROM ({scoped2}) GROUP BY 1, 2""")}
-        nat = {(r["day"], r["ws"]): r for r in q(f"""
-            SELECT CAST(date AS VARCHAR) AS day, workspace_id AS ws,
-                   SUM(sent)::BIGINT AS sent, SUM(unique_replies)::BIGINT AS h,
-                   SUM(unique_replies_automatic)::BIGINT AS a
-            FROM raw_pipeline_campaign_daily_metrics
-            WHERE workspace_id IN {kws_in} AND date BETWEEN DATE '{since}' AND DATE '{cap}'
-            GROUP BY 1, 2""")}
-        wm = {r["day"]: r["wm"] for r in q(f"""
-            SELECT CAST(CAST(message_ts AS DATE) AS VARCHAR) AS day,
-                   CAST(MAX(labeled_at) AS VARCHAR) AS wm
-            FROM main.raw_reply_label_event
-            WHERE workspace_slug IN {kws_in}
-              AND CAST(message_ts AS DATE) BETWEEN DATE '{since}' AND DATE '{cap}'
-            GROUP BY 1""")}
-        push_rows, dropped = [], 0
-        all_days = sorted({d for d, _ in lab} | {d for d, _ in nat})
-        for dday in all_days:
-            tot_sent = sum(int(r["sent"] or 0) for (d, _), r in nat.items() if d == dday)
-            tot_h    = sum(int(r["h"] or 0)    for (d, _), r in nat.items() if d == dday)
-            tot_a    = sum(int(r["a"] or 0)    for (d, _), r in nat.items() if d == dday)
-            tot_lab  = sum(int(r["labeled"] or 0) for (d, _), r in lab.items() if d == dday)
-            reasons = []
-            if tot_sent <= 0: reasons.append("native sent=0")
-            if tot_h <= 0: reasons.append("native human=0")
-            if tot_lab <= 0: reasons.append("no labels")
-            if tot_sent >= 100_000 and (tot_h + tot_a) > 0.05 * tot_sent:
-                reasons.append(f"replies {tot_h+tot_a} > 5% of sent {tot_sent}")
-            w = wm.get(dday)
-            if not w or w[:10] <= dday: reasons.append(f"labeler watermark {w} not past day")
-            for slug in kpi_ws:
-                p_ = int((lab.get((dday, slug)) or {}).get("pos") or 0)
-                h_ = int((nat.get((dday, slug)) or {}).get("h") or 0)
-                if p_ > h_: reasons.append(f"{slug}: positives {p_} > human {h_}")
-            if reasons:
-                dropped += 1
-                log(f"KPI-LABELS GATE: skipping {dday}: " + " | ".join(reasons))
-                continue
-            for slug in kpi_ws:
-                name = slug_name.get(slug)
-                if name not in portal_names:
-                    continue
-                lr, nr = lab.get((dday, slug)), nat.get((dday, slug))
-                if not lr and not nr:
-                    continue
-                push_rows.append({"date": dday, "workspace": name,
-                                  "sent": int((nr or {}).get("sent") or 0),
-                                  "human_replies": int((nr or {}).get("h") or 0),
-                                  "positive": int((lr or {}).get("pos") or 0),
-                                  "opps_labeled": int((lr or {}).get("opp") or 0),
-                                  "updated_at": datetime.now(timezone.utc).isoformat(timespec="seconds")})
-        for i in range(0, len(push_rows), 500):
-            body2 = json.dumps(push_rows[i:i+500], default=str).encode()
-            req2 = urllib.request.Request(
-                purl.rstrip("/") + "/rest/v1/kpi_labels_daily?on_conflict=date,workspace",
-                data=body2, method="POST",
-                headers={"apikey": pkey, "Authorization": "Bearer " + pkey,
-                         "Content-Type": "application/json",
-                         "Prefer": "resolution=merge-duplicates,return=minimal"})
-            urllib.request.urlopen(req2, timeout=120).read()
-        print(f"  ok kpi_labels_daily upserted: {len(push_rows)} rows "
-              f"({since} → {cap}, {dropped} day(s) gate-skipped)")
-    except Exception as e:
-        log(f"WARN kpi-labels push failed (KPI tab falls back to provisional counts): {e}")
+              f"days={payload['scope']['days']}, modes={[m['mode'] for m in payload['day_meta']]}, "
+              f"HTTP {resp.status})")
 
 
 if __name__ == "__main__":
