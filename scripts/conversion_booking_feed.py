@@ -6,7 +6,7 @@ Conversion tab UI is retired; the feed lives on for the KPI columns + any consum
 
 METRIC CONTRACT (Sam cohort ruling 2026-07-17 — the 19-vs-20 problem):
   - opp_cohort  = distinct leads with an OPPORTUNITY LABEL EVENT whose reply falls on the
-                  day (main.raw_reply_label_event, append-only — a lead who later books
+                  day (label-event stream, append-only — a lead who later books
                   STILL counts; never a current-state count).
   - pos_cohort  = distinct leads with an opportunity OR engagement event that day.
   - opp_leads / opp_met = the day's opp cohort and, of it, leads with a meeting booked
@@ -23,7 +23,8 @@ DAY MODES (day_meta.mode):
   - 'ledger_provisional': completed sending day whose labels are still landing — the row
     carries the LEDGER cohort instead (opp_cohort/opp_leads = ever-marked-positive that
     day; opp_met = post-reply meetings of that cohort). Replaced in place by the labeled
-    row once the sweep completes. The KPIs tab renders these asterisked.
+    row once the sweep completes. The KPIs tab renders these days as '—' in the three
+    labeled columns (Sam labeled-only ruling 2026-07-17 — no provisional display).
 
 DAY-READINESS GATE [Sam-caught 2026-07-17 incident]: a day ships ONLY with complete native
 facts (sent>0, human>0; replies<=5% of sent when sent>=100k — low-send weekend days are
@@ -36,6 +37,18 @@ SCOPE: COMPLETED SENDING DAYS ONLY — cap = yesterday-ET, always. Override down
 BOOKING_CONV_MAX_DAY=YYYY-MM-DD; the cap can never exceed yesterday-ET.
 Workspaces: 5 funding slugs + warm-leads + renaissance-1 + the-gatekeepers (Max's —
 added 2026-07-17 for the KPI merge).
+
+LABEL SOURCE = ESCROW PARQUETS, NOT THE SNAPSHOT (Sam flaw-fix 2026-07-17): label-event
+data is read directly from the labeler's escrow parquets — the live daily stream UNION the
+alltime backfill, deduped on the table's uniqueness grain (message_ref_table,
+message_ref_id, labeler_version) — with the same current-state/cohort derivations the
+warehouse views encode (DDL 1111/1112 semantics, replicated in this session's queries).
+Sourcing labels from the local snapshot made every label update wait on a 107GB promote;
+escrow-direct decouples label freshness from promotes entirely (a day's finalization =
+sweep + parquet regen + feed refresh ≈ 3 min). Native denominators (sent / replies /
+meetings / ledger marks) STAY on the snapshot — they only change nightly, promote timing
+is fine for them. If no escrow parquet is readable the script falls back to the snapshot's
+main.raw_reply_label_event with a loud WARN (payload.label_source records which path ran).
 
 Runs inside refresh_portal_feed.sh (conductor job portal-feed-refresh, daily@07:30 UTC,
 plus later same-day reruns — the 07:30 run predates the nightly's facts for yesterday).
@@ -51,6 +64,12 @@ import duckdb
 
 DB = os.environ.get("CORE_DB_PATH", "/opt/duckdb/warehouse_current.duckdb")
 WORKER_ENV = os.environ.get("WORKER_ENV_FILE", "/root/renaissance-worker/.env")
+# Escrow parquets = the label-event truth at labeler freshness (env names match the
+# reply_label_event entity's override convention; ⚠ REHOME with /root/mof ~2026-07-25).
+ESCROW_DAILY = os.environ.get("REPLY_LABEL_ESCROW_PARQUET",
+                              "/root/mof/labeling/backfill/escrow/events.parquet")
+ESCROW_ALLTIME = os.environ.get("REPLY_LABEL_ESCROW_ALLTIME_PARQUET",
+                                "/root/mof/labeling/backfill_alltime/escrow/events.parquet")
 FULL_READ_THROUGH = "2026-07-14"   # R18 boundary: <= this day = full-read; after = positive-slice
 MIN_DAY = "2026-07-14"             # R11 floor: first fully-covered presentable day
 SLICE_COMPLETE = 0.90              # labeled share of the day's ledger positive cohort => labels complete
@@ -114,21 +133,45 @@ def main() -> None:
     ws_names = {r["slug"]: r["name"] for r in q(f"SELECT slug, name FROM core.workspace WHERE slug IN {WS_IN}")}
     led_to_slug = {ledger_ws_key(name): slug for slug, name in ws_names.items()}
 
+    # ── label-event source: escrow parquets (labeler-fresh), snapshot table as fallback ──
+    escrow = [p for p in (ESCROW_DAILY, ESCROW_ALLTIME) if os.path.isfile(p)]
+    if escrow:
+        if len(escrow) < 2:
+            log(f"WARN only {len(escrow)}/2 escrow parquets readable ({escrow}) — proceeding with what exists")
+        files = ", ".join("'" + p + "'" for p in escrow)
+        # dedup on the event uniqueness grain (DDL 1110); rows are append-only and identical
+        # across escrows when both carry a key — labeled_at DESC is a deterministic tiebreak
+        ev_table = (f"(SELECT * FROM read_parquet([{files}], union_by_name=true) "
+                    "QUALIFY row_number() OVER (PARTITION BY message_ref_table, message_ref_id, "
+                    "labeler_version ORDER BY labeled_at DESC) = 1)")
+        label_source = "escrow_parquet"
+        have_events = True
+    elif exists("main", "raw_reply_label_event"):
+        log("WARN no escrow parquet readable — FALLING BACK to snapshot main.raw_reply_label_event "
+            "(label freshness re-coupled to promotes until escrow returns)")
+        ev_table = "main.raw_reply_label_event"
+        label_source = "warehouse_snapshot_fallback"
+        have_events = True
+    else:
+        ev_table = None
+        label_source = None
+        have_events = False
+
     payload: dict = {
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "snapshot_id": os.path.basename(os.path.realpath(DB)),
         "status": "pending_labels",
         "grain": "day_x_workspace",
         "cohort_basis": "label_events",          # v3: append-only event cohorts (Sam ruling 07-17)
+        "label_source": label_source,            # escrow_parquet | warehouse_snapshot_fallback
         "labeler_version": None,
         "scope": {"mode": "completed_days_only", "max_day": cap, "days": []},
         "day_meta": [], "rows": [],
     }
 
-    have_events = exists("main", "raw_reply_label_event")
     have_ledger = table_known("raw_comms_instantly_lead_state_event")
     if not have_events:
-        log("raw_reply_label_event missing from snapshot — upserting pending_labels state")
+        log("no escrow parquets AND raw_reply_label_event missing from snapshot — upserting pending_labels state")
 
     rows: list[dict] = []
     day_meta_out: list[dict] = []
@@ -145,11 +188,11 @@ def main() -> None:
             FROM raw_pipeline_campaign_daily_metrics
             WHERE workspace_id IN {WS_IN} AND CAST(date AS DATE) {rng}
             GROUP BY 1, 2""")}
-        # ── label events: append-only cohorts + current-state lineage counts ────────
+        # ── label events (escrow-fresh): append-only cohorts + current-state lineage ────
         ev_base = f"""
             SELECT DISTINCT workspace_slug AS ws, lower(lead_email) AS le,
                    CAST(message_ts AS DATE) AS d, lower(CAST(label AS VARCHAR)) AS label
-            FROM main.raw_reply_label_event
+            FROM {ev_table} ev
             WHERE workspace_slug IN {WS_IN} AND CAST(message_ts AS DATE) {rng}
               AND lower(CAST(label AS VARCHAR)) IN {LABELS_IN}
         """
@@ -157,7 +200,7 @@ def main() -> None:
             SELECT workspace_slug AS ws, lower(lead_email) AS le,
                    CAST(message_ts AS DATE) AS d,
                    lower(CAST(label AS VARCHAR)) AS label, labeler_version
-            FROM main.raw_reply_label_event
+            FROM {ev_table} ev
             WHERE workspace_slug IN {WS_IN} AND CAST(message_ts AS DATE) {rng}
               AND lower(CAST(label AS VARCHAR)) IN {LABELS_IN}
             QUALIFY row_number() OVER (PARTITION BY workspace_slug, lower(lead_email),
@@ -194,7 +237,7 @@ def main() -> None:
         wm = {r["day"]: r["wm"] for r in q(f"""
             SELECT CAST(CAST(message_ts AS DATE) AS VARCHAR) AS day,
                    CAST(MAX(labeled_at) AS VARCHAR) AS wm
-            FROM main.raw_reply_label_event
+            FROM {ev_table} ev
             WHERE workspace_slug IN {WS_IN} AND CAST(message_ts AS DATE) {rng}
             GROUP BY 1""")}
         # ── ledger: never-decrementing Instantly positive marks (provisional cohorts) ──
