@@ -1,5 +1,23 @@
 """Push the booking-site conversion feed — portal Supabase dashboard_feeds key='conversion'.
 
+v5 (MOF-19 period rollups + eng/conf conversion surface, 2026-07-18) — ADDITIVE ONLY,
+existing consumers untouched:
+  * day rows gain eng_cohort / conf_cohort (append-only event cohorts for engagement
+    resp. confused — same convention as opp_cohort: DISTINCT leads with a label EVENT
+    whose reply falls on the day). None outside labeled modes, like the other cohorts.
+  * NEW top-level keys "weekly" (ISO week Mon-Sun) and "monthly" (calendar month):
+    ORG-level rollups of the emitted day rows for the tab's trend surface. Label
+    columns obey the 100%-or-wipe period gate — they ship ONLY when EVERY calendar
+    day of the FULL period is covered by a label-sound day mode, else None (never a
+    partially-summed label count). Native sums cover the period's covered days with
+    days_covered/days_in_period for honesty. X_to_booked = meetings-in-period ÷
+    period X-cohort (R38 simple-ratio lag-mismatch convention, Sam 2026-07-17;
+    >100% possible by design). meetings here = the feed's v_meeting_truth meetings
+    key (warehouse-consistent, DDL 1138), NOT the kpi-chain bookings. These are
+    ANALYSIS surfaces, not targets — no secondary IM targets derive from eng/conf.
+    Canonical warehouse home of the period semantics = core.v_kpi_weekly /
+    core.v_kpi_monthly (DDL 1138); this feed stays escrow-direct for label freshness.
+
 v4 (R36 all-sound-history backfill, 2026-07-17): the feed now emits ALL SOUND HISTORY
 (day x workspace) — not just recent days — so the KPIs tab computes every range preset
 by summing day rows and never mixes coverages (the MTD-bug class: 3 days of labeled opps
@@ -316,7 +334,9 @@ def main() -> None:
         coh = {(r["day"], r["ws"]): r for r in q(f"""
             SELECT CAST(d AS VARCHAR) AS day, ws,
                    COUNT(DISTINCT CASE WHEN label = 'opportunity' THEN le END) AS opp_cohort,
-                   COUNT(DISTINCT CASE WHEN label IN ('opportunity','engagement') THEN le END) AS pos_cohort
+                   COUNT(DISTINCT CASE WHEN label IN ('opportunity','engagement') THEN le END) AS pos_cohort,
+                   COUNT(DISTINCT CASE WHEN label = 'engagement' THEN le END) AS eng_cohort,
+                   COUNT(DISTINCT CASE WHEN label = 'confused' THEN le END) AS conf_cohort
             FROM ({ev_base}) GROUP BY 1, 2""")}
         meeting_leads = ("SELECT DISTINCT lower(lead_email) AS le, meeting_date "
                         "FROM core.v_meeting_truth "
@@ -472,6 +492,8 @@ def main() -> None:
                             "ni": int((lc or {}).get("ni") or 0),
                             "opp_cohort": int((cc or {}).get("opp_cohort") or 0),
                             "pos_cohort": int((cc or {}).get("pos_cohort") or 0),
+                            "eng_cohort": int((cc or {}).get("eng_cohort") or 0),
+                            "conf_cohort": int((cc or {}).get("conf_cohort") or 0),
                             "opp_leads": int((om_ or {}).get("opp_leads") or 0),
                             "opp_met": int((om_ or {}).get("opp_met") or 0),
                             "meetings": mtg.get((dday, slug), 0),
@@ -496,6 +518,7 @@ def main() -> None:
                             "native_opps": int((nr or {}).get("native_opps") or 0),
                             "labeled": None, "opp": None, "eng": None, "conf": None, "ni": None,
                             "opp_cohort": lcoh, "pos_cohort": None,
+                            "eng_cohort": None, "conf_cohort": None,
                             "opp_leads": lcoh,
                             "opp_met": min(int((lr or {}).get("led_met") or 0), lcoh),
                             "meetings": mtg.get((dday, slug), 0),
@@ -548,6 +571,8 @@ def main() -> None:
                         "ni": int((lc or {}).get("ni") or 0) if labeled_mode else None,
                         "opp_cohort": int((cc or {}).get("opp_cohort") or 0) if labeled_mode else None,
                         "pos_cohort": int((cc or {}).get("pos_cohort") or 0) if labeled_mode else None,
+                        "eng_cohort": int((cc or {}).get("eng_cohort") or 0) if labeled_mode else None,
+                        "conf_cohort": int((cc or {}).get("conf_cohort") or 0) if labeled_mode else None,
                         "opp_leads": int((om_ or {}).get("opp_leads") or 0) if labeled_mode else None,
                         "opp_met": int((om_ or {}).get("opp_met") or 0) if labeled_mode else None,
                         "meetings": mg,
@@ -592,6 +617,8 @@ def main() -> None:
                         "ni": int((lc or {}).get("ni") or 0),
                         "opp_cohort": int((cc or {}).get("opp_cohort") or 0),
                         "pos_cohort": int((cc or {}).get("pos_cohort") or 0),
+                        "eng_cohort": int((cc or {}).get("eng_cohort") or 0),
+                        "conf_cohort": int((cc or {}).get("conf_cohort") or 0),
                         "opp_leads": int((om_ or {}).get("opp_leads") or 0),
                         "opp_met": int((om_ or {}).get("opp_met") or 0),
                         "meetings": mtg.get((ev_day, slug), 0),
@@ -603,6 +630,65 @@ def main() -> None:
                 payload["scope"]["max_day"] = ev_day
                 payload["scope"]["evening_day"] = ev_day
                 log(f"EVENING day {ev_day} shipped (coverage={cov_pct}, labeled={ev_lab})")
+
+        # ── v5: ORG-level ISO-week / calendar-month rollups of the emitted rows ──
+        # (additive "weekly"/"monthly" payload keys; label columns 100%-or-wipe at
+        # period grain — see the v5 docstring block for the full contract)
+        def period_rollups(kind: str) -> list[dict]:
+            sound_modes = {"full_read", "positive_slice", "backfill_slice", "evening_complete"}
+            mode_by_day = {m["day"]: m["mode"] for m in day_meta_out}
+            max_day = payload["scope"].get("max_day") or cap
+
+            def p_start(ds: str) -> str:
+                if kind == "monthly":
+                    return ds[:8] + "01"
+                d0 = datetime.fromisoformat(ds).date()
+                return (d0 - timedelta(days=d0.weekday())).isoformat()  # ISO Monday
+
+            def p_end(ps: str) -> str:
+                d0 = datetime.fromisoformat(ps).date()
+                if kind == "weekly":
+                    return (d0 + timedelta(days=6)).isoformat()
+                nxt = (d0.replace(day=28) + timedelta(days=4)).replace(day=1)
+                return (nxt - timedelta(days=1)).isoformat()
+
+            per: dict = {}
+            for r in rows:
+                p = per.setdefault(p_start(r["day"]), {
+                    "sent": 0, "replies_human": 0, "replies_auto": 0, "meetings": 0,
+                    "opp_cohort": 0, "pos_cohort": 0, "eng_cohort": 0, "conf_cohort": 0})
+                p["sent"] += int(r.get("sent") or 0)
+                p["replies_human"] += int(r.get("replies_human") or 0)
+                p["replies_auto"] += int(r.get("replies_auto") or 0)
+                p["meetings"] += int(r.get("meetings") or 0)
+                if mode_by_day.get(r["day"]) in sound_modes:
+                    for kk in ("opp_cohort", "pos_cohort", "eng_cohort", "conf_cohort"):
+                        p[kk] += int(r.get(kk) or 0)
+            out: list[dict] = []
+            for ps in sorted(per):
+                pe = p_end(ps)
+                d0 = datetime.fromisoformat(ps).date()
+                d1 = datetime.fromisoformat(pe).date()
+                cal_days = [(d0 + timedelta(days=i)).isoformat() for i in range((d1 - d0).days + 1)]
+                n_cov = sum(1 for x in cal_days if x in mode_by_day)
+                n_sound = sum(1 for x in cal_days if mode_by_day.get(x) in sound_modes)
+                labels_complete = n_sound == len(cal_days)   # EVERY calendar day label-sound
+                p = per[ps]
+                e: dict = {"start": ps, "end": pe,
+                           "days_in_period": len(cal_days), "days_covered": n_cov,
+                           "days_label_sound": n_sound,
+                           "complete": pe <= max_day, "labels_complete": labels_complete,
+                           "sent": p["sent"], "replies_human": p["replies_human"],
+                           "replies_auto": p["replies_auto"], "meetings": p["meetings"],
+                           "kpi": round(p["sent"] / p["meetings"]) if p["meetings"] > 0 and p["sent"] > 0 else None}
+                for kk in ("opp_cohort", "pos_cohort", "eng_cohort", "conf_cohort"):
+                    e[kk] = p[kk] if labels_complete else None
+                for num, den in (("opp_to_booked", "opp_cohort"), ("eng_to_booked", "eng_cohort"),
+                                 ("conf_to_booked", "conf_cohort")):
+                    e[num] = (round(p["meetings"] / p[den], 4)
+                              if labels_complete and p[den] > 0 else None)
+                out.append(e)
+            return out
 
         if days_out:
             try:
@@ -616,6 +702,8 @@ def main() -> None:
                 "scope": {**payload["scope"], "days": days_out},
                 "day_meta": day_meta_out,
                 "rows": rows,
+                "weekly": period_rollups("weekly"),     # v5 additive keys
+                "monthly": period_rollups("monthly"),
             })
         else:
             log(f"no presentable days within cap {cap}")
