@@ -241,6 +241,41 @@ class InstantlyClient:
             return payload.get("items") or []
         return []
 
+    def account_daily_analytics(
+        self, emails: list[str], start_date: str, end_date: str
+    ) -> list[dict]:
+        """`GET /accounts/analytics/daily?emails=<csv>&start_date=&end_date=` —
+        per-ACCOUNT day-grain metrics (the sibling of campaign_analytics_daily at
+        account grain). Returns a bare list of one object per (account, active-day):
+          date, email_account, sent, bounced, contacted, new_leads_contacted,
+          opened, unique_opened, replies, unique_replies, replies_automatic,
+          unique_replies_automatic, clicks, unique_clicks.
+        `unique_replies` = HUMAN (per-lead dedup); `unique_replies_automatic` = AUTO.
+
+        MUST be chunked by the `emails` filter. The whole-workspace pull (no emails)
+        413s once a workspace exceeds ~a few hundred accounts — "Payload Too Large:
+        add an emails filter or request a smaller date range". The cap is account-COUNT
+        (payload size), NOT date-range: even a single day 413s at workspace scope, and
+        413 is NOT ret/split-able. Verified live 2026-07-18: renaissance-1 @ 13,607
+        accounts whole-workspace 413s; emails-filtered batches of 200 return 200, 500
+        413s. Callers pass batches of <=100 (entities/instantly_account_daily.py);
+        a single filtered request may span the whole window (one row per account per day).
+        """
+        if not emails:
+            return []
+        params = {
+            "emails": ",".join(emails),
+            "start_date": start_date,
+            "end_date": end_date,
+        }
+        payload = self._get("/accounts/analytics/daily", params=params)
+        if isinstance(payload, list):
+            return payload
+        # Defensive: some deployments wrap the array in {items:[...]} / {daily:[...]}.
+        if isinstance(payload, dict):
+            return payload.get("items") or payload.get("daily") or []
+        return []
+
     def received_emails(
         self,
         since: str | None = None,
