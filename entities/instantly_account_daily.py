@@ -165,30 +165,48 @@ def _fetch_workspace(client: InstantlyClient, slug: str, start: str, end: str) -
     return rows
 
 
+# Upsert this many rows per transaction. A single transaction over a whole big workspace
+# (funding-4 ~85k accounts -> ~238k day-rows on a wide window) accumulated enough index/MVCC
+# state to OOM the writer at the ~15GB memory_limit; committing in bounded batches caps each
+# transaction's footprint (the nightly's 3-day window is smaller, but the backfill is not).
+_WRITE_BATCH = 20_000
+
+
 def _write_workspace(conn, slug: str, rows: list[dict], now, run_id: str) -> int:
-    """Upsert one workspace's fetched rows in a single transaction. Returns row count."""
-    conn.execute("BEGIN")
-    try:
-        written = 0
-        for item in rows:
-            em = (item.get("email_account") or "").strip().lower()
-            d = str(item.get("date", ""))[:10]
-            if not em or not d:
-                continue
-            domain = em.split("@", 1)[1] if "@" in em else None
-            conn.execute(
-                _UPSERT,
-                [
-                    em, d, slug, domain, item.get("_provider_group"),
-                    *[_int_or_none(item.get(f)) for f in _METRIC_FIELDS],
-                    now, now, run_id,
-                ],
-            )
-            written += 1
-        conn.execute("COMMIT")
-    except Exception:
-        conn.execute("ROLLBACK")
-        raise
+    """Upsert one workspace's fetched rows in bounded per-batch transactions. Returns the
+    total rows written. `_flush` owns commit + tally + clear so the count can't drift from
+    what was committed."""
+    written = 0
+    batch: list[list] = []
+
+    def _flush() -> None:
+        nonlocal written
+        if not batch:
+            return
+        conn.execute("BEGIN")
+        try:
+            conn.executemany(_UPSERT, batch)
+            conn.execute("COMMIT")
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+        written += len(batch)
+        batch.clear()
+
+    for item in rows:
+        em = (item.get("email_account") or "").strip().lower()
+        d = str(item.get("date", ""))[:10]
+        if not em or not d:
+            continue
+        domain = em.split("@", 1)[1] if "@" in em else None
+        batch.append([
+            em, d, slug, domain, item.get("_provider_group"),
+            *[_int_or_none(item.get(f)) for f in _METRIC_FIELDS],
+            now, now, run_id,
+        ])
+        if len(batch) >= _WRITE_BATCH:
+            _flush()
+    _flush()
     return written
 
 
