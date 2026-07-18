@@ -49,10 +49,12 @@ METRIC CONTRACT (Sam cohort ruling 2026-07-17 — the 19-vs-20 problem):
   - Denominators stay native Instantly daily facts (sent / unique_replies / auto).
 
 DAY MODES (day_meta.mode): full_read | positive_slice | ledger_provisional (v3, live path)
-  + backfill_slice | pre_boundary | backfill_assert_failed (v4, history). Live-path mode
-  semantics are unchanged from v3 (see git history for the full v3 docstring);
-  'ledger_provisional' days render '—' in the labeled columns (Sam labeled-only ruling
-  2026-07-17 — no provisional display).
+  + backfill_slice | pre_boundary | backfill_assert_failed (v4, history)
+  + evening_complete (v4.1, R37: the just-closed UTC day, labeled by the evening pass —
+  marker-gated, natives from the live pipeline mirror; label-sound for the tab; tops up
+  via morning re-sweeps). Live-path mode semantics are unchanged from v3 (see git
+  history for the full v3 docstring); 'ledger_provisional' days render '—' in the
+  labeled columns (Sam labeled-only ruling 2026-07-17 — no provisional display).
 
 DAY-READINESS GATE [Sam-caught 2026-07-17 incident]: live-path days ship ONLY with
 complete native facts (sent>0, human>0; replies<=5% of sent when sent>=100k). History
@@ -102,6 +104,17 @@ LIVE_PATH_FROM = "2026-07-14"      # >= this day: the v3 live pipeline verbatim 
 LABEL_SOUND_FROM = "2026-05-15"    # R36 measured boundary: labels sound from here (see docstring)
 NATIVE_MIN_DAY_DEFAULT = "2024-01-15"  # 1105 API-restatement floor (earliest stitched day)
 SLICE_COMPLETE = 0.90              # labeled share of the day's ledger positive cohort => labels complete
+# R37 (Sam 2026-07-17): same-day evening completeness. The evening pass (daily_v2/
+# evening_pass.py, 00:05Z) labels the JUST-CLOSED UTC day and writes a marker with its
+# live coverage + live per-workspace natives (pipeline campaign_daily_metrics — the same
+# lineage as the raw_pipeline mirror the live path reads). A marker day with
+# complete=true ships as mode='evening_complete' (the tab treats it as label-sound and
+# includes it in range coverage). Later marks/replies top up via the morning pass +
+# re-sweeps (append-only — counts only grow). Marker natives also BACKSTOP the live-path
+# day gate overnight (the snapshot's raw_pipeline mirror lags the nightly; without the
+# backstop the day would flap out of the feed between midnight ET and the nightly).
+EVENING_MARKER_DIR = os.environ.get("BOOKING_CONV_EVENING_DIR",
+                                    "/root/mof/labeling/daily_v2/evening")
 
 # 8 workspaces (Sam 2026-07-17: +the-gatekeepers for the KPI merge)
 FUNDING_WS = ('renaissance-2', 'renaissance-4', 'renaissance-5',
@@ -210,9 +223,30 @@ def main() -> None:
     day_meta_out: list[dict] = []
     days_out: list[str] = []
 
+    # ── R37 evening markers: {day: marker} for complete markers within the recent window ──
+    markers: dict = {}
+    try:
+        if os.path.isdir(EVENING_MARKER_DIR):
+            for fn in os.listdir(EVENING_MARKER_DIR):
+                if not fn.endswith(".json") or fn.startswith("."):
+                    continue
+                d = fn[:-5]
+                lo = (datetime.fromisoformat(cap) - timedelta(days=3)).date().isoformat()
+                hi_ok = (datetime.fromisoformat(cap) + timedelta(days=1)).date().isoformat()
+                if not (lo <= d <= hi_ok):
+                    continue
+                with open(os.path.join(EVENING_MARKER_DIR, fn)) as fh:
+                    m = json.load(fh)
+                if m.get("complete") and m.get("day") == d and m.get("natives"):
+                    markers[d] = m
+    except Exception as e:
+        log(f"WARN evening marker scan failed (ignored): {e}")
+    ev_day = next((d for d in sorted(markers, reverse=True) if d > cap), None)
+    hi = ev_day or cap
+
     if have_events:
-        rng = f"BETWEEN DATE '{LIVE_PATH_FROM}' AND DATE '{cap}'"        # live path (v3, frozen)
-        rng_lab = f"BETWEEN DATE '{LABEL_SOUND_FROM}' AND DATE '{cap}'"  # label-sound span (v4)
+        rng = f"BETWEEN DATE '{LIVE_PATH_FROM}' AND DATE '{hi}'"         # live path (v3, frozen) + evening day labels
+        rng_lab = f"BETWEEN DATE '{LABEL_SOUND_FROM}' AND DATE '{hi}'"   # label-sound span (v4)
         # ── native Instantly daily facts (denominators) ─────────────────────────────
         # live path (>= LIVE_PATH_FROM): raw_pipeline verbatim (v3 regression-frozen);
         # history (< LIVE_PATH_FROM): core.v_sends_truth_daily MAX-stitch restatement.
@@ -246,7 +280,7 @@ def main() -> None:
             FROM core.v_meeting_truth mt
             LEFT JOIN campdim cd ON cd.campaign_id = mt.campaign_id
             WHERE mt.channel_norm = 'Email' AND mt.is_ours AND mt.meeting_date IS NOT NULL
-              AND mt.meeting_date BETWEEN DATE '{min_day}' AND DATE '{cap}'
+              AND mt.meeting_date BETWEEN DATE '{min_day}' AND DATE '{hi}'
               AND COALESCE(NULLIF(mt.workspace_slug, ''), cd.ws_slug) IN {WS_IN}
             GROUP BY 1, 2""")} if exists("core", "v_meeting_truth") else {}
         # ── label events (escrow-fresh): append-only cohorts + current-state lineage ────
@@ -361,8 +395,9 @@ def main() -> None:
             log("ledger table missing — label-incomplete days will be omitted, not provisional")
 
         # ── per-day gate + mode + row assembly ──────────────────────────────────────
-        all_days = sorted({d for d, _ in nat} | {d for d, _ in nat_hist} | {d for d, _ in coh}
-                          | {d for d, _ in led} | {d for d, _ in mtg if d < LIVE_PATH_FROM})
+        all_days = sorted(d for d in ({d for d, _ in nat} | {d for d, _ in nat_hist}
+                          | {d for d, _ in coh} | {d for d, _ in led}
+                          | {d for d, _ in mtg if d < LIVE_PATH_FROM}) if d <= cap)
         for dday in all_days:
             if dday >= LIVE_PATH_FROM:
                 # ═══ LIVE PATH — v3 verbatim (regression-frozen) ═══
@@ -375,6 +410,23 @@ def main() -> None:
                 if tot_h <= 0: reasons.append("native human replies=0 — nightly facts not loaded yet")
                 if tot_sent >= 100_000 and (tot_h + tot_a) > 0.05 * tot_sent:
                     reasons.append(f"replies {tot_h+tot_a} > 5% of sent {tot_sent} — implausible")
+                if reasons and dday in markers:
+                    # R37 marker backstop: the snapshot's raw_pipeline mirror lags the
+                    # nightly — an evening-completed day must not flap out overnight.
+                    for slug, nv in (markers[dday].get("natives") or {}).items():
+                        nat[(dday, slug)] = {"day": dday, "ws": slug,
+                                             "sent": nv.get("sent"), "h": nv.get("h"),
+                                             "a": nv.get("a"),
+                                             "native_opps": nv.get("native_opps")}
+                    tot_sent = sum(int(r["sent"] or 0) for (d, _), r in nat.items() if d == dday)
+                    tot_h    = sum(int(r["h"] or 0)    for (d, _), r in nat.items() if d == dday)
+                    tot_a    = sum(int(r["a"] or 0)    for (d, _), r in nat.items() if d == dday)
+                    reasons = []
+                    if tot_sent <= 0: reasons.append("marker natives sent=0")
+                    if tot_h <= 0: reasons.append("marker natives human=0")
+                    if not reasons:
+                        log(f"DAY {dday}: native facts from EVENING MARKER (snapshot mirror "
+                            f"not loaded yet — R37 backstop)")
                 if reasons:
                     log(f"DAY GATE: DROPPING {dday}: " + " | ".join(reasons))
                     continue
@@ -504,6 +556,54 @@ def main() -> None:
             day_meta_out.append({"day": dday, "mode": mode,
                                  "slice_cov": round(slice_cov, 3) if slice_cov is not None else None})
 
+        # ═══ R37 EVENING DAY (> cap): marker natives + evening-pass labels ═══
+        if ev_day:
+            m = markers[ev_day]
+            mnat = m.get("natives") or {}
+            a_reasons = []
+            for slug in FUNDING_WS:
+                lc, nv = labc.get((ev_day, slug)), mnat.get(slug)
+                pos = int((lc or {}).get("opp") or 0) + int((lc or {}).get("eng") or 0)
+                if pos > int((nv or {}).get("h") or 0):
+                    a_reasons.append(f"{slug}: positives {pos} > human {(nv or {}).get('h')}")
+            ev_lab = sum(int((labc.get((ev_day, s)) or {}).get("labeled") or 0) for s in FUNDING_WS)
+            if a_reasons:
+                log(f"EVENING GATE: DROPPING {ev_day}: " + " | ".join(a_reasons))
+            elif ev_lab <= 0:
+                log(f"EVENING GATE: DROPPING {ev_day}: marker complete but no label events "
+                    f"visible in escrow (regen race?)")
+            else:
+                for slug in FUNDING_WS:
+                    nv = mnat.get(slug)
+                    lc = labc.get((ev_day, slug)); cc = coh.get((ev_day, slug))
+                    om_ = omv.get((ev_day, slug))
+                    if not (nv or lc or cc):
+                        continue
+                    rows.append({
+                        "day": ev_day, "ws": slug, "name": ws_names.get(slug, slug),
+                        "sent": int((nv or {}).get("sent") or 0),
+                        "replies_human": int((nv or {}).get("h") or 0),
+                        "replies_auto": int((nv or {}).get("a") or 0),
+                        "native_opps": int((nv or {}).get("native_opps") or 0),
+                        "labeled": int((lc or {}).get("labeled") or 0),
+                        "opp": int((lc or {}).get("opp") or 0),
+                        "eng": int((lc or {}).get("eng") or 0),
+                        "conf": int((lc or {}).get("conf") or 0),
+                        "ni": int((lc or {}).get("ni") or 0),
+                        "opp_cohort": int((cc or {}).get("opp_cohort") or 0),
+                        "pos_cohort": int((cc or {}).get("pos_cohort") or 0),
+                        "opp_leads": int((om_ or {}).get("opp_leads") or 0),
+                        "opp_met": int((om_ or {}).get("opp_met") or 0),
+                        "meetings": mtg.get((ev_day, slug), 0),
+                    })
+                days_out.append(ev_day)
+                cov_pct = ((m.get("coverage") or {}).get("pct"))
+                day_meta_out.append({"day": ev_day, "mode": "evening_complete",
+                                     "slice_cov": cov_pct})
+                payload["scope"]["max_day"] = ev_day
+                payload["scope"]["evening_day"] = ev_day
+                log(f"EVENING day {ev_day} shipped (coverage={cov_pct}, labeled={ev_lab})")
+
         if days_out:
             try:
                 ver = q(f"SELECT MAX(labeler_version) AS ver FROM ({cur_state})")[0]["ver"]
@@ -512,7 +612,8 @@ def main() -> None:
             payload.update({
                 "status": "ok",
                 "labeler_version": ver,
-                "scope": {**payload["scope"], "max_day": cap, "days": days_out},
+                # scope.max_day already = cap, or the evening day when one shipped (R37)
+                "scope": {**payload["scope"], "days": days_out},
                 "day_meta": day_meta_out,
                 "rows": rows,
             })
