@@ -322,6 +322,15 @@ def run_pipeline_mirror(ctx: RunContext) -> PhaseResult:
     INBOX_FED = {
         "campaigns", "campaign_data", "campaign_daily_metrics",
         "variant_copy", "bounce_suppression",
+        # [2026-07-18 wave-2] reply_data + lead_events: the CF worker
+        # data-pipeline-webhooks now lands webhook rows in D1 (webhook-ingest,
+        # WEBHOOK_SINK_BACKEND=d1) and the droplet job
+        # /root/renaissance-worker/jobs/webhook-d1-export/export_d1_inbox.py
+        # drains D1 -> /root/warehouse-inbox hourly (ids offset +1e10 to avoid
+        # colliding with legacy Supabase ids). Final legacy pull + watermark
+        # boundary documented in deliverables/2026-07-18-supabase-retirement-wave2/
+        # LOG.md (Renaissance). D1-vs-Supabase parity proven 2026-07-18.
+        "reply_data", "lead_events",
     }
     _unknown_fed = INBOX_FED - SPECS.keys()
     if _unknown_fed:
