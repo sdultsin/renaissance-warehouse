@@ -83,7 +83,7 @@ def run_no_show_campaign_member(ctx: RunContext) -> PhaseResult:
                    CAST(load_source AS VARCHAR)             AS load_source
             FROM _nscm_raw
             WHERE origin IS NOT NULL AND trim(CAST(origin AS VARCHAR)) <> ''
-              AND campaign_id IS NOT NULL
+              AND campaign_id IS NOT NULL AND trim(CAST(campaign_id AS VARCHAR)) <> ''
               AND lead_email IS NOT NULL AND trim(CAST(lead_email AS VARCHAR)) <> ''
         )
         QUALIFY row_number() OVER (
