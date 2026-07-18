@@ -173,11 +173,14 @@ _WRITE_BATCH = 20_000
 
 
 def _write_workspace(conn, slug: str, rows: list[dict], now, run_id: str) -> int:
-    """Upsert one workspace's fetched rows in bounded per-batch transactions. Returns count."""
+    """Upsert one workspace's fetched rows in bounded per-batch transactions. Returns the
+    total rows written. `_flush` owns commit + tally + clear so the count can't drift from
+    what was committed."""
     written = 0
     batch: list[list] = []
 
     def _flush() -> None:
+        nonlocal written
         if not batch:
             return
         conn.execute("BEGIN")
@@ -187,6 +190,8 @@ def _write_workspace(conn, slug: str, rows: list[dict], now, run_id: str) -> int
         except Exception:
             conn.execute("ROLLBACK")
             raise
+        written += len(batch)
+        batch.clear()
 
     for item in rows:
         em = (item.get("email_account") or "").strip().lower()
@@ -201,10 +206,7 @@ def _write_workspace(conn, slug: str, rows: list[dict], now, run_id: str) -> int
         ])
         if len(batch) >= _WRITE_BATCH:
             _flush()
-            written += len(batch)
-            batch.clear()
     _flush()
-    written += len(batch)
     return written
 
 
