@@ -63,18 +63,28 @@ def run_no_show_campaign_member(ctx: RunContext) -> PhaseResult:
         """
         CREATE OR REPLACE TEMP TABLE _nscm_stage AS
         SELECT * FROM (
-            SELECT origin,
-                   campaign_id,
-                   coalesce(source_tab, '')  AS source_tab,
-                   lower(trim(lead_email))    AS lead_email,
-                   campaign_name, partner, bucket,
-                   first_name, last_name, company_name, phone,
-                   lead_status, rg_status, lead_id, ts_created, ts_updated,
-                   payload, load_source
+            -- read_json_auto infers UUID-shaped strings (campaign_id, lead_id) as UUID;
+            -- CAST every column to its target type up front so type inference can never
+            -- break the guard/insert (trim(UUID) etc.).
+            SELECT CAST(origin AS VARCHAR)                  AS origin,
+                   CAST(campaign_id AS VARCHAR)             AS campaign_id,
+                   coalesce(CAST(source_tab AS VARCHAR), '') AS source_tab,
+                   lower(trim(CAST(lead_email AS VARCHAR)))  AS lead_email,
+                   CAST(campaign_name AS VARCHAR)           AS campaign_name,
+                   CAST(partner AS VARCHAR)                 AS partner,
+                   CAST(bucket AS VARCHAR)                  AS bucket,
+                   CAST(first_name AS VARCHAR)              AS first_name,
+                   CAST(last_name AS VARCHAR)               AS last_name,
+                   CAST(company_name AS VARCHAR)            AS company_name,
+                   CAST(phone AS VARCHAR)                   AS phone,
+                   lead_status, rg_status,
+                   CAST(lead_id AS VARCHAR)                 AS lead_id,
+                   ts_created, ts_updated, payload,
+                   CAST(load_source AS VARCHAR)             AS load_source
             FROM _nscm_raw
-            WHERE origin IS NOT NULL AND trim(origin) <> ''
-              AND campaign_id IS NOT NULL AND trim(campaign_id) <> ''
-              AND lead_email IS NOT NULL AND trim(lead_email) <> ''
+            WHERE origin IS NOT NULL AND trim(CAST(origin AS VARCHAR)) <> ''
+              AND campaign_id IS NOT NULL AND trim(CAST(campaign_id AS VARCHAR)) <> ''
+              AND lead_email IS NOT NULL AND trim(CAST(lead_email AS VARCHAR)) <> ''
         )
         QUALIFY row_number() OVER (
             PARTITION BY origin, campaign_id, source_tab, lead_email
