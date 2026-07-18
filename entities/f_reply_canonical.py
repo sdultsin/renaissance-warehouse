@@ -214,12 +214,23 @@ def run(ctx: RunContext) -> PhaseResult:
         WITH pipe AS (
             SELECT
                 lower(trim(p.lead_email))                       AS lead_email,
-                p.campaign_id, p.workspace_id, p.step,
+                p.campaign_id,
+                -- campaign->workspace fallback (ticket 2026-07-18): reply workspace_id is
+                -- payload-carried and ~6% land NULL despite a resolvable campaign.
+                -- v_campaign_dim_unified is slug-encoded (matches the pipeline reply
+                -- encoding) and unique on campaign_id, so no fan-out.
+                COALESCE(p.workspace_id, cdu.workspace_slug)    AS workspace_id,
+                p.step,
                 CAST(p.variant AS VARCHAR)                      AS variant,
                 p.subject, p.reply_text, p.reply_timestamp,
                 {auto_sql}                                      AS is_auto_reply,
                 {unsub_sql}                                     AS is_unsubscribe
             FROM raw_pipeline_reply_data p
+            -- cdu pre-deduped to 1 row/campaign_id -> the LEFT JOIN is fan-out-proof (cannot
+            -- duplicate a reply row) regardless of v_campaign_dim_unified's grain.
+            LEFT JOIN (SELECT campaign_id, any_value(workspace_slug) AS workspace_slug
+                       FROM core.v_campaign_dim_unified WHERE campaign_id IS NOT NULL
+                       GROUP BY campaign_id) cdu ON cdu.campaign_id = p.campaign_id
             WHERE p.lead_email IS NOT NULL AND trim(p.lead_email) <> ''
               AND NOT EXISTS (
                   SELECT 1 FROM core.reply r

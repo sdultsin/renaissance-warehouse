@@ -474,6 +474,21 @@ def run_inbox_loader(ctx: RunContext) -> PhaseResult:
           AND c.workspace_id IS NOT NULL AND c.workspace_id <> ''
         """
     )
+    # (a2) workspace_id carry-forward for the REPLY grain (mirror of (a) for replies — ticket
+    #      2026-07-18). Reply workspace_id is 100% payload-carried and, unlike sends, was NEVER
+    #      backfilled from the campaign dim; ~6% of replies (48k) landed NULL despite a resolvable
+    #      campaign_id. Same slug-encoded dim + self-healing shape as (a); raw_pipeline_campaigns is
+    #      unique on campaign_id so the UPDATE is deterministic (verified 2026-07-18: 0 multi-ws).
+    ctx.db.execute(
+        """
+        UPDATE raw_pipeline_reply_data m
+        SET workspace_id = c.workspace_id
+        FROM raw_pipeline_campaigns c
+        WHERE m.campaign_id = c.campaign_id
+          AND m.workspace_id IS NULL
+          AND c.workspace_id IS NOT NULL AND c.workspace_id <> ''
+        """
+    )
     # (b) freshness gate for the inbox-fed families: the legacy-mirror backstop is gone, so a
     #     silently-dead exporter must show up HERE, loudly, not as quiet staleness.
     for _t, _col in (("campaigns", "synced_at"), ("campaign_data", "synced_at"),
