@@ -10,8 +10,9 @@ MX sweep would be ~40h; this classifies what carries the volume):
      Capped at RECIPIENT_MX_TOP_N (default 150k). Incremental: domains already in
      core.recipient_domain are skipped, so nightly runs only sweep new high-volume domains.
 
-Volume is scored from contact_frequency_campaign_daily (pipeline-supabase) via
-postgres_scanner aggregation — no 25M-row raw mirror.
+Volume is scored from the warehouse-local raw_pipeline_contact_frequency_campaign_daily
+([2026-07-18 wave-2, MOF-10] repointed from pipeline-supabase postgres_scanner; the local
+table is inbox-fed hourly + full history backfilled 2026-07-18, parity exact).
 
 Registers under the 'dns_sweep' phase (it's a sweep; runs after the sender sweep).
 Long tail stays unclassified (matrix buckets it as 'unknown').
@@ -60,31 +61,20 @@ def run_recipient_domain(ctx: RunContext) -> PhaseResult:
     conn = ctx.db
     run_id = ctx.run_id
 
-    # --- 1. Score recipient domains by send volume via postgres_scanner ---------
-    pg_url = ctx.credentials.require("PIPELINE_SUPABASE_DB_URL")
-    conn.execute("INSTALL postgres"); conn.execute("LOAD postgres")
-    try:
-        conn.execute("DETACH pg")
-    except Exception:
-        pass
-    conn.execute(f"ATTACH '{pg_url}' AS pg (TYPE postgres, READ_ONLY)")
+    # --- 1. Score recipient domains by send volume (warehouse-local) ------------
+    # [2026-07-18 wave-2] reads raw_pipeline_contact_frequency_campaign_daily directly —
+    # no legacy-Supabase attach.
     conn.execute("DROP TABLE IF EXISTS _recip_vol")
-    try:
-        conn.execute(
-            f"""
-            CREATE TEMP TABLE _recip_vol AS
-            SELECT lower(lead_domain) AS domain, SUM(sent_count)::BIGINT AS send_volume
-            FROM pg.public.{CONTACT_FREQ}
-            WHERE send_date >= current_date - INTERVAL '{VOLUME_WINDOW_DAYS} days'
-              AND lead_domain IS NOT NULL AND lead_domain <> ''
-            GROUP BY 1
-            """
-        )
-    finally:
-        try:
-            conn.execute("DETACH pg")
-        except Exception:
-            pass
+    conn.execute(
+        f"""
+        CREATE TEMP TABLE _recip_vol AS
+        SELECT lower(lead_domain) AS domain, SUM(sent_count)::BIGINT AS send_volume
+        FROM raw_pipeline_{CONTACT_FREQ}
+        WHERE send_date >= current_date - INTERVAL '{VOLUME_WINDOW_DAYS} days'
+          AND lead_domain IS NOT NULL AND lead_domain <> ''
+        GROUP BY 1
+        """
+    )
     n_domains = conn.execute("SELECT count(*) FROM _recip_vol").fetchone()[0]
     logger.info("recipient volume scored: %d domains (%dd window)", n_domains, VOLUME_WINDOW_DAYS)
 

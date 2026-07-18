@@ -305,7 +305,6 @@ def _build_sql(table: str, spec: Spec) -> str:
 
 
 def run_pipeline_mirror(ctx: RunContext) -> PhaseResult:
-    pg_url = ctx.credentials.require("PIPELINE_SUPABASE_DB_URL")
     conn = ctx.db
 
     # PIPELINE_MIRROR_ONLY=tbl1,tbl2 restricts the run to named SPECS tables.
@@ -329,6 +328,25 @@ def run_pipeline_mirror(ctx: RunContext) -> PhaseResult:
         raise ValueError(f"INBOX_FED names unknown SPECS tables: {sorted(_unknown_fed)}")
     specs = {t: sp for t, sp in specs.items() if t not in INBOX_FED}
     logger.info("inbox-fed families, legacy read SKIPPED: %s", sorted(INBOX_FED))
+    # [2026-07-18 wave-2 flip, MOF-10] These families are FROZEN upstream — the legacy
+    # Supabase tables stopped receiving writes weeks ago and the warehouse copy is
+    # byte-identical (parity proven 2026-07-18: counts, max watermarks and sample rows
+    # exact — see deliverables/2026-07-18-supabase-retirement-wave2/LOG.md):
+    #   meetings_booked_raw          frozen 2026-06-14 (Funding-Form sheet canonical)
+    #   reply_intent_classifications frozen 2026-06-07 (classifier chain retired)
+    #   reply_auto_reconciliation    frozen 2026-06-07 (same chain)
+    # The warehouse raw_pipeline_* copy is the canonical archive now; the legacy read is
+    # skipped as part of the pipeline-Supabase retirement. SPECS entries STAY (uniform
+    # with INBOX_FED; key derivation must remain importable). Un-flip by removing a name
+    # from this set; PIPELINE_MIRROR_ONLY=<family> still forces a one-off legacy re-pull.
+    LEGACY_FROZEN = {
+        "meetings_booked_raw", "reply_intent_classifications", "reply_auto_reconciliation",
+    }
+    _unknown_frozen = LEGACY_FROZEN - SPECS.keys()
+    if _unknown_frozen:
+        raise ValueError(f"LEGACY_FROZEN names unknown SPECS tables: {sorted(_unknown_frozen)}")
+    specs = {t: sp for t, sp in specs.items() if t not in LEGACY_FROZEN}
+    logger.info("legacy-frozen families, legacy read SKIPPED: %s", sorted(LEGACY_FROZEN))
     if only_env:
         wanted = [t.strip() for t in only_env.split(",") if t.strip()]
         unknown = [t for t in wanted if t not in SPECS]
@@ -337,16 +355,26 @@ def run_pipeline_mirror(ctx: RunContext) -> PhaseResult:
         specs = {t: SPECS[t] for t in wanted}
         logger.info("PIPELINE_MIRROR_ONLY -> mirroring only %s", wanted)
 
-    conn.execute("INSTALL postgres")
-    conn.execute("LOAD postgres")
-    try:
-        conn.execute("DETACH pg")
-    except Exception:
-        pass
-    conn.execute(f"ATTACH '{pg_url}' AS pg (TYPE postgres, READ_ONLY)")
-
     rows_total = 0
     per_table: dict[str, dict] = {}
+
+    # [2026-07-18 wave-2] Zero-traffic guard: when every family is flipped (inbox-fed or
+    # frozen) there is nothing to pull — skip the legacy ATTACH entirely so the retiring
+    # Supabase project sees no connection from this phase. The workspace_id fixup below
+    # is warehouse-local and still runs.
+    if not specs:
+        logger.info("all mirror families flipped — legacy Supabase NOT attached (zero-traffic)")
+    else:
+        # credential resolved lazily so a fully-flipped mirror also works with the
+        # legacy DSN removed from .env post-retirement.
+        pg_url = ctx.credentials.require("PIPELINE_SUPABASE_DB_URL")
+        conn.execute("INSTALL postgres")
+        conn.execute("LOAD postgres")
+        try:
+            conn.execute("DETACH pg")
+        except Exception:
+            pass
+        conn.execute(f"ATTACH '{pg_url}' AS pg (TYPE postgres, READ_ONLY)")
     try:
         for table, spec in specs.items():
             logger.info("mirroring %s (mode=%s, watermark=%s)", table, spec.mode, spec.watermark_col or "-")
@@ -364,10 +392,11 @@ def run_pipeline_mirror(ctx: RunContext) -> PhaseResult:
             rows_total += max(written, 0)
             logger.info("  %s -> %d total (%+d new)", table, after, written)
     finally:
-        try:
-            conn.execute("DETACH pg")
-        except Exception:
-            pass
+        if specs:
+            try:
+                conn.execute("DETACH pg")
+            except Exception:
+                pass
 
     # Durable workspace_id carry-forward (D-L2-4). The upstream campaign_daily_metrics.workspace_id
     # went increasingly NULL over time (Apr ~0%, May ~13%, Jun ~100%), so the faithful mirror above

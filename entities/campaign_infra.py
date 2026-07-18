@@ -43,9 +43,10 @@ upsert-once / NEVER truncated. Five steps each night:
   f) LIVENESS — last_seen_live_at / last_seen_name / campaign_status refreshed
      for campaigns present in the dim (last_seen_at within _LIVE_WINDOW_DAYS)
      or the live census this run.
-  g) RECIPIENT MIX — ATTACH Pipeline pg READ_ONLY (esp_matrix pattern) and
-     aggregate pg.public.contact_frequency_campaign_daily (campaign × lead_domain
-     × day, 61.6M rows 2026-05-08→07-02) LEFT JOIN core.recipient_domain into
+  g) RECIPIENT MIX — aggregate the warehouse-local
+     raw_pipeline_contact_frequency_campaign_daily ([2026-07-18 wave-2, MOF-10]
+     repointed from the retiring pipeline-Supabase attach; inbox-fed + full
+     history backfilled) (campaign × lead_domain × day) LEFT JOIN core.recipient_domain into
      per-campaign send buckets (google / microsoft / other / unknown; the tiny
      'isp'/'yahoo'/'apple' classes fold into 'other'; NULL rd → 'unknown').
      Default incremental scope = campaigns with any send in the last 45 days
@@ -62,7 +63,7 @@ upsert-once / NEVER truncated. Five steps each night:
      campaigns are skipped entirely; a weak 'unknown' recompute never clobbers
      a real label, e.g. a manifest_pump_day one). Recomputed stats are
      otherwise allowed to change — they self-improve as the DNS ESP backfill
-     lands. DETACH pg in finally.
+     lands.
 
 Write style: UPDATE ... FROM staged + INSERT ... ANTI JOIN — NO ON CONFLICT DO
 UPDATE (the DuckDB ART-index INTERNAL duplicate-key abort class documented in
@@ -490,14 +491,13 @@ def _refresh_liveness(conn, run_id: str) -> int:
     return n
 
 
-def _recipient_mix(conn, pg_url: str, run_id: str) -> dict:
+def _recipient_mix(conn, run_id: str) -> dict:
+    # [2026-07-18 wave-2, MOF-10] Repointed from pg.public.contact_frequency_campaign_daily
+    # (retiring pipeline Supabase, postgres_scanner attach) to the warehouse-local
+    # raw_pipeline_contact_frequency_campaign_daily. The local table carries the FULL
+    # history (backfilled 2026-07-18, _run_id='cf-history-backfill-20260718') so
+    # recipient_sends_total stays cumulative — the invariant below is preserved.
     full = os.environ.get("CAMPAIGN_INFRA_RECIP_FULL", "") == "1"
-    conn.execute("INSTALL postgres"); conn.execute("LOAD postgres")
-    try:
-        conn.execute("DETACH pg")
-    except Exception:  # noqa: BLE001 — nothing attached
-        pass
-    conn.execute(f"ATTACH '{pg_url}' AS pg (TYPE postgres, READ_ONLY)")
     try:
         # Incremental scope = CAMPAIGNS with recent sends; their FULL history is
         # aggregated so recipient_sends_total stays cumulative (never a window
@@ -505,7 +505,7 @@ def _recipient_mix(conn, pg_url: str, run_id: str) -> dict:
         # qualifying sends are absent from the staging -> skipped, never touched.
         campaign_filter = "" if full else (
             "WHERE cf.campaign_id IN ("
-            "  SELECT DISTINCT campaign_id FROM pg.public.contact_frequency_campaign_daily"
+            "  SELECT DISTINCT campaign_id FROM raw_pipeline_contact_frequency_campaign_daily"
             f"  WHERE send_date >= current_date - INTERVAL {_RECIP_WINDOW_DAYS} DAY)"
         )
         conn.execute(
@@ -523,7 +523,7 @@ def _recipient_mix(conn, pg_url: str, run_id: str) -> dict:
                                 THEN cf.sent_count ELSE 0 END)::BIGINT AS s_other,
                        SUM(CASE WHEN rd.recipient_esp IS NULL
                                 THEN cf.sent_count ELSE 0 END)::BIGINT AS s_unknown
-                FROM pg.public.contact_frequency_campaign_daily cf
+                FROM raw_pipeline_contact_frequency_campaign_daily cf
                 LEFT JOIN core.recipient_domain rd ON rd.domain = lower(cf.lead_domain)
                 {campaign_filter}
                 GROUP BY 1
@@ -552,10 +552,7 @@ def _recipient_mix(conn, pg_url: str, run_id: str) -> dict:
             """
         )
     finally:
-        try:
-            conn.execute("DETACH pg")
-        except Exception:  # noqa: BLE001
-            pass
+        pass  # warehouse-local only since 2026-07-18 — nothing attached to detach
 
     conn.execute("BEGIN")
     try:
@@ -607,13 +604,12 @@ def _recipient_mix(conn, pg_url: str, run_id: str) -> dict:
 
 def run_campaign_infra(ctx: RunContext) -> PhaseResult:
     conn = ctx.db
-    pg_url = ctx.credentials.require("PIPELINE_SUPABASE_DB_URL")
 
     universe = _stage_universe(conn)
     derivation = _stage_derivations(conn)
     merge = _merge(conn, ctx.run_id)
     live = _refresh_liveness(conn, ctx.run_id)
-    recip = _recipient_mix(conn, pg_url, ctx.run_id)
+    recip = _recipient_mix(conn, ctx.run_id)
 
     registry_total = conn.execute("SELECT count(*) FROM core.campaign_infra").fetchone()[0]
     by_source = dict(conn.execute(

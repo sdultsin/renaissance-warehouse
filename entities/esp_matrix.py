@@ -5,7 +5,7 @@ into each recipient ESP (Google/Microsoft/Yahoo/...). Pure aggregation, no new s
 
   sender_esp    = raw_pipeline_campaigns.infra_type  (per campaign)
   recipient_esp = core.recipient_domain.recipient_esp (per lead_domain; 'unknown' if unclassified)
-  sends         = SUM(contact_frequency_campaign_daily.sent_count)  via postgres_scanner
+  sends         = SUM(raw_pipeline_contact_frequency_campaign_daily.sent_count)  (warehouse-local)
   human_replies = canonical reply intent rows (is_auto_reply = false), attributed lead_email→domain→recipient_esp
 
 ⚠ 2026-06-14 (Sam source-of-truth, memory reference_warehouse_reply_and_tag_truth_20260614):
@@ -16,9 +16,13 @@ reply-intent classifier. They are NON-CANONICAL and must NOT be surfaced as repl
 native: unique_replies / unique_replies_automatic in raw_pipeline_campaign_daily_metrics. This mv's
 `sends` column is fine; treat the reply columns as a deprecated internal artifact only.
 
-Built as a materialized table (not a view) because it aggregates an attached-Postgres
-source (postgres_scanner can't live inside a VIEW). Registers under the 'derived' phase,
-AFTER recipient_domain (dns_sweep phase) has classified the recipient side.
+Built as a materialized table (not a view) — historically because it aggregated an
+attached-Postgres source. [2026-07-18 wave-2, MOF-10] Source repointed from
+pg.public.contact_frequency_campaign_daily (retiring pipeline Supabase) to the
+warehouse-local raw_pipeline_contact_frequency_campaign_daily (inbox-fed hourly parquet;
+full history backfilled 2026-07-18, recent-window parity exact). No Supabase attach
+remains. Registers under the 'derived' phase, AFTER recipient_domain (dns_sweep phase)
+has classified the recipient side.
 """
 from __future__ import annotations
 
@@ -39,14 +43,8 @@ def register(registry: Registry) -> None:
 
 def run_esp_matrix(ctx: RunContext) -> PhaseResult:
     conn = ctx.db
-    pg_url = ctx.credentials.require("PIPELINE_SUPABASE_DB_URL")
-
-    conn.execute("INSTALL postgres"); conn.execute("LOAD postgres")
-    try:
-        conn.execute("DETACH pg")
-    except Exception:
-        pass
-    conn.execute(f"ATTACH '{pg_url}' AS pg (TYPE postgres, READ_ONLY)")
+    # [2026-07-18 wave-2] sends now come from the warehouse-local
+    # raw_pipeline_contact_frequency_campaign_daily — no legacy-Supabase attach.
 
     # arg_max over the upsert-mirror: raw_pipeline_campaigns is 1 row/campaign, so a
     # _run_id=(latest) filter silently drops frozen/deleted-upstream campaigns from the
@@ -77,7 +75,7 @@ def run_esp_matrix(ctx: RunContext) -> PhaseResult:
                      COALESCE(rd.recipient_esp, 'unknown')  AS recipient_esp,
                      SUM(cf.sent_count)::BIGINT             AS sends,
                      COUNT(DISTINCT cf.lead_domain)::BIGINT AS domains_covered
-              FROM pg.public.contact_frequency_campaign_daily cf
+              FROM raw_pipeline_contact_frequency_campaign_daily cf
               LEFT JOIN {latest_campaigns} camp ON camp.campaign_id = CAST(cf.campaign_id AS VARCHAR)
               LEFT JOIN core.recipient_domain rd ON rd.domain = lower(cf.lead_domain)
               WHERE cf.send_date >= current_date - INTERVAL '{WINDOW_DAYS} days'
@@ -116,10 +114,7 @@ def run_esp_matrix(ctx: RunContext) -> PhaseResult:
             """
         )
     finally:
-        try:
-            conn.execute("DETACH pg")
-        except Exception:
-            pass
+        pass  # warehouse-local only since 2026-07-18 — nothing attached to detach
 
     n = conn.execute("SELECT count(*) FROM mv_esp_send_matrix").fetchone()[0]
     tot = conn.execute(
