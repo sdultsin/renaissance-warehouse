@@ -1,10 +1,25 @@
-"""account_tags: nightly per-INBOX tag column from Instantly (ADDITIVE COMPLETE REFRESH).
+"""account_tags: nightly per-INBOX tag sync from Instantly — ONE sweep, THREE surfaces.
 
-Populates core.account_tags (DDL 1026/98): ONE row per inbox, with every tag that inbox
-carries in Instantly rolled into a single `tags` column (verbatim, no curation). This is
-the per-inbox tag field core.v_inbox_overview reads (prov_tag / batch_tag / verbatim tags)
-— distinct from the curated core.sending_account_tag (4 workflow tags, capacity math, left
-to entities/account_tag.py).
+Populates, from a single per-workspace /accounts?tag_ids= sweep:
+  1. core.account_tags (DDL 1026/98): ONE row per inbox, every tag rolled into a single
+     `tags` column (verbatim, no curation) — the per-inbox tag field core.v_inbox_overview
+     reads (prov_tag / batch_tag / verbatim tags). ADDITIVE COMPLETE REFRESH (below).
+  2. raw_instantly_account_tag (DDL 1002): one raw row per (email x tag x run) for EVERY
+     tag — the dated membership record time-series queries read.
+  3. core.sending_account_tag: the account->tag edge table (upsert + prune), feeding the
+     capacity views (core.v_sending_capacity_by_tag, DDL 1002/1073), v_otd_tag_membership
+     (DDL 111) and v_tag_coverage_gaps (DDL 1013).
+
+WHY (2)+(3) LIVE HERE (2026-07-19, task #28 tag-gap fix): surfaces 2-3 were produced by
+entities/account_tag.py ('instantly' phase, now RETIRED), which gated tags through a
+hard-coded allowlist regex ^(Reseller|Outreach Today) (Active|Warmup)$ — so the warmup-pool
+tags ("Warmy Warmup" ~137k, "Instantly Warmup" ~57k accounts) were never requested and the
+canonical tag surface silently missed ~223k tagged accounts (domain-rehab was blocked on
+this). This entity's sweep already walks EVERY tag in every workspace's catalog daily, so
+the fix is one sweep feeding all three surfaces: no allowlist, no duplicate API pass, and a
+new pool tag can never be silently dropped again. Freshness is unchanged-or-better: this
+phase runs later in the SAME pass (PASS A) as the old 'instantly' slot, AFTER the census
+promote, so the resolve step joins TONIGHT's census rather than yesterday's.
 
 WHY A COMPLETE REBUILD (2026-07-06 rewrite — restores the DDL's intended full-replace)
 -------------------------------------------------------------------------------------
@@ -18,8 +33,8 @@ Two prior shapes both failed:
     simply absent, and coverage drifted — needing periodic `manual_full_reconcile` runs. The
     result was a warehouse whose tags were stale/incomplete on any given night.
 
-This version gets BOTH complete AND fast by using the RIGHT endpoint — the same one
-entities/account_tag.py already uses for workflow tags:
+This version gets BOTH complete AND fast by using the RIGHT endpoint (the same one the
+retired entities/account_tag.py used for its 4 workflow tags):
   1. Per workspace, list every custom tag, then GET /accounts?tag_ids=<id> per tag. This is a
      SERVER-SIDE filter that returns only CURRENT accounts (no historical-edge bloat), WITH the
      account object — so we build the inbox→{labels} map directly, completely, cheaply.
@@ -35,8 +50,9 @@ entities/account_tag.py already uses for workflow tags:
 Workspaces are pulled with BOUNDED CONCURRENCY (each a distinct key). The "serial within a
 workspace" discipline still holds — one cursor at a time per key — this only overlaps DIFFERENT
 keys, capped so the aggregate IP rate stays gentle. All DB writes stay in the main thread
-(single writer). Registered as the LAST phase ('account_tags_late', after 'derived') so even a
-slow pull can never block the critical phases.
+(single writer). Registered as 'account_tags_late' — the LAST phase of PASS A (see
+core/config.py PHASE_ORDER, 2026-07-14 two-pass split) so even a slow pull can never block the
+fleet-health phases in front of it.
 """
 
 from __future__ import annotations
@@ -73,10 +89,21 @@ def register(registry: Registry) -> None:
     registry.add_phase("account_tags_late", "account_tags", run_account_tags_ingest)
 
 
+def _as_int(v) -> int | None:
+    try:
+        return int(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _pull_workspace(slug: str, api_key: str) -> dict:
     """READ-ONLY, DB-free (safe in a worker thread): pull the COMPLETE current tag map for one
     workspace via /accounts?tag_ids= (server-side tag filter → CURRENT accounts only, no
-    historical-edge bloat). Returns {slug, status, workspace_id, ws_slug, n_tags, by_email}."""
+    historical-edge bloat). Keeps tag IDs and a light per-account meta snapshot
+    (provider_code/status/daily_limit from the /accounts payload) so the ONE sweep can feed
+    core.account_tags AND raw_instantly_account_tag / core.sending_account_tag (see module
+    docstring). Returns {slug, status, workspace_id, ws_slug, n_tags, tag_labels, by_email,
+    acct_meta} where by_email maps email -> {tag_label: tag_id}."""
     try:
         with InstantlyClient(api_key) as client:
             ws = client.get_current_workspace()
@@ -88,15 +115,24 @@ def _pull_workspace(slug: str, api_key: str) -> dict:
                 for t in client.list_tags(wid)
                 if t.get("id") and t.get("label")
             ]
-            by_email: dict[str, set] = defaultdict(set)
+            by_email: dict[str, dict[str, str]] = defaultdict(dict)
+            acct_meta: dict[str, tuple] = {}
             for tag_id, label in tags:
                 for acct in client.list_accounts(tag_ids=tag_id, workspace_id=wid):
                     email = (acct.get("email") or "").strip().lower()
                     if email and "@" in email:
-                        by_email[email].add(label)
+                        by_email[email][label] = tag_id
+                        if email not in acct_meta:
+                            acct_meta[email] = (
+                                _as_int(acct.get("provider_code")),
+                                _as_int(acct.get("status")),
+                                _as_int(acct.get("daily_limit")),
+                            )
             return {
                 "slug": slug, "status": "ok", "workspace_id": wid,
-                "ws_slug": ws.get("slug"), "n_tags": len(tags), "by_email": by_email,
+                "ws_slug": ws.get("slug"), "n_tags": len(tags),
+                "tag_labels": [label for _tid, label in tags],
+                "by_email": by_email, "acct_meta": acct_meta,
             }
     except InstantlyError as exc:
         return {"slug": slug, "status": "fail", "err": str(exc)[:300]}
@@ -146,9 +182,16 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
 
     # --- serial full-replace per CLEAN workspace (single writer) ----------------------------
     inboxes_written = 0
+    raw_edge_rows = 0
     workspaces_done: list[str] = []
     failures: list[dict] = []
     seen_uuids: set[str] = set()
+    # (canonical workspace_slug, tag_label) pairs SUCCESSFULLY landed — the prune scope for
+    # core.sending_account_tag (a failed/skipped workspace keeps its last-good edge rows).
+    scanned_pairs: set[tuple[str, str]] = set()
+
+    # Clear any partial raw rows from a prior aborted run with this run_id (idempotent).
+    ctx.db.execute("DELETE FROM raw_instantly_account_tag WHERE _run_id = ?", [ctx.run_id])
 
     for r in sorted(results, key=lambda x: x["slug"]):
         slug = r["slug"]
@@ -162,6 +205,7 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
         seen_uuids.add(wid)
         canon_slug = uuid_to_slug.get(wid, r.get("ws_slug") or slug)
         by_email = r["by_email"]
+        acct_meta = r["acct_meta"]
         new_n = len(by_email)
         rows = [(email, sorted(labels)) for email, labels in by_email.items()]
         try:
@@ -192,6 +236,45 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
                 [canon_slug, wid, now, ctx.run_id],
             )
             ctx.db.execute("DROP TABLE IF EXISTS _wt")
+
+            # --- raw_instantly_account_tag: one dated row per (email x tag) — ALL tags -----
+            # Same single sweep, set-based write (temp table -> one INSERT; the per-row
+            # autocommit INSERT was the retired account_tag.py's writer-bloat lesson).
+            # ON CONFLICT DO NOTHING: PK (email, tag_id, _run_id) absorbs any payload dupes.
+            edge_batch = [
+                [now, ctx.run_id, wid, canon_slug, email, tag_id, label,
+                 *(acct_meta.get(email) or (None, None, None))]
+                for email, labels in by_email.items()
+                for label, tag_id in labels.items()
+            ]
+            if edge_batch:
+                ctx.db.execute(
+                    "CREATE OR REPLACE TEMP TABLE _acct_tag_batch ("
+                    "_loaded_at TIMESTAMPTZ, _run_id VARCHAR, workspace_uuid VARCHAR, "
+                    "workspace_slug VARCHAR, email VARCHAR, tag_id VARCHAR, tag_label VARCHAR, "
+                    "provider_code INTEGER, status INTEGER, daily_limit INTEGER)"
+                )
+                ctx.db.executemany(
+                    "INSERT INTO _acct_tag_batch VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", edge_batch
+                )
+                ctx.db.execute(
+                    """
+                    INSERT INTO raw_instantly_account_tag
+                      (_loaded_at, _run_id, workspace_uuid, workspace_slug,
+                       email, tag_id, tag_label, provider_code, status, daily_limit)
+                    SELECT * FROM _acct_tag_batch
+                    ON CONFLICT DO NOTHING
+                    """
+                )
+                ctx.db.execute("DROP TABLE IF EXISTS _acct_tag_batch")
+                raw_edge_rows += len(edge_batch)
+
+            # Mark pairs scanned ONLY after this workspace's writes landed: an exception
+            # mid-workspace adds NOTHING to the prune scope, so a pair can never enter it
+            # with zero raw rows (which would wipe its last-good membership in the prune).
+            # EVERY catalog tag is a scanned pair — including tags with zero members, so an
+            # emptied tag correctly prunes to zero.
+            scanned_pairs.update((canon_slug, label) for label in r["tag_labels"])
         except Exception as exc:  # noqa: BLE001
             logger.exception("account_tags %s: write failed — last-good kept", slug)
             failures.append({"slug": slug, "error": f"write_failed: {type(exc).__name__}"})
@@ -201,6 +284,11 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
         workspaces_done.append(slug)
         logger.info("account_tags %s (slug=%s): full-replace %d inboxes across %d tags",
                     slug, canon_slug, new_n, r.get("n_tags"))
+
+    # ---- resolve core.sending_account_tag (upsert + prune) ----------------------------------
+    # Unguarded on purpose (matches the retired account_tag.py): a resolve failure fails the
+    # phase loud; the account_tags writes above are already committed and re-heal next night.
+    core_tag_rows = _resolve_core_account_tag(ctx, now, scanned_pairs)
 
     # ---- daily stage-history snapshot (DDL 1115) --------------------------------------------
     # core.account_tags is CURRENT-STATE ONLY: each inbox's row is overwritten with its current
@@ -264,6 +352,9 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
 
     return PhaseResult(rows_out=inboxes_written, notes={
         "inboxes_written": inboxes_written,
+        "raw_edge_rows": raw_edge_rows,
+        "core_tag_rows_after": core_tag_rows,
+        "tag_pairs_scanned": len(scanned_pairs),
         "workspaces_done": workspaces_done,
         "failures": failures,
         "workers": _WORKERS,
@@ -271,3 +362,91 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
         "skipped_on_deadline": skipped,
         "stage_snapshot_rows": snapshot_rows,
     })
+
+
+def _resolve_core_account_tag(ctx, now: datetime, scanned_pairs: set[tuple[str, str]]) -> int:
+    """Upsert this run's raw membership into core.sending_account_tag, then prune memberships
+    that disappeared within the SUCCESSFULLY-scanned (workspace, tag) pairs. provider_code +
+    canonical workspace_slug are taken from the latest census (raw is the fallback). Moved
+    verbatim from the retired entities/account_tag.py, minus its allowlist, plus a
+    (email, tag_label) dedupe: with the full tag universe the same email+label can now
+    legitimately appear under two workspaces in one run, and DuckDB's ON CONFLICT DO UPDATE
+    raises if a single statement updates one target row twice."""
+    db = ctx.db
+
+    # Deduped membership observed this run: exactly ONE row per (email, tag_label).
+    db.execute("DROP TABLE IF EXISTS _run_account_tag")
+    db.execute(
+        """
+        CREATE TEMP TABLE _run_account_tag AS
+        SELECT email, tag_id, tag_label, workspace_slug, provider_code
+        FROM (
+            SELECT lower(email) AS email,
+                   tag_id,
+                   tag_label,
+                   workspace_slug,
+                   provider_code,
+                   row_number() OVER (
+                       PARTITION BY lower(email), tag_label
+                       ORDER BY workspace_slug, tag_id
+                   ) AS _rn
+            FROM raw_instantly_account_tag
+            WHERE _run_id = ?
+        ) WHERE _rn = 1
+        """,
+        [ctx.run_id],
+    )
+
+    # UPSERT. first_seen_at kept on conflict; everything else refreshed. census is the
+    # authority for provider_code + canonical workspace_slug (raw is the fallback).
+    db.execute(
+        """
+        INSERT INTO core.sending_account_tag
+          (email, workspace_slug, tag_id, tag_label, first_seen_at, last_seen_at, provider_code)
+        SELECT
+            r.email,
+            COALESCE(c.workspace_slug, r.workspace_slug),
+            r.tag_id,
+            r.tag_label,
+            ?, ?,
+            COALESCE(c.provider_code, r.provider_code)
+        FROM _run_account_tag r
+        LEFT JOIN core.v_account_census_latest c ON c.email = r.email
+        ON CONFLICT (email, tag_label) DO UPDATE SET
+            last_seen_at   = excluded.last_seen_at,
+            tag_id         = excluded.tag_id,
+            workspace_slug = excluded.workspace_slug,
+            provider_code  = excluded.provider_code
+        """,
+        [now, now],
+    )
+
+    # PRUNE removed memberships — ONLY within (workspace_slug, tag_label) pairs we
+    # successfully scanned this run, so a failed/skipped workspace keeps its rows.
+    if scanned_pairs:
+        db.execute("DROP TABLE IF EXISTS _scanned_pairs")
+        db.execute("CREATE TEMP TABLE _scanned_pairs (workspace_slug VARCHAR, tag_label VARCHAR)")
+        db.executemany(
+            "INSERT INTO _scanned_pairs VALUES (?, ?)",
+            [[ws, lbl] for (ws, lbl) in sorted(scanned_pairs)],
+        )
+        db.execute(
+            """
+            DELETE FROM core.sending_account_tag s
+            WHERE EXISTS (
+                SELECT 1 FROM _scanned_pairs p
+                WHERE p.workspace_slug = s.workspace_slug AND p.tag_label = s.tag_label
+            )
+            AND NOT EXISTS (
+                SELECT 1 FROM _run_account_tag r
+                WHERE r.email = s.email AND r.tag_label = s.tag_label
+            )
+            """
+        )
+        db.execute("DROP TABLE IF EXISTS _scanned_pairs")
+
+    n = db.execute("SELECT count(*) FROM core.sending_account_tag").fetchone()[0]
+    db.execute("DROP TABLE IF EXISTS _run_account_tag")
+    logger.info("core.sending_account_tag resolved -> %d rows (%d scanned pairs)",
+                n, len(scanned_pairs))
+    return n
