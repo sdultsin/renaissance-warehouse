@@ -21,10 +21,11 @@ _auto come from at campaign grain. Reply truth is Instantly-native ONLY (the hom
 auto/human classifier was dropped 2026-06-14, reference_warehouse_reply_and_tag_truth_20260614).
 
 Scope: EVERY workspace from the credential enumerator (credentials.instantly_workspace_keys()
-— all INSTANTLY_KEY_* except PERSONAL/SAM_TEST). A workspace on a dead/retired plan returns
-402 Payment Required -> SKIPPED (not a failure). Any OTHER per-workspace failure is isolated
-(healthy workspaces still commit) and the phase FAILS LOUD at the end so a break is never a
-silent zero.
+— all INSTANTLY_KEY_* except PERSONAL/SAM_TEST). A dead/unreachable workspace credential
+returns 402 Payment Required (dead plan) or 401 Unauthorized (invalid/rotated key, e.g. the
+retired renaissance-3/6/7) -> SKIPPED (not a failure). Any OTHER per-workspace failure is
+isolated (healthy workspaces still commit) and the phase FAILS LOUD at the end so a break is
+never a silent zero.
 
 Instantly = direct REST, browser UA, never MCP (feedback_instantly_api_not_mcp_20260630);
 429 retries adaptively; the 413 is handled by emails-chunking, not retry.
@@ -256,12 +257,16 @@ def _ingest(conn, credentials, run_id: str, start: str, end: str,
             if written == 0:
                 logger.warning("%s: 0 account-day rows in %s..%s (no activity?)", slug, start, end)
         except InstantlyError as exc:
-            # A dead/retired workspace plan returns 402 -> SKIP (not a failure). Any other
-            # Instantly error is a real failure (esp. a 413, which would mean the emails
-            # chunk fix regressed) -> isolate + fail loud at the end.
+            # A dead/retired/unreachable workspace credential returns 402 Payment Required
+            # (dead plan) or 401 Unauthorized (invalid/rotated key — e.g. the retired
+            # renaissance-3/6/7 workspaces) -> SKIP, not a failure: nothing we can pull, and
+            # failing loud would break the whole nightly phase forever on a dead key. Any
+            # OTHER Instantly error is real (esp. a 413, which would mean the emails-chunk fix
+            # regressed) -> isolate + fail loud at the end.
             msg = str(exc)
-            if " -> 402" in msg or "402:" in msg:
-                logger.warning("%s: 402 Payment Required (dead/retired plan) -> skipped", slug)
+            if any(t in msg for t in (" -> 402", "402:", " -> 401", "401:")):
+                code = "402 Payment Required" if "402" in msg else "401 Unauthorized"
+                logger.warning("%s: %s (dead/unreachable workspace credential) -> skipped", slug, code)
                 skipped.append(slug)
             else:
                 logger.exception("%s: workspace ingest failed", slug)
@@ -273,7 +278,7 @@ def _ingest(conn, credentials, run_id: str, start: str, end: str,
     notes = {
         "window": f"{start}..{end}",
         "workspaces_done": done,
-        "workspaces_skipped_402": skipped,
+        "workspaces_skipped_401_402": skipped,
         "failures": failures,
         "rows": total,
     }
@@ -283,7 +288,7 @@ def _ingest(conn, credentials, run_id: str, start: str, end: str,
         raise RuntimeError(
             f"instantly account_daily: {len(failures)} workspace(s) failed "
             f"({[f['slug'] for f in failures]}); healthy committed (rows={total}, "
-            f"done={len(done)}, skipped_402={len(skipped)})."
+            f"done={len(done)}, skipped_401_402={len(skipped)})."
         )
     return PhaseResult(rows_in=total, rows_out=total, notes=notes)
 
