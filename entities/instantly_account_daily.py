@@ -47,6 +47,8 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime, timedelta, timezone
 
+import pyarrow as pa
+
 from core.registry import Registry, RunContext
 from core.sync_run import PhaseResult
 from sources.instantly import InstantlyClient, InstantlyError
@@ -86,9 +88,19 @@ _COLS = [
     "account_email", "metric_date", "workspace_slug", "domain", "provider_group",
     *_METRIC_FIELDS, "api_synced_at", "_loaded_at", "_run_id",
 ]
-_UPSERT = (
+# Vectorized upsert from a registered pyarrow table `_stg_account_daily`. Row-by-row
+# executemany ON CONFLICT was pathological at scale (~200k rows = O(minutes), per-row PK
+# index probes); a single INSERT...SELECT...ON CONFLICT is a vectorized hash-join upsert.
+# The window de-dups the source per (account_email, metric_date) so ON CONFLICT never tries
+# to update the same target row twice (a duplicate account in the API payload would raise).
+_STG = "_stg_account_daily"
+_UPSERT_SELECT = (
     f"INSERT INTO main.raw_instantly_account_daily ({', '.join(_COLS)}) "
-    f"VALUES ({', '.join('?' for _ in _COLS)}) "
+    f"SELECT {', '.join(_COLS)} FROM ("
+    f"  SELECT *, row_number() OVER "
+    f"    (PARTITION BY account_email, metric_date ORDER BY sent DESC NULLS LAST) AS _rn "
+    f"  FROM {_STG}"
+    f") WHERE _rn = 1 "
     "ON CONFLICT (account_email, metric_date) DO UPDATE SET "
     + ", ".join(
         f"{c} = excluded.{c}" for c in _COLS if c not in ("account_email", "metric_date")
@@ -165,49 +177,54 @@ def _fetch_workspace(client: InstantlyClient, slug: str, start: str, end: str) -
     return rows
 
 
-# Upsert this many rows per transaction. A single transaction over a whole big workspace
-# (funding-4 ~85k accounts -> ~238k day-rows on a wide window) accumulated enough index/MVCC
-# state to OOM the writer at the ~15GB memory_limit; committing in bounded batches caps each
-# transaction's footprint (the nightly's 3-day window is smaller, but the backfill is not).
-_WRITE_BATCH = 20_000
-
-
 def _write_workspace(conn, slug: str, rows: list[dict], now, run_id: str) -> int:
-    """Upsert one workspace's fetched rows in bounded per-batch transactions. Returns the
-    total rows written. `_flush` owns commit + tally + clear so the count can't drift from
-    what was committed."""
-    written = 0
-    batch: list[list] = []
-
-    def _flush() -> None:
-        nonlocal written
-        if not batch:
-            return
-        conn.execute("BEGIN")
-        try:
-            conn.executemany(_UPSERT, batch)
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-        written += len(batch)
-        batch.clear()
-
+    """Upsert one workspace's fetched rows via ONE vectorized pyarrow bulk upsert. Returns
+    the number of (deduped) rows staged. Column-wise arrays -> a registered pyarrow table ->
+    INSERT...SELECT...ON CONFLICT (see _UPSERT_SELECT), so a big workspace (funding-4 ~238k
+    rows) lands in one vectorized statement instead of ~200k per-row executemany upserts."""
+    cols: dict[str, list] = {c: [] for c in _COLS}
     for item in rows:
         em = (item.get("email_account") or "").strip().lower()
         d = str(item.get("date", ""))[:10]
         if not em or not d:
             continue
         domain = em.split("@", 1)[1] if "@" in em else None
-        batch.append([
-            em, d, slug, domain, item.get("_provider_group"),
-            *[_int_or_none(item.get(f)) for f in _METRIC_FIELDS],
-            now, now, run_id,
-        ])
-        if len(batch) >= _WRITE_BATCH:
-            _flush()
-    _flush()
-    return written
+        cols["account_email"].append(em)
+        cols["metric_date"].append(d)
+        cols["workspace_slug"].append(slug)
+        cols["domain"].append(domain)
+        cols["provider_group"].append(item.get("_provider_group"))
+        for f in _METRIC_FIELDS:
+            cols[f].append(_int_or_none(item.get(f)))
+        cols["api_synced_at"].append(now)
+        cols["_loaded_at"].append(now)
+        cols["_run_id"].append(run_id)
+
+    n = len(cols["account_email"])
+    if n == 0:
+        return 0
+    # Explicit types so an all-NULL metric column (a workspace with no clicks/opens) doesn't
+    # infer to arrow `null` and break the INSERT cast; metric_date stays VARCHAR and casts to
+    # DATE on insert, timestamps carry tz.
+    schema = pa.schema(
+        [(c, pa.string()) for c in ("account_email", "metric_date", "workspace_slug",
+                                    "domain", "provider_group", "_run_id")]
+        + [(c, pa.int64()) for c in _METRIC_FIELDS]
+        + [("api_synced_at", pa.timestamp("us", tz="UTC")),
+           ("_loaded_at", pa.timestamp("us", tz="UTC"))]
+    )
+    tbl = pa.table({c: cols[c] for c in schema.names}, schema=schema)
+    conn.register(_STG, tbl)
+    try:
+        conn.execute("BEGIN")
+        conn.execute(_UPSERT_SELECT)
+        conn.execute("COMMIT")
+    except Exception:
+        conn.execute("ROLLBACK")
+        raise
+    finally:
+        conn.unregister(_STG)
+    return n
 
 
 def _ingest(conn, credentials, run_id: str, start: str, end: str,
