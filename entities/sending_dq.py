@@ -1,7 +1,11 @@
 """SPEC D: Sending Data-Quality monitors.
 
 Registers under the 'derived' phase (runs after canonical). Handles:
-  D3 — ingest account_truth daily actuals CSV into raw + canonical.
+  D3 — ingest account_truth daily actuals CSV into raw, then rebuild the canonical
+       core.sending_account_daily DUAL-SOURCE: actual_sends prefers the repo-versioned
+       main.raw_instantly_account_daily per (date, account), account_truth CSV as the
+       fallback (DDL 1143, 2026-07-19 — droplet-death durability; see the rebuild
+       comment block below and core.v_sending_actuals_parity).
   D4 — set _snapshot_date on core.sending_account from raw_account_truth_accounts.
   D2 — tag coverage gaps (deferred until SPEC A lands core.sending_account_tag).
 
@@ -202,6 +206,28 @@ def run_sending_dq(ctx: RunContext) -> PhaseResult:
     #   (2) Populate PER DATE, each day in its own transaction — bounds each commit's PK-index delta to ~1
     #       day (~1.4M rows) so it fits far under the 8GB limit. Same dedup result as the global rebuild
     #       (the window PARTITIONs by (date, email), so restricting the source to one date is equivalent).
+    #
+    # [2026-07-19 DDL 1143 — actual_sends made DURABLE, dual-source] actual_sends now PREFERS the
+    # repo-versioned main.raw_instantly_account_daily (entities/instantly_account_daily.py, phase
+    # 'replies_late' — runs BEFORE 'derived' in PASS B) per (date, account), falling back to the
+    # box-only account_truth CSV feed (raw_account_truth_daily_actuals) — a per-account FULL OUTER
+    # JOIN, because NEITHER source is a superset (verified 2026-07-19 on the live warehouse):
+    #   * values agree exactly where both sources see an account (same Instantly endpoint;
+    #     renaissance-1/2/5, prospects-power, the-gatekeepers: 0 to ±34 sends/day per workspace);
+    #   * account_truth-only rows: accounts PURGED from Instantly before raw_instantly_account_daily's
+    #     2026-07-18 backfill ran (e.g. renaissance-4 2026-07-16: 6,648 deleted accounts / 100,577
+    #     sends) — kept via the fallback side of the join;
+    #   * raw_instantly-only rows: workspaces the box script's key set misses (tariffs +15k,
+    #     warm-leads +20k on 2026-07-16) — NEW coverage.
+    # When the droplet (and its box-only account_truth generator) dies, the CSV side simply stops
+    # producing new dates and the rebuild continues from raw_instantly_account_daily alone.
+    # Capacity columns (daily_limit/expected_sends/delta/fulfillment) still come from account_truth
+    # where it has the row; for raw_instantly-only rows they are filled from core.sending_account
+    # (current config, D6 semantics: expected := daily_limit) right after this loop. esp is left
+    # NULL here for raw_instantly-only rows — the two existing esp backfills below (vendor + census)
+    # already recover it. Grain guard: only COMPLETE days (date < current UTC date) are rebuilt, so
+    # the same-day partial rows raw_instantly_account_daily's rolling window pulls intra-day never
+    # land here (the table stays a D-1 entity; render_daily's §4 waterfall depends on that).
     db.execute("SET preserve_insertion_order=false")
     _ddl = db.execute(
         "SELECT sql FROM duckdb_tables() "
@@ -210,45 +236,90 @@ def run_sending_dq(ctx: RunContext) -> PhaseResult:
     assert _ddl.strip().upper().startswith("CREATE TABLE"), f"unexpected DDL: {_ddl[:40]!r}"
     db.execute(_ddl.replace("CREATE TABLE", "CREATE OR REPLACE TABLE", 1))
     raw_dates = [r[0] for r in db.execute(
-        "SELECT DISTINCT date FROM raw_account_truth_daily_actuals ORDER BY date"
+        """
+        SELECT DISTINCT date FROM (
+            SELECT date FROM raw_account_truth_daily_actuals
+            UNION
+            SELECT metric_date AS date FROM main.raw_instantly_account_daily
+        ) WHERE date < current_date ORDER BY date
+        """
     ).fetchall()]
     for _d in raw_dates:
         db.execute("BEGIN")
         try:
             db.execute("""
                 INSERT INTO core.sending_account_daily
-                WITH deduped AS (
-                    SELECT *,
-                        ROW_NUMBER() OVER (
-                            PARTITION BY date, email
-                            ORDER BY actual_sends DESC NULLS LAST
-                        ) AS rn
-                    FROM raw_account_truth_daily_actuals
-                    WHERE date = ?
+                WITH at_dedup AS (
+                    SELECT * FROM (
+                        SELECT *,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY date, lower(email)
+                                ORDER BY actual_sends DESC NULLS LAST
+                            ) AS rn
+                        FROM raw_account_truth_daily_actuals
+                        WHERE date = ?
+                    ) WHERE rn = 1
+                ),
+                iad AS (
+                    SELECT account_email, workspace_slug, sent
+                    FROM main.raw_instantly_account_daily
+                    WHERE metric_date = ?
                 )
                 SELECT
-                    date,
-                    email AS account_id,
-                    workspace_slug,
-                    CASE infra_type
+                    ? AS date,
+                    COALESCE(a.email, i.account_email) AS account_id,
+                    COALESCE(a.workspace_slug, i.workspace_slug) AS workspace_slug,
+                    CASE a.infra_type
                         WHEN 'Google' THEN 'google'
                         WHEN 'Outlook' THEN 'outlook'
                         WHEN 'OTD' THEN 'otd'
                         ELSE NULL
                     END AS esp,
-                    daily_limit,
-                    expected_sends,
-                    actual_sends,
-                    delta,
-                    fulfillment,
-                    active_campaign_count
-                FROM deduped
-                WHERE rn = 1
-            """, [_d])
+                    a.daily_limit,
+                    a.expected_sends,
+                    COALESCE(i.sent, a.actual_sends) AS actual_sends,
+                    CASE WHEN i.sent IS NULL THEN a.delta
+                         ELSE a.expected_sends - i.sent END AS delta,
+                    CASE WHEN i.sent IS NULL THEN a.fulfillment
+                         WHEN COALESCE(a.expected_sends, 0) > 0
+                             THEN i.sent::DOUBLE / a.expected_sends
+                         END AS fulfillment,
+                    a.active_campaign_count
+                FROM at_dedup a
+                FULL OUTER JOIN iad i ON lower(a.email) = i.account_email
+            """, [_d, _d, _d])
             db.execute("COMMIT")
         except Exception:
             db.execute("ROLLBACK")
             raise
+
+    # [2026-07-19 DDL 1143] Capacity fill for rows sourced ONLY from raw_instantly_account_daily
+    # (no account_truth CSV row — post-droplet dates, or workspaces the box script missed): both
+    # capacity columns are NULL from the join above, which would zero the capacity sums in
+    # derived.v_sending_volume_daily for those dates. Fill from core.sending_account with the D6
+    # reassert semantics (active + resolved ESP + real limit; expected_sends := daily_limit; delta/
+    # fulfillment recomputed). Email-keyed (iad workspace slugs are credential slugs, not census
+    # slugs); deduped to one deterministic row per email. Idempotent — only touches NULL-capacity
+    # rows, and the whole table is rebuilt every nightly anyway. Point-in-time caveat: this stamps
+    # the CURRENT config onto the row's date, exactly like D6; the durable settings history entity
+    # (task #28 step 3) is the real fix for capacity-over-time.
+    db.execute("""
+        UPDATE core.sending_account_daily AS sad
+        SET daily_limit = sa.daily_limit,
+            expected_sends = sa.daily_limit,
+            delta = sa.daily_limit - COALESCE(sad.actual_sends, 0),
+            fulfillment = CASE WHEN sa.daily_limit > 0
+                THEN COALESCE(sad.actual_sends, 0)::DOUBLE / sa.daily_limit END
+        FROM (
+            SELECT LOWER(email) AS email_lc,
+                   max(daily_limit) AS daily_limit
+            FROM core.sending_account
+            WHERE is_active AND esp IS NOT NULL AND daily_limit > 0
+            GROUP BY LOWER(email)
+        ) sa
+        WHERE sad.daily_limit IS NULL AND sad.expected_sends IS NULL
+          AND LOWER(sad.account_id) = sa.email_lc
+    """)
 
     # [2026-06-16 infra-data-truth] ESP BACKFILL. The CSV's infra_type is 'Missing Current Inventory'
     # for accounts that sent but aren't in the (cached) account_truth inventory -> esp=NULL above

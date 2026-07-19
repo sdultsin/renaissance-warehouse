@@ -183,7 +183,7 @@ OVERRIDES: dict[str, dict] = {
 # (name, source, owner_phase, cadence, freshness_column, biz_date_column, biz_sla_days, notes)
 CORE_FEEDS = [
     ("core.campaign_daily",        "instantly_step_api", "derived",   "daily",    "_loaded_at", "date", None, "Track H per-campaign daily"),
-    ("core.sending_account_daily", "account_truth",      "account_truth", "daily", "_loaded_at", "date", 2, "Track G infra daily; no load-ts column -> biz-recency SLA 2d (wall-clock nulled)"),
+    ("core.sending_account_daily", "account_truth+instantly", "derived", "daily", "_loaded_at", "date", 2, "Track G infra daily; dual-source since DDL 1143 (raw_instantly_account_daily preferred, account_truth CSV fallback; rebuilt by sending_dq in 'derived'); no load-ts column -> biz-recency SLA 2d (wall-clock nulled)"),
     # biz date = posted_at (when the meeting was POSTED, not when we synced) — the Jun 4-10
     # outage had last_synced_at current while the newest meeting was 4 days old.
     ("core.meeting",               "slack_scrape",       "canonical", "daily",    "_last_seen_at", "posted_at", 2, "booked meetings; biz-recency SLA 2d"),
