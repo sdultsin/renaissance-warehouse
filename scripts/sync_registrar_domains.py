@@ -34,7 +34,7 @@ from core import db as db_module
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger("scripts.sync_registrar_domains")
 
-REGS = ("porkbun", "spaceship", "dynadot")
+REGS = ("porkbun", "spaceship", "dynadot", "namecheap")
 
 # Parse an ISO8601 string OR the 'epoch_ms:<int>' sentinel the fetchers emit -> TIMESTAMPTZ.
 PARSE = ("CASE WHEN {c} LIKE 'epoch_ms:%' "
