@@ -140,6 +140,23 @@ FUNDING_WS = ('renaissance-2', 'renaissance-4', 'renaissance-5',
               'the-gatekeepers')
 WS_IN = "('" + "','".join(FUNDING_WS) + "')"
 
+# EOD-PATCH [2026-07-20 kpi-tab-booking-fix]: im_bookings.workspace label -> warehouse slug.
+# Verified 2026-07-20 against the warehouse's own Jul-18 v_meeting_truth per-slug attribution
+# (exact 1:1 match, all 8 workspaces). Used ONLY by _portal_meetings_overlay() below to source
+# meetings straight from the portal booking source-of-truth on days the warehouse snapshot has
+# not yet mirrored (e.g. a failed nightly). Any unmapped label is skipped (conservative).
+IMB_LABEL_TO_SLUG = {
+    "warm leads": "warm-leads",
+    "renaissance 1": "renaissance-1",
+    "funding 5 (eyver)": "renaissance-2",
+    "funding 1 (samuel)": "renaissance-4",
+    "funding 2 (ido)": "renaissance-5",
+    "funding 3 (leo)": "prospects-power",
+    "funding 4 (sam)": "koi-and-destroy",
+    "max ws": "the-gatekeepers",
+    "max's workspace": "the-gatekeepers",
+}
+
 LABELS_IN = "('opportunity','engagement','confused','not_interested','not interested')"
 
 
@@ -169,6 +186,43 @@ def effective_max_day() -> str:
 def ledger_ws_key(name: str) -> str:
     """core.workspace.name -> raw_comms ledger 'workspace' slug (e.g. Max's workspace -> max-s-workspace)."""
     return re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
+
+
+def _portal_meetings_overlay(lo_day: str, hi_day: str) -> dict:
+    """EOD-PATCH [2026-07-20 kpi-tab-booking-fix]. Live per-(submit-day, slug) EMAIL meetings
+    straight from the portal im_bookings table — THE booking source of truth — for days the
+    warehouse serving snapshot has not yet mirrored (its v_meeting_truth lags live portal by up
+    to a nightly; a failed nightly makes a real booking day render 0 on the tab). Returns
+    {(day, slug): count}: channel='Email', deleted_at IS NULL, deduped by (submit-day, email|
+    phone), workspace-label mapped to slug and restricted to FUNDING_WS. Read-only on the
+    warehouse; the feed's only write remains the portal dashboard_feeds upsert."""
+    purl = env_from_worker("PORTAL_SUPABASE_URL")
+    pkey = env_from_worker("PORTAL_SUPABASE_SERVICE_ROLE_KEY")
+    if not purl or not pkey:
+        raise RuntimeError("no portal creds (PORTAL_SUPABASE_URL / _SERVICE_ROLE_KEY)")
+    url = (purl.rstrip("/") + "/rest/v1/im_bookings"
+           "?select=date,email,phone,workspace"
+           "&channel=eq.Email&deleted_at=is.null"
+           f"&date=gte.{lo_day}&date=lte.{hi_day}&limit=100000")
+    req = urllib.request.Request(url, headers={"apikey": pkey, "Authorization": "Bearer " + pkey})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        booked = json.load(r)
+    seen: set = set()      # (submit-day, identity) — dedup email OR phone within a submit-day
+    counts: dict = {}
+    for b in booked:
+        day = b.get("date")
+        slug = IMB_LABEL_TO_SLUG.get((b.get("workspace") or "").strip().lower())
+        if not day or slug not in FUNDING_WS:
+            continue
+        em = (b.get("email") or "").strip().lower()
+        ph = "".join(ch for ch in (b.get("phone") or "") if ch.isdigit())
+        ident = em or ("ph:" + ph if ph else None)
+        dk = (day, ident) if ident else (day, "row:" + str(len(seen)))
+        if dk in seen:
+            continue
+        seen.add(dk)
+        counts[(day, slug)] = counts.get((day, slug), 0) + 1
+    return counts
 
 
 def main() -> None:
@@ -301,6 +355,26 @@ def main() -> None:
               AND mt.meeting_date BETWEEN DATE '{min_day}' AND DATE '{hi}'
               AND COALESCE(NULLIF(mt.workspace_slug, ''), cd.ws_slug) IN {WS_IN}
             GROUP BY 1, 2""")} if exists("core", "v_meeting_truth") else {}
+        # ── EOD-PATCH [2026-07-20 kpi-tab-booking-fix]: portal-direct meetings overlay ──────
+        # The snapshot's im_bookings mirror (v_meeting_truth) lags live portal by up to a
+        # nightly; when a nightly fails (2026-07-20 PASS-B segfault) a real booking day renders
+        # 0 meetings on the tab (Jul-19: warehouse 0 vs 66 real bookings). For days the
+        # warehouse has NOT mirrored — day > its max meeting day, up to cap, bounded 10d — take
+        # meetings LIVE from portal im_bookings (the booking source of truth). Self-disables per
+        # day the moment the warehouse catches up. Read-only on the warehouse; portal write only.
+        try:
+            _wh_max = max((d for (d, _s) in mtg), default="")
+            _floor = (datetime.strptime(cap, "%Y-%m-%d") - timedelta(days=10)).date().isoformat()
+            _lo = max(_wh_max, _floor)
+            if _lo < cap:
+                _lo = (datetime.strptime(_lo, "%Y-%m-%d") + timedelta(days=1)).date().isoformat()
+                _ov = _portal_meetings_overlay(_lo, cap)
+                for _k, _v in _ov.items():
+                    mtg[_k] = _v
+                log(f"portal-direct meetings overlay {_lo}..{cap}: {sum(_ov.values())} meetings "
+                    f"/ {len({_d for _d, _ in _ov})} day(s) [warehouse mtg max={_wh_max or 'none'}]")
+        except Exception as _e:
+            log(f"WARN portal-direct meetings overlay skipped ({_e}) — warehouse values kept")
         # ── label events (escrow-fresh): append-only cohorts + current-state lineage ────
         ev_base = f"""
             SELECT DISTINCT workspace_slug AS ws, lower(lead_email) AS le,
