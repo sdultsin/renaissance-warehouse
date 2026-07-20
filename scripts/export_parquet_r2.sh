@@ -59,6 +59,20 @@ DAY="$(date -u +%Y-%m-%d)"
 PREFIX="s3://${R2_BUCKET}/warehouse-parquet/dt=${DAY}"
 ENDPOINT="${R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
 
+# ── MEMORY DISCIPLINE [2026-07-20] ────────────────────────────────────────────────────────────
+# The per-table `COPY (SELECT * FROM t) TO parquet (ZSTD)` below ran `duckdb -readonly` with NO
+# memory_limit and NO threads cap = the DuckDB CLI default (~80% of RAM, one row-group + ZSTD
+# compression buffer PER core). On 2026-07-19 06:02Z that OOM-killed at 23GB RSS exporting a big
+# table (PID 1256415, this script line ~86) — the largest single-process overshoot on the box and,
+# alone, more than a 15GB box can hold. Bound it: a small pool + few writer threads spill to disk
+# and keep worst-case export RSS ~5-6GB. OUTPUT-PRESERVING — same rows/schema per parquet, just
+# fewer threads and a bounded pool (the SELECT * projection is unchanged). Env-overridable.
+R2_EXPORT_MEM="${R2_EXPORT_MEM:-5GB}"
+R2_EXPORT_THREADS="${R2_EXPORT_THREADS:-2}"
+R2_EXPORT_TMP="${R2_EXPORT_TMP:-/mnt/volume_nyc1_1781398428838/duckdb_tmp}"
+mkdir -p "$R2_EXPORT_TMP" 2>/dev/null || true
+DUCKDB_PRELUDE="SET memory_limit='${R2_EXPORT_MEM}'; SET threads=${R2_EXPORT_THREADS}; SET temp_directory='${R2_EXPORT_TMP}'; SET preserve_insertion_order=false;"
+
 # Tables to export, schema-qualified as <schema>.<table>:
 #   - core.*        canonical analytics tables (the durability priority)
 #   - derived.*     derived marts
@@ -77,6 +91,7 @@ for qt in $TABLES; do
   # qt = schema.table ; flatten to schema__table.parquet for a flat object key
   fname="$(echo "$qt" | tr '.' '_')"
   duckdb -readonly "$DB" "
+    ${DUCKDB_PRELUDE}
     INSTALL httpfs; LOAD httpfs;
     SET s3_endpoint='${ENDPOINT}';
     SET s3_access_key_id='${R2_ACCESS_KEY_ID}';

@@ -15,11 +15,30 @@ record; this is a cheap projection over ~130k + ~410k rows). Re-running converge
 
 ⚠ PII: reply_text + lead_email. Nothing here is written to a git-tracked file.
 
+MEMORY DISCIPLINE [2026-07-20]: the single-statement rebuild was the nightly OOM/segfault killer.
+raw_instantly_email is only ~479k rows but ~12GB — the reply_text / api_response_raw VARCHARs are
+huge (100KB+ HTML bodies). The `QUALIFY row_number() OVER (PARTITION BY email_id ...)` window forced
+DuckDB to carry ALL of that text through one window operator's sort/hash — which DuckDB cannot fully
+spill — plus two per-row regexp_replace passes and the core.reply PK ART-index build, all in ONE
+transaction. That pinned >16GB and on 2026-07-20 SEGFAULTED PASS B (exit 139) inside canonical,
+skipping every post-orchestrator step (incl. the #12 outbound fold). Fix = the SAME hash-bucket
+chunking the sending_dq rebuild already uses (per-date there): process the Instantly side in
+REPLY_CANONICAL_BUCKETS buckets by hash(email_id). Because that dedup window PARTITIONs BY email_id,
+every email_id lands wholly in one bucket, so the per-bucket QUALIFY yields the EXACT same surviving
+rows as the global one — output is bit-identical (row/checksum-proven 2026-07-20), only the peak
+memory is ~1/N (measured 26.5GB -> ~8GB). Each bucket is its own autocommit statement so the window
+materialization AND the PK-index delta stay bounded; DuckDB projection-pushdown reads only the
+narrow email_id column per bucket for the filter, so the fat text columns are read once total. The
+pipeline side is left as a SINGLE statement (its NOT EXISTS optimizes to one whole-core.reply anti-
+join; chunking it would rebuild that N times for no memory win — the hog was only the fat Instantly
+window). Reversible: set REPLY_CANONICAL_BUCKETS=1 to restore the old single-statement behaviour.
+
 Registers under the `canonical` phase. Schema = sql/ddl/43_reply_intent.sql.
 """
 from __future__ import annotations
 
 import logging
+import os
 
 from core.config import REPO_ROOT
 from core.registry import Registry, RunContext
@@ -28,6 +47,11 @@ from core.sync_run import PhaseResult
 logger = logging.getLogger("entities.reply_canonical")
 
 _DDL = REPO_ROOT / "sql" / "ddl" / "43_reply_intent.sql"
+
+# Memory-discipline chunking. N buckets over the dedup partition key. 16 keeps peak RSS well
+# under a small box while adding negligible wall time (the per-bucket window is 1/N the rows).
+# REPLY_CANONICAL_BUCKETS=1 restores the historical single-statement rebuild (escape hatch).
+N_BUCKETS = max(1, int(os.environ.get("REPLY_CANONICAL_BUCKETS", "16")))
 
 # Row-level non-human / non-positive classifiers (raw_instantly_email has no clean native auto
 # flag; ue_type is constant 2 = "received", and Instantly's per-message i_status sentinels
@@ -163,8 +187,13 @@ def run(ctx: RunContext) -> PhaseResult:
     # raw_pipeline_variant_copy.variant. Verified against variant_copy (campaign 8e698:
     # max step=3, max variant='T'=index 19). Falls back to the flattened i.step if the raw
     # composite is absent. eaccount = the inbox that sent the message the lead replied to.
-    db.execute(
-        f"""
+    #
+    # MEMORY-DISCIPLINE CHUNKING: bucketed by hash(email_id). The window PARTITIONs BY email_id,
+    # so every email_id's rows land wholly in one bucket -> the per-bucket dedup is identical to
+    # the global one (row/checksum-proven 2026-07-20). COALESCE guards a NULL email_id so it can
+    # never fall out of every bucket (it would still collapse to one row via the window, exactly
+    # as before). Each bucket is its own autocommit statement (bounded window + PK-index delta).
+    inst_tpl = f"""
         INSERT INTO core.reply
             (reply_id, lead_email, campaign_id, workspace_id, step, variant, eaccount,
              subject, reply_text, reply_timestamp, is_auto_reply, is_unsubscribe, source,
@@ -188,6 +217,7 @@ def run(ctx: RunContext) -> PhaseResult:
                 {unsub_sql}                                     AS is_unsubscribe
             FROM raw_instantly_email i
             WHERE i.lead_email IS NOT NULL AND trim(i.lead_email) <> ''
+              AND mod(hash(COALESCE(i.email_id, '')), {N_BUCKETS}) = {{bucket}}
             QUALIFY row_number() OVER (
                 PARTITION BY i.email_id ORDER BY i._loaded_at DESC
             ) = 1
@@ -197,14 +227,27 @@ def run(ctx: RunContext) -> PhaseResult:
             subject, reply_text, reply_timestamp, is_auto_reply, is_unsubscribe,
             'instantly', now(), ?
         FROM inst
-        """,
-        [ctx.run_id],
-    )
+        """
+    for b in range(N_BUCKETS):
+        db.execute(inst_tpl.format(bucket=b), [ctx.run_id])
 
     # Pipeline side (historical FALLBACK). Only insert rows NOT already covered by an Instantly
     # reply (same lead_email + reply_timestamp — raw_pipeline_reply_data has no thread_id, so we
     # use the loosest safe cross-source guard to avoid double-counting the same physical reply).
     # reply_id = stable md5 hash over the dedup key (no email_id upstream).
+    #
+    # NOT CHUNKED (single statement). Two memory-discipline refinements vs the pre-2026-07-20 code,
+    # both output-identical:
+    #   (1) the cross-source guard is checked against a NARROW key-set (_pipe_keys = DISTINCT
+    #       lead_email, reply_timestamp from core.reply) rather than core.reply directly. Projection
+    #       pushdown reads only those 2 columns (never the 7.8GB reply_text the Instantly buckets just
+    #       wrote), so the anti-join stays tiny instead of dragging the fat rows through the buffer
+    #       pool. NOT EXISTS over DISTINCT(k) is membership-identical to NOT EXISTS over the table.
+    #   (2) the side itself is left whole (not bucketed): its window is over the small
+    #       raw_pipeline_reply_data (~0.9GB) and bucketing would rebuild the anti-join N× for no win.
+    # All Instantly buckets are committed, so _pipe_keys reflects the full Instantly set.
+    db.execute("CREATE OR REPLACE TEMP TABLE _pipe_keys AS "
+               "SELECT DISTINCT lead_email, reply_timestamp FROM core.reply")
     db.execute(
         f"""
         INSERT INTO core.reply
@@ -233,7 +276,7 @@ def run(ctx: RunContext) -> PhaseResult:
                        GROUP BY campaign_id) cdu ON cdu.campaign_id = p.campaign_id
             WHERE p.lead_email IS NOT NULL AND trim(p.lead_email) <> ''
               AND NOT EXISTS (
-                  SELECT 1 FROM core.reply r
+                  SELECT 1 FROM _pipe_keys r
                   WHERE r.lead_email = lower(trim(p.lead_email))
                     AND r.reply_timestamp = p.reply_timestamp
               )
@@ -269,8 +312,8 @@ def run(ctx: RunContext) -> PhaseResult:
     ).fetchone()[0]
 
     logger.info(
-        "core.reply rebuilt: %d total (%s), auto=%d, unsubscribe=%d, cross-source dup groups=%d",
-        total, by_source, auto_n, unsub_n, dups,
+        "core.reply rebuilt: %d total (%s), auto=%d, unsubscribe=%d, cross-source dup groups=%d [%d buckets]",
+        total, by_source, auto_n, unsub_n, dups, N_BUCKETS,
     )
 
     return PhaseResult(
@@ -282,6 +325,7 @@ def run(ctx: RunContext) -> PhaseResult:
             "unsubscribe": unsub_n,
             "variant_recovery": variant_note,
             "dup_groups": dups,
+            "buckets": N_BUCKETS,
         },
     )
 
