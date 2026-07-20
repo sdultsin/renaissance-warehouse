@@ -63,4 +63,12 @@ SELECT sb.workspace, sb.name AS campaign_name, sb.cm_name, sb.status,
        sb.first_send_date, sb.last_send_date, sb.campaign_id
 FROM main.v_campaign_scoreboard sb
 LEFT JOIN dash.lead_label_attributed a ON a.campaign_id = sb.campaign_id
-GROUP BY ALL;
+-- Explicit GROUP BY of the scoreboard base columns (one row per campaign).
+-- `GROUP BY ALL` errors here ("Cannot mix aggregates with non-aggregated columns")
+-- because eop_real nests COUNT(...) alongside non-aggregated sb.sent in one scalar
+-- expression, which the GROUP BY ALL resolver can't classify. eop_native is a pure
+-- function of the grouped sb.sent/sb.opps, so it needs no entry here. [fix 2026-07-20]
+GROUP BY sb.workspace, sb.name, sb.cm_name, sb.status,
+         sb.sent, sb.human_replies, sb.opps,
+         sb.meetings, sb.kpi, sb.opp_to_meeting_pct,
+         sb.first_send_date, sb.last_send_date, sb.campaign_id;
