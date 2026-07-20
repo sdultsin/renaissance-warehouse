@@ -436,6 +436,30 @@ if [[ "$EXIT_CODE" -eq 0 || "$EXIT_CODE" -eq 1 ]]; then
         echo "email-thread sync SKIPPED in nightly — owned by the standalone SYNC-7 continuous drain (flag #26, 2026-07-10); set THREADS_IN_NIGHTLY=1 to restore" | tee -a "$LOG_FILE"
     fi
 
+    # OUTBOUND FOLD (bridge) — merge the box-local outbound logs (AIM auto-send log + reply-QA overlay)
+    # into raw_instantly_email_message so core.email_message / core.reply_attribution.answered reflect
+    # our REAL sends without waiting for the lagging per-lead drain (root cause:
+    # deliverables/2026-07-19-report-consolidation/forensics/OUTBOUND-CAPTURE-ROOTCAUSE.md). Reads LOCAL
+    # files only (no /emails API load); inherits conversation identity from the lead's captured inbound
+    # ue2 row; INSERT ... ON CONFLICT DO NOTHING (never clobbers real drain-captured rows). Idempotent +
+    # self-retiring: once the per-lead drain captures a message with its real id, the AIM fold row IS
+    # that id (drain upsert supersedes it) and overlay_bridge rows are cleaned up. MUST run AFTER the
+    # email-thread apply and BEFORE the SLA build so ue3 our-replies feed both. Flag-gated
+    # (WAREHOUSE_FOLD_OUTBOUND, default on); reversible via `DELETE ... WHERE source IN
+    # ('aim_fold','overlay_bridge')`.
+    if [ "${WAREHOUSE_FOLD_OUTBOUND:-1}" = "1" ]; then
+      echo "outbound fold (AIM send-log + reply-QA overlay -> raw_instantly_email_message)" | tee -a "$LOG_FILE"
+      ( set -o pipefail
+        export WAREHOUSE_FOLD_OUTBOUND=1
+        FOLD_STAGE=/root/core/email_outbound_fold_stage.jsonl
+        rm -f "$FOLD_STAGE" 2>/dev/null
+        "$PYTHON" -m entities.email_outbound_fold build --stage "$FOLD_STAGE" 2>&1 | tee -a "$LOG_FILE" \
+          && "$PYTHON" -m entities.email_outbound_fold apply --stage "$FOLD_STAGE" 2>&1 | tee -a "$LOG_FILE"
+        rm -f "$FOLD_STAGE" 2>/dev/null ) \
+        || echo "WARN email_outbound_fold_failed (continuing)" | tee -a "$LOG_FILE"
+      mv /root/renaissance-warehouse/core/email_thread_manifest_fold_*.txt /root/core/threads_bf/manifests/ 2>/dev/null || true
+    fi
+
     # SLA reply-time (§6 canonical business-minute clock) — MUST run AFTER the email-thread apply
     # above so core.email_message carries tonight's fresh prospect replies (ue_type=2) + our replies
     # (ue_type=3). Rebuilds the first-reply (seq=1, thread-grain) fact and materializes
