@@ -68,6 +68,11 @@ from core.registry import Registry, RunContext
 from core.sync_run import PhaseResult
 from sources.instantly import InstantlyClient, InstantlyError
 
+try:  # bulk-load path (see _bulk_insert); executemany remains the fallback
+    import pyarrow as _pa
+except Exception:  # noqa: BLE001 — never let a missing optional dep fail the nightly
+    _pa = None
+
 logger = logging.getLogger("entities.account_tags")
 
 # Concurrency tuning (env-overridable).
@@ -83,6 +88,63 @@ _WORKERS = max(1, int(os.environ.get("WAREHOUSE_ACCOUNT_TAGS_WORKERS", "3")))
 # skipped workspace simply keeps its last-good tag rows (nothing is wiped, nothing half-written).
 # Degrades gracefully: warn + carry on, never abort the run. [2026-07-14]
 _DEADLINE_S = max(0, int(os.environ.get("WAREHOUSE_ACCOUNT_TAGS_DEADLINE_MIN", "0"))) * 60
+
+
+# --- bulk temp-table load -----------------------------------------------------------------
+# WHY: this phase writes ~3.1M (email x tag) edge rows + ~390k inbox rows every night, and it
+# ran them through executemany — DuckDB's row-at-a-time prepared-statement path (~280 rows/sec
+# measured on the box). That made the SERIAL write loop 3h16m of the phase's 3h47m on
+# 2026-07-21, which by itself pushed the fleet-health snapshot from ~02:45 to 06:03 ET and the
+# Data Hub from ~05:30 to 08:47 ET. Registering an Arrow table and letting DuckDB read it
+# columnar is the same pattern entities/account_census.py already uses (399,279 rows in 23s).
+#
+# SEMANTICS ARE UNCHANGED: same target temp tables, same column order, same subsequent SQL —
+# only the transport differs. Proven byte-identical against the executemany path at full
+# production scale (391,871 inboxes / 3,096,450 edge rows) before shipping.
+#
+# DEGRADES GRACEFULLY (feedback_no_breaking_guards): no pyarrow, or any error building/loading
+# the Arrow table, falls straight back to the original executemany. INSERT is a single atomic
+# statement, so a failed bulk insert lands nothing and the fallback cannot double-write.
+_WT_ARROW_COLS = ("email", "tags_arr")
+_EDGE_ARROW_COLS = ("_loaded_at", "_run_id", "workspace_uuid", "workspace_slug", "email",
+                    "tag_id", "tag_label", "provider_code", "status", "daily_limit")
+
+
+def _arrow_types(kind: str):
+    if kind == "wt":
+        return [_pa.string(), _pa.list_(_pa.string())]
+    return [_pa.timestamp("us", tz="UTC"), _pa.string(), _pa.string(), _pa.string(),
+            _pa.string(), _pa.string(), _pa.string(), _pa.int32(), _pa.int32(), _pa.int32()]
+
+
+def _bulk_insert(conn, table: str, rows: list, kind: str) -> None:
+    """INSERT `rows` into the ALREADY-CREATED temp table `table` (columns in positional order).
+
+    Arrow-registered bulk insert; falls back to executemany on any problem."""
+    if not rows:
+        return
+    cols = _WT_ARROW_COLS if kind == "wt" else _EDGE_ARROW_COLS
+    if _pa is not None:
+        view = f"_arrow_{table.lstrip('_')}"
+        try:
+            columnar = list(zip(*rows))
+            tbl = _pa.table({name: _pa.array(list(vals), typ)
+                             for name, vals, typ in zip(cols, columnar, _arrow_types(kind))})
+            conn.register(view, tbl)
+            try:
+                conn.execute(f"INSERT INTO {table} SELECT * FROM {view}")
+            finally:
+                conn.unregister(view)
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("account_tags: bulk load into %s failed (%s: %s) — falling back to "
+                           "executemany (slower, same result)", table, type(exc).__name__,
+                           str(exc)[:120])
+            try:
+                conn.unregister(view)
+            except Exception:  # noqa: BLE001
+                pass
+    conn.executemany(f"INSERT INTO {table} VALUES ({', '.join(['?'] * len(cols))})", rows)
 
 
 def register(registry: Registry) -> None:
@@ -211,7 +273,7 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
         try:
             ctx.db.execute("CREATE OR REPLACE TEMP TABLE _wt (email VARCHAR, tags_arr VARCHAR[])")
             if rows:
-                ctx.db.executemany("INSERT INTO _wt VALUES (?, ?)", rows)
+                _bulk_insert(ctx.db, "_wt", rows, "wt")
             # ADDITIVE refresh: DELETE only the inboxes present in THIS pull, then re-INSERT them
             # with their current tags. Rows for inboxes no longer in the workspace (ghosts) are KEPT
             # — account_tags is the permanent per-inbox tag record; the domain/inbox archive lives in
@@ -254,9 +316,7 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
                     "workspace_slug VARCHAR, email VARCHAR, tag_id VARCHAR, tag_label VARCHAR, "
                     "provider_code INTEGER, status INTEGER, daily_limit INTEGER)"
                 )
-                ctx.db.executemany(
-                    "INSERT INTO _acct_tag_batch VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", edge_batch
-                )
+                _bulk_insert(ctx.db, "_acct_tag_batch", edge_batch, "edge")
                 ctx.db.execute(
                     """
                     INSERT INTO raw_instantly_account_tag
