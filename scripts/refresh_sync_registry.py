@@ -190,6 +190,16 @@ CORE_FEEDS = [
     ("core.opportunity",           "instantly",          "canonical", "daily",    "_resolved_at",  None, None, "opportunities"),
     ("core.domain_registry",       "registrar+dns",      "canonical", "periodic", "_loaded_at", None,   None, "Track I domain master"),
     ("core.sending_account",       "account_truth",      "canonical", "daily",    "last_seen_at", None, None, "canonical inbox"),
+    # [2026-07-21] The three rollup_history snapshots (DDL 1087, entities/rollup_history.py) were
+    # NEVER registered, so nothing watched them. That entity is FAIL-SOFT BY DESIGN — it logs and
+    # skips on any error and never raises — which makes an unmonitored silent stop its most likely
+    # failure mode, and it is the ONLY origin of provider/deliverability/batch history (nothing else
+    # is date-partitioned, so a gap is permanent and un-backfillable). Caught exactly that on
+    # registration: all three last landed 2026-07-19 while the nightly reported green.
+    # cadence=daily (standard 36h tier, appended once per nightly) + biz-recency on snapshot_date.
+    ("core.provider_history",       "rollup_history", "canonical", "daily", "_loaded_at", "snapshot_date", 2, "DDL 1087 daily provider aggregate; fail-soft writer -> registry is the only watch"),
+    ("core.deliverability_history", "rollup_history", "canonical", "daily", "_loaded_at", "snapshot_date", 2, "DDL 1087 daily SPF/DKIM/DMARC/blacklist aggregate; fail-soft writer -> registry is the only watch"),
+    ("core.batch_history",          "rollup_history", "canonical", "daily", "_loaded_at", "snapshot_date", 2, "DDL 1087 daily per-batch aggregate; fail-soft writer -> registry is the only watch"),
 ]
 
 
