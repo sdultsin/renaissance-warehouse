@@ -101,6 +101,41 @@ def rebuild(db, now: datetime) -> dict:
     has_call_outcome = _table_exists(db, "core", "call_outcome")
     has_portal = _table_exists(db, "main", "raw_im_bookings")
 
+    # [2026-07-21] Do NOT delete THROUGH the secondary indexes — that is what has been killing the
+    # nightly. On 2026-07-21 23:06 this exact DELETE raised
+    #   "Invalid Input Error: Failed to delete all rows from index. Only deleted 627 out of 901 rows"
+    # which poisons the DuckDB connection, so the orchestrator aborts the whole run with "no further
+    # phases will run". rollup_history lives LATER in this same `canonical` phase, which is why
+    # core.provider_history / deliverability_history / batch_history froze at 2026-07-19. The same
+    # error has hit `core.canonical.domain` too — 12 occurrences in logs/nightly.log.
+    #
+    # It is NOT inherent to the pattern: a scratch table built from the same 89,898 rows with the
+    # same four indexes DELETEs fine, and survived 12 consecutive DELETE+INSERT cycles. So it is
+    # accumulated ART state in the live build DB. Rather than repair that state by hand, drop the
+    # secondary indexes for the rebuild and recreate them after — the rebuild then never deletes
+    # through an index, AND every run leaves freshly-built indexes, so the corruption cannot
+    # accumulate again. These are non-unique lookup indexes: dropping them touches no data and
+    # rebuilding 89k rows is trivial.
+    #
+    # NOTE THE SCHEMA QUALIFIER. DuckDB namespaces indexes: `DROP INDEX ix_core_conv_event_agent`
+    # raises "does not exist! Did you mean core.ix_...", and the IF EXISTS form SILENTLY DOES
+    # NOTHING — a repair written the obvious way reports success and changes nothing.
+    # DuckDB is ASYMMETRIC here and it is a trap: DROP INDEX *requires* the schema qualifier
+    # (`core.ix_…`), while CREATE INDEX *rejects* it ("Parser Error: syntax error at or near .")
+    # and takes the schema from the table. Get that wrong and you drop all four and cannot put
+    # them back — caught by the cycle test, not by reading. So keep BOTH forms.
+    _IDX = [("ix_core_conv_event_agent",    "conversion_agent"),
+            ("ix_core_conv_event_channel",  "source_channel"),
+            ("ix_core_conv_event_occurred", "occurred_at"),
+            ("ix_core_conv_event_campaign", "campaign_id")]
+    _dropped = []
+    for _name, _col in _IDX:
+        try:
+            db.execute(f"DROP INDEX core.{_name}")     # qualified: required by DROP
+            _dropped.append((_name, _col))             # bare: required by CREATE
+        except Exception as _e:      # already absent is fine; anything else must not abort the run
+            logger.info("conversion_event: index %s not dropped (%s)", _name, str(_e)[:80])
+
     db.execute("DELETE FROM core.conversion_event")
 
     n_im = 0
@@ -280,6 +315,20 @@ def rebuild(db, now: datetime) -> dict:
         except Exception as exc:  # core.lead exists but column shape differs — tolerate.
             logger.warning("core.lead present but lead_key join failed (%s) — leaving lead_key NULL", exc)
             lead_joined = 0
+
+    # Put the secondary indexes back, freshly built from the rows just inserted. Recreating is what
+    # makes this self-healing: even if the ART had drifted, the next run starts from a clean one.
+    # Never let this abort the phase — the DATA is already correct at this point, and a missing
+    # lookup index is a performance issue, not a correctness one ([[feedback_no_breaking_guards]]).
+    for _name, _col in _dropped:
+        try:
+            db.execute(f"CREATE INDEX IF NOT EXISTS {_name} ON core.conversion_event ({_col})")
+        except Exception as _e:  # noqa: BLE001
+            logger.error("conversion_event: could NOT recreate index %s (%s) — data is fine, "
+                         "lookups on that column will be slower until the next run.",
+                         _name, str(_e)[:120])
+    if _dropped:
+        logger.info("conversion_event: rebuilt %d secondary index(es) after the swap", len(_dropped))
 
     total = db.execute("SELECT count(*) FROM core.conversion_event").fetchone()[0]
     null_channel = db.execute(
