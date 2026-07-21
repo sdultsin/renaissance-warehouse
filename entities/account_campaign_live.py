@@ -29,6 +29,40 @@ logger = logging.getLogger("entities.account_campaign_live")
 _ACTIVE_STATUS = 1  # Instantly campaign status: 1=active, 0=draft, 2=paused, 3=completed
 
 
+def uncovered_active_workspaces(db, covered_slugs, failures) -> list[str]:
+    """Active workspaces that no key reached this run — i.e. never even attempted.
+
+    Excludes workspaces that WERE attempted and failed: those are already reported in
+    `failures`, and double-reporting them would bury the distinct "we have no key for this
+    workspace at all" case, which is the one that stays broken forever if nobody notices.
+
+    Fail-LOUD in the log, but NEVER raises: this runs after the pulls have already
+    committed, so a roster read problem must not turn a successful ingest into a failed
+    phase ([[feedback_no_breaking_guards]]).
+    """
+    try:
+        active = {
+            s for (s,) in db.execute(
+                "SELECT slug FROM core.workspace WHERE is_active"
+            ).fetchall() if s
+        }
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("account_campaign_live: coverage check skipped (%s)", exc)
+        return []
+
+    attempted = set(covered_slugs) | {f.get("slug") for f in failures if f.get("slug")}
+    uncovered = sorted(active - attempted)
+    if uncovered:
+        logger.error(
+            "account_campaign_live COVERAGE GAP: %d active workspace(s) were never pulled "
+            "(no INSTANTLY_KEY_<SLUG> reached them): %s — for every inbox in them "
+            "in_campaign is UNKNOWN, not false.",
+            len(uncovered), ", ".join(uncovered))
+    else:
+        logger.info("account_campaign_live: all %d active workspaces covered", len(active))
+    return uncovered
+
+
 def register(registry: Registry) -> None:
     registry.add_phase("instantly", "account_campaign_live", run_account_campaign_live_ingest)
 
@@ -56,6 +90,15 @@ def run_account_campaign_live_ingest(ctx: RunContext) -> PhaseResult:
     workspaces_done: list[str] = []
     failures: list[dict] = []
     seen_workspace_ids: set[str] = set()
+    # [2026-07-21] Coverage bookkeeping. A workspace can be absent from
+    # core.account_campaign_live for two VERY different reasons: (a) it genuinely has no
+    # inbox attached to any campaign (correct — e.g. a workspace still in warm-up), or
+    # (b) we never pulled it at all because no INSTANTLY_KEY_<SLUG> exists for it. The
+    # table alone cannot tell those apart, so a brand-new workspace would stay silently
+    # uncovered forever. rows_by_slug records an explicit 0 for (a); the roster check
+    # below names (b) out loud.
+    rows_by_slug: dict[str, int] = {}
+    covered_slugs: set[str] = set()
 
     for slug in sorted(keys.keys()):
         try:
@@ -146,6 +189,8 @@ def run_account_campaign_live_ingest(ctx: RunContext) -> PhaseResult:
                 ctx.db.execute("DROP TABLE IF EXISTS _acl_batch")
                 total_inboxes += len(rows)
                 workspaces_done.append(slug)
+                rows_by_slug[canon_slug] = len(rows)
+                covered_slugs.add(canon_slug)
                 logger.info("account_campaign_live %s (slug=%s): %d inboxes in campaigns across %d campaigns",
                             slug, canon_slug, len(rows), len(campaigns))
         except InstantlyError as exc:
@@ -155,8 +200,17 @@ def run_account_campaign_live_ingest(ctx: RunContext) -> PhaseResult:
             logger.exception("account_campaign_live %s: unexpected error", slug)
             failures.append({"slug": slug, "error": f"{type(exc).__name__}: {exc}"[:300]})
 
+    # Roster coverage: every ACTIVE workspace must have been reached by some key. This is
+    # fail-LOUD-but-degrade-gracefully: it logs an error and reports the uncovered slugs in
+    # the phase notes, and never raises — a roster read problem must not lose a pull that
+    # already succeeded and committed.
+    uncovered = uncovered_active_workspaces(ctx.db, covered_slugs, failures)
+
     return PhaseResult(notes={
         "inboxes_in_campaigns": total_inboxes,
         "workspaces_done": workspaces_done,
         "failures": failures,
+        # explicit 0 = pulled and genuinely empty (NOT the same as absent/uncovered)
+        "rows_by_workspace": rows_by_slug,
+        "uncovered_active_workspaces": uncovered,
     })
