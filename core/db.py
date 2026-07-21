@@ -207,6 +207,52 @@ def _release_write_lock() -> None:
     # Leave WAREHOUSE_WRITE_LOCK_HELD set: the process is exiting; clearing it has no benefit.
 
 
+_DB_LOCK_RETRY_S = int(os.environ.get("WAREHOUSE_DB_LOCK_RETRY_S", "1800"))
+
+
+def _duckdb_connect_retrying(path: Path, read_only: bool) -> duckdb.DuckDBPyConnection:
+    """duckdb.connect(), but WAIT OUT a conflicting on-disk lock instead of dying on first contact.
+
+    WHY THIS EXISTS [2026-07-21]. The flock in _acquire_write_lock only sequences writers that go
+    through core.db. A writer that does NOT — the duckdb CLI, or a script opening the file itself —
+    takes DuckDB's own file lock while holding no flock, so we win the flock and then blow up on
+    `IO Error: Could not set lock on file ... Conflicting lock is held`. That is not a transient
+    annoyance: it killed the nightly's whole PASS B (14 ingest phases: comms_mirror, sendivo,
+    derived, account_truth, dns_sweep, ...) on three consecutive nights, which is why the send log
+    and deliverability history silently went days stale while PASS A kept succeeding and every
+    dashboard looked healthy.
+
+    Degrades gracefully by design: on the uncontended path this is exactly one connect() call and
+    behaves identically. It only engages where the old code raised, and it still raises the ORIGINAL
+    error once the budget is spent, so a genuinely stuck lock fails loudly rather than hanging
+    forever. Read-only connections never retry — DuckDB permits concurrent readers, so a lock error
+    there means something else is wrong and should surface immediately.
+    """
+    deadline = time.monotonic() + _DB_LOCK_RETRY_S
+    warned = False
+    delay = 5.0
+    while True:
+        try:
+            return duckdb.connect(str(path), read_only=read_only)
+        except Exception as exc:                     # duckdb.IOException is not always importable
+            if read_only or "Conflicting lock" not in str(exc):
+                raise
+            if time.monotonic() >= deadline:
+                log.error(
+                    "warehouse DB file lock still held after %ss — giving up: %s",
+                    _DB_LOCK_RETRY_S, str(exc)[:200],
+                )
+                raise
+            if not warned:
+                log.warning(
+                    "warehouse DB file lock held by a non-flock writer; waiting up to %ss. %s",
+                    _DB_LOCK_RETRY_S, str(exc)[:200],
+                )
+                warned = True
+            time.sleep(delay)
+            delay = min(delay * 1.5, 60.0)           # back off, but keep checking at least once a minute
+
+
 def connect(db_path: Path | None = None, *, read_only: bool = False) -> duckdb.DuckDBPyConnection:
     """Open a DuckDB connection. Caller is responsible for closing.
 
@@ -222,7 +268,7 @@ def connect(db_path: Path | None = None, *, read_only: bool = False) -> duckdb.D
     path.parent.mkdir(parents=True, exist_ok=True)
     if not read_only:
         _acquire_write_lock()
-    conn = duckdb.connect(str(path), read_only=read_only)
+    conn = _duckdb_connect_retrying(path, read_only)
     tmp_dir = path.parent / "duckdb_tmp"
     try:
         os.makedirs(tmp_dir, exist_ok=True)
