@@ -90,13 +90,16 @@ def run_inbox_date_history(ctx: RunContext) -> PhaseResult:
     before = conn.execute("SELECT count(*) FROM core.inbox_date_history").fetchone()[0]
     conn.execute("BEGIN")
     try:
-        # INSERT-ONLY. The anti-join in _DIFF_SQL already excludes anything we hold, so this can be
-        # re-run any number of times without duplicating a single row.
+        # INSERT-ONLY, never UPDATE, never DELETE — that is the append-only contract. Three layers,
+        # cheapest first: the anti-join skips what we already hold, DISTINCT stops a single run
+        # self-duplicating, and ON CONFLICT DO NOTHING makes even a concurrent run a clean no-op
+        # instead of a unique violation. DO NOTHING, never DO UPDATE: a history row that can be
+        # rewritten is not history.
         conn.execute(
             "INSERT INTO core.inbox_date_history "
             "(email, workspace_slug, field, old_value, new_value, detected_on, _loaded_at, _run_id) "
             "SELECT email, workspace_slug, field, old_value, new_value, detected_on, now(), ? "
-            "FROM (" + _DIFF_SQL + ")", [ctx.run_id])
+            "FROM (" + _DIFF_SQL + ") ON CONFLICT DO NOTHING", [ctx.run_id])
         conn.execute("COMMIT")
     except Exception:
         conn.execute("ROLLBACK")
