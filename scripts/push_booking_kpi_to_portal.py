@@ -32,7 +32,8 @@ import json
 import os
 import sys
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
+from zoneinfo import ZoneInfo
 
 # --- static config (mirrors pipeline ws_rename / kpi_workspaces / kpi_ws_alias) -----
 # ws_real(): coalesce(ws_rename.real for old, old). Rename map (old display -> real).
@@ -97,6 +98,10 @@ FROM raw_pipeline_campaign_daily_metrics mt
 JOIN dims d ON d.campaign_id = mt.campaign_id
 LEFT JOIN ws_rename r ON r.old = d.workspace_name
 WHERE COALESCE(r.real, d.workspace_name) IN (SELECT name FROM kpi_ws)
+  -- Seal ONLY days older than the intraday live settling window. The live feed
+  -- (push_booking_kpi_intraday.py) owns [today-K..today] direct from Instantly; this
+  -- warehouse push owns [..today-(K+1)] — disjoint (date,ws) keyspace, both upsert-only.
+  AND CAST(mt.date AS DATE) <= DATE '__SEAL_FLOOR__'
 GROUP BY 1, 2
 -- Publish only real (positive) sent days. kpi_ingest_snapshot is UPSERT-only, so
 -- never emitting a 0 means a day is never regressed to 0 in the cache. In
@@ -202,7 +207,12 @@ def portal_ingest(snapshot: dict) -> dict:
 def main() -> int:
     _load_repo_env()
     dry = "--dry" in sys.argv
-    wd = wh_query(SQL_WORKSPACE_DAILY)
+    # Seal-floor: own ONLY completed days older than the intraday live settling window
+    # [today-K..today] (push_booking_kpi_intraday.py). K MUST match that feed's value.
+    K = int(_env("KPI_INTRADAY_SETTLE_DAYS", default="5"))
+    seal_floor = (datetime.now(ZoneInfo("America/New_York")).date()
+                  - timedelta(days=K + 1)).isoformat()
+    wd = wh_query(SQL_WORKSPACE_DAILY.replace("__SEAL_FLOOR__", seal_floor))
     cw = wh_query(SQL_CAMPAIGN_WS)
     snapshot = {
         "generated_at": datetime.now(timezone.utc).isoformat(),

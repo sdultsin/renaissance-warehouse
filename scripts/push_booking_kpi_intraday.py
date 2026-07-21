@@ -42,7 +42,7 @@ import sys
 import time
 import urllib.request
 import urllib.error
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
 # canonical Instantly key env-var -> KPIs-tab workspace display name (the 10 tab rows).
@@ -122,15 +122,27 @@ def _get(url: str, key: str, tries: int = 4):
     return {"_error": last}
 
 
-def instantly_today(day: str, key: str) -> tuple[int, int] | None:
-    """(sent, opps) for `day` (YYYY-MM-DD) for the workspace this key belongs to."""
-    out = _get(f"{INSTANTLY_DAILY}?start_date={day}&end_date={day}", key)
+def instantly_range(start_day: str, end_day: str, key: str) -> dict | None:
+    """{date: (sent, opps)} over [start_day, end_day] for this key's workspace.
+
+    ONE call covers the whole settling window. Opportunities are Instantly-native and
+    trail sends by 1-3 days (marked over the following days), so a completed day keeps
+    climbing after midnight — we must RE-PULL the recent window every tick, not freeze
+    each day at its first (undercounted) reading. That's the fix for opp<bookings on
+    recent days: a day settles to its true count within the window instead of sticking
+    at its ~midnight estimate."""
+    out = _get(f"{INSTANTLY_DAILY}?start_date={start_day}&end_date={end_day}", key)
     if isinstance(out, dict) and out.get("_error"):
         return None
     rows = out if isinstance(out, list) else out.get("data", []) if isinstance(out, dict) else []
-    sent = sum(int(r.get("sent") or 0) for r in rows)
-    opps = sum(int(r.get("opportunities") or 0) for r in rows)
-    return sent, opps
+    agg: dict = {}
+    for r in rows:
+        d = str(r.get("date") or "")[:10]
+        if not d:
+            continue
+        ps, po = agg.get(d, (0, 0))
+        agg[d] = (ps + int(r.get("sent") or 0), po + int(r.get("opportunities") or 0))
+    return agg
 
 
 def portal_ingest(snapshot: dict) -> dict:
@@ -154,9 +166,18 @@ def portal_ingest(snapshot: dict) -> dict:
 def main() -> int:
     _load_envs()
     dry = "--dry" in sys.argv
-    day = _env("KPI_INTRADAY_DAY")  # override for testing
-    if not day:
-        day = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    # Settling window: re-pull [today-K .. today] every tick so recent completed days
+    # keep climbing to their true opp count (opps trail sends 1-3d). The warehouse push
+    # owns [.. today-(K+1)] (disjoint), so kpi_ingest_snapshot (upsert by date+ws) has
+    # exactly one owner per (date,ws) — no overlap, no double-count.
+    # K=5: native opps trail sends ~4-5 days to fully mature (weekday day-4 ~=85%,
+    # day-5+ settled), so keep a day live-refreshing until it's done, then the
+    # warehouse seals it. Tunable via env; the warehouse push MUST use the same K.
+    K = int(_env("KPI_INTRADAY_SETTLE_DAYS", default="5"))
+    end = _env("KPI_INTRADAY_DAY")  # override for testing
+    if not end:
+        end = datetime.now(ZoneInfo("America/New_York")).date().isoformat()
+    start = (datetime.strptime(end, "%Y-%m-%d").date() - timedelta(days=K)).isoformat()
 
     rows, missing, errors = [], [], []
     for ws_name, key_names in WS_KEYS:
@@ -164,23 +185,24 @@ def main() -> int:
         if not key:
             missing.append(ws_name)
             continue
-        res = instantly_today(day, key)
-        if res is None:
+        agg = instantly_range(start, end, key)
+        if agg is None:
             errors.append(ws_name)
             continue
-        sent, opps = res
-        if sent > 0:  # match warehouse push: never regress a day to 0
-            rows.append({"d": day, "ws": ws_name, "sent": sent, "opps": opps})
+        for d, (sent, opps) in agg.items():
+            if sent > 0:  # match warehouse push: never regress a day to 0
+                rows.append({"d": d, "ws": ws_name, "sent": sent, "opps": opps})
 
     ts = datetime.now(timezone.utc).isoformat()
     if dry:
-        print(f"[dry {ts}] day={day} rows={len(rows)} missing={missing} errors={errors}")
-        for r in sorted(rows, key=lambda x: -x["sent"]):
-            print(f"   {r['ws']:28s} sent={r['sent']:>9} opps={r['opps']:>4}")
+        print(f"[dry {ts}] window={start}..{end} (K={K}) rows={len(rows)} "
+              f"missing={missing} errors={errors}")
+        for r in sorted(rows, key=lambda x: (x["d"], -x["sent"])):
+            print(f"   {r['d']} {r['ws']:28s} sent={r['sent']:>9} opps={r['opps']:>4}")
         return 0
 
     if not rows:
-        print(f"[{ts}] intraday: no positive-sent workspaces for {day} "
+        print(f"[{ts}] intraday: no positive-sent rows for {start}..{end} "
               f"(missing={missing} errors={errors}) — nothing pushed")
         return 0
 
@@ -191,7 +213,7 @@ def main() -> int:
     }
     res = portal_ingest(snapshot)
     total_sent = sum(r["sent"] for r in rows)
-    print(f"[{ts}] intraday KPI -> portal: day={day} ws={len(rows)} "
+    print(f"[{ts}] intraday KPI -> portal: window={start}..{end} rows={len(rows)} "
           f"sent_total={total_sent} opps_total={sum(r['opps'] for r in rows)} "
           f"ingest={res} missing={missing} errors={errors}")
     return 0
