@@ -40,10 +40,24 @@ def uncovered_active_workspaces(db, covered_slugs, failures) -> list[str]:
     committed, so a roster read problem must not turn a successful ingest into a failed
     phase ([[feedback_no_breaking_guards]]).
     """
+    # Only demand coverage for active workspaces that actually HOLD inboxes.
+    #
+    # [2026-07-21, same day, second pass] `is_active` here does NOT mean "one of David's
+    # operational workspaces" — entities/workspace.py sets it TRUE for any workspace whose key
+    # ANSWERED this run. So it is TRUE for `the-eagles`: we still hold a working key and Instantly
+    # still returns it (5 campaigns), even though it holds 0 inboxes, has sent nothing in 90 days,
+    # and is NOT among the 11 on the canonical roster. Flipping that row by hand would be undone by
+    # the very next nightly, because the key keeps answering.
+    #
+    # A workspace with no inboxes has nothing whose in_campaign could be wrong, so demanding
+    # campaign coverage for it is meaningless — and would have made this check cry wolf EVERY night
+    # about `the-eagles` and `growth-1`. A guard that always fires is a guard nobody reads.
     try:
         active = {
             s for (s,) in db.execute(
-                "SELECT slug FROM core.workspace WHERE is_active"
+                "SELECT w.slug FROM core.workspace w "
+                "WHERE w.is_active AND EXISTS ("
+                "  SELECT 1 FROM core.sending_account a WHERE a.workspace_slug = w.slug)"
             ).fetchall() if s
         }
     except Exception as exc:  # noqa: BLE001
