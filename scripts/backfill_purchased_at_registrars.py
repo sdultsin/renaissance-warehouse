@@ -41,7 +41,9 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import duckdb
@@ -174,6 +176,19 @@ def dynadot_accounts(env: dict) -> list[tuple[str, str]]:
     return out
 
 
+def namecheap_accounts(env: dict) -> list[tuple[str, str, str]]:
+    """(label, apiuser, apikey) for every numbered Namecheap account. Env:
+    NAMECHEAP_<n>_API_USER + NAMECHEAP_<n>_API_KEY (the ApiUser doubles as UserName). [2026-07-20]"""
+    out = []
+    for n in sorted({int(m.group(1)) for k in env
+                     for m in [re.match(r"^NAMECHEAP_(\d+)_API_KEY$", k)] if m}):
+        u = env.get(f"NAMECHEAP_{n}_API_USER", "")
+        ak = env.get(f"NAMECHEAP_{n}_API_KEY", "")
+        if u and ak:
+            out.append((f"namecheap.{n}", u, ak))
+    return out
+
+
 # ---- fetchers (return list[(domain, create_iso_or_none, expire_iso_or_none)]) ----
 
 def fetch_porkbun(label, ak, sk) -> list[tuple]:
@@ -245,6 +260,67 @@ def fetch_dynadot(label, ak) -> list[tuple]:
 
 # ---- cache + load ------------------------------------------------------------
 
+def _nc_date(s):
+    """Namecheap 'MM/DD/YYYY' -> 'YYYY-MM-DD' so TRY_CAST parses it. None-safe; passes through anything else."""
+    if not s:
+        return None
+    s = str(s).strip()
+    m = re.match(r"^(\d{1,2})/(\d{1,2})/(\d{4})$", s)
+    return f"{int(m.group(3)):04d}-{int(m.group(1)):02d}-{int(m.group(2)):02d}" if m else s
+
+
+_CLIENT_IP = None
+def _client_ip() -> str:
+    """The public IP the registrar sees — must be the whitelisted one. Env PUBLIC_IP wins; else ipify."""
+    global _CLIENT_IP
+    if _CLIENT_IP:
+        return _CLIENT_IP
+    ip = os.environ.get("PUBLIC_IP", "").strip()
+    if not ip:
+        try:
+            ip = urllib.request.urlopen("https://api.ipify.org", timeout=10).read().decode().strip()
+        except Exception:
+            ip = "127.0.0.1"
+    _CLIENT_IP = ip
+    return ip
+
+
+def fetch_namecheap(label, user, key) -> list[tuple]:
+    """namecheap.domains.getList (XML), paged. ClientIp must be a whitelisted IP (the box's). Returns
+    (domain, created, expires, auto_renew, nameservers=None, domain_status). [2026-07-20]"""
+    out, page = [], 1
+    base = "https://api.namecheap.com/xml.response"
+    while True:
+        q = urllib.parse.urlencode({"ApiUser": user, "ApiKey": key, "UserName": user,
+            "Command": "namecheap.domains.getList", "ClientIp": _client_ip(),
+            "Page": str(page), "PageSize": "100"})
+        req = urllib.request.Request(base + "?" + q, headers={"User-Agent": UA})
+        raw = urllib.request.urlopen(req, timeout=90).read().decode("utf-8", "replace")
+        raw = raw.replace('xmlns="http://api.namecheap.com/xml.response"', '')
+        root = ET.fromstring(raw)
+        if root.attrib.get("Status") != "OK":
+            errs = "; ".join((e.text or "") for e in root.iter("Error"))
+            raise RuntimeError(f"{label} error: {errs or 'non-OK status'}")
+        got = 0
+        for d in root.iter("Domain"):
+            dom = (d.attrib.get("Name") or "").lower()
+            if not dom:
+                continue
+            got += 1
+            ar = "yes" if str(d.attrib.get("AutoRenew", "")).lower() == "true" else "no"
+            status = "expired" if str(d.attrib.get("IsExpired", "")).lower() == "true" else "active"
+            out.append((dom, _nc_date(d.attrib.get("Created")), _nc_date(d.attrib.get("Expires")),
+                        ar, None, status))
+        total = None
+        for tp in root.iter("TotalItems"):
+            total = int(tp.text or 0)
+        if got == 0 or total is None or len(out) >= total:
+            break
+        page += 1
+        time.sleep(0.4)
+    return out
+
+
 def fetch_registrar(reg: str, env: dict) -> list[tuple]:
     rows: list[tuple] = []
     if reg == "porkbun":
@@ -256,6 +332,9 @@ def fetch_registrar(reg: str, env: dict) -> list[tuple]:
     elif reg == "dynadot":
         accts = dynadot_accounts(env)
         fn = lambda a: fetch_dynadot(*a)
+    elif reg == "namecheap":
+        accts = namecheap_accounts(env)
+        fn = lambda a: fetch_namecheap(*a)
     else:
         raise ValueError(reg)
     if not accts:
@@ -305,7 +384,7 @@ def main(argv=None) -> int:
                     help="load from existing caches without hitting the APIs")
     ap.add_argument("--no-load", action="store_true",
                     help="fetch + write caches only; skip the DuckDB date-load (isolated testing)")
-    ap.add_argument("--registrars", default="porkbun,spaceship,dynadot")
+    ap.add_argument("--registrars", default="porkbun,spaceship,dynadot,namecheap")
     ap.add_argument("--cache-dir", default=CACHE_DIR)
     args = ap.parse_args(argv)
 
