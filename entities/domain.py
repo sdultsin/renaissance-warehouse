@@ -81,6 +81,34 @@ def run_domain(ctx: RunContext) -> PhaseResult:
     if not batch_exists:
         logger.warning("co-sale batch CSV not found at %s — only NS-handoff domains get batch cost", BATCH_CSV)
 
+    # [2026-07-21] Same fix as entities/conversion_event.py, and for the same reason: deleting
+    # THROUGH the secondary indexes is what aborts the nightly. This table hit it on 2026-07-12
+    # ("Only deleted 966 out of 2048 rows") and again 2026-07-21 10:38 ("1107 out of 2048"). The
+    # error poisons the DuckDB connection, so the orchestrator kills the whole run with "no further
+    # phases will run" — taking rollup_history (later in this same 'canonical' phase) with it, which
+    # is why provider/deliverability/batch history froze at 2026-07-19.
+    #
+    # Drop the lookup indexes for the rebuild, recreate them after: the rebuild never deletes through
+    # an index, and each run leaves freshly-built ones so the drift cannot accumulate.
+    #
+    # DuckDB is ASYMMETRIC — DROP needs `core.<name>`, CREATE REJECTS the prefix. And the unqualified
+    # `DROP INDEX IF EXISTS` form SILENTLY DOES NOTHING, so a naive version reports success, changes
+    # nothing, and then fails on CREATE with "already exists". Keep both forms.
+    _IDX = [("ix_core_domain_esp",         "esp"),
+            ("ix_core_domain_infra",       "infra_provider"),
+            ("ix_core_domain_ns",          "ns_provider"),
+            ("ix_core_domain_signature",   "dns_signature"),
+            ("ix_core_domain_a24",         "a_record_24"),
+            ("ix_core_domain_brand",       "brand_prefix"),
+            ("ix_core_domain_blacklisted", "any_blacklist_active")]
+    _dropped = []
+    for _name, _col in _IDX:
+        try:
+            db.execute(f"DROP INDEX core.{_name}")
+            _dropped.append((_name, _col))
+        except Exception as _e:      # already absent is fine; must never abort the run
+            logger.info("domain: index %s not dropped (%s)", _name, str(_e)[:80])
+
     db.execute("DELETE FROM core.domain")
     db.execute(
         f"""
@@ -189,6 +217,18 @@ def run_domain(ctx: RunContext) -> PhaseResult:
             WHERE batch.domain NOT IN (SELECT domain FROM core.domain)
             """
         )
+
+    # Rebuild the lookup indexes from the rows just inserted. Logged, never raised: the DATA is
+    # already correct here, and a missing lookup index is a performance issue, not a correctness one
+    # ([[feedback_no_breaking_guards]]). Note the bare name — CREATE rejects the schema prefix.
+    for _name, _col in _dropped:
+        try:
+            db.execute(f"CREATE INDEX IF NOT EXISTS {_name} ON core.domain ({_col})")
+        except Exception as _e:  # noqa: BLE001
+            logger.error("domain: could NOT recreate index %s (%s) — data is fine, lookups on that "
+                         "column stay slower until the next run.", _name, str(_e)[:120])
+    if _dropped:
+        logger.info("domain: rebuilt %d secondary index(es) after the rebuild", len(_dropped))
 
     n = db.execute("SELECT count(*) FROM core.domain").fetchone()[0]
     n_ns = db.execute("SELECT count(*) FROM core.domain WHERE ns_provider IS NOT NULL").fetchone()[0]
