@@ -73,8 +73,8 @@ def run_hub_fleet_history(ctx: RunContext) -> PhaseResult:
         # upsert by (metric, d): replace exactly the days the export carries, keep all others
         conn.execute("CREATE OR REPLACE TEMP TABLE _hfh AS "
                      "SELECT * FROM core.hub_fleet_history LIMIT 0")
-        conn.executemany(
-            "INSERT INTO _hfh VALUES (?,?,?,?,?,?, now())", clean)
+        if clean:   # executemany raises on an empty list (same trap as hub_problem_ack)
+            conn.executemany("INSERT INTO _hfh VALUES (?,?,?,?,?,?, now())", clean)
         conn.execute(
             "DELETE FROM core.hub_fleet_history WHERE (metric, d) IN (SELECT DISTINCT metric, d FROM _hfh)")
         conn.execute("INSERT INTO core.hub_fleet_history SELECT * FROM _hfh")

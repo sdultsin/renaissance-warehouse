@@ -59,18 +59,20 @@ def run_hub_problem_ack(ctx: RunContext) -> PhaseResult:
     conn.execute("BEGIN")
     try:
         conn.execute("DELETE FROM core.hub_problem_ack")
-        conn.executemany(
+        # DuckDB's executemany RAISES on an empty parameter list — an empty sub-table (e.g. no log
+        # rows yet) must not abort the whole mirror. Found live on the first backfill run.
+        if acks: conn.executemany(
             "INSERT INTO core.hub_problem_ack VALUES (?,?,?,?,?,?,?,?,?,?, now())",
             [[r.get("gkey"), r.get("problem"), r.get("workspace"), bool(r.get("acked")),
               r.get("note"), r.get("acked_by"), r.get("acked_at"), r.get("first_flagged"),
               r.get("last_seen"), int(r.get("last_count") or 0)] for r in acks])
         conn.execute("DELETE FROM core.hub_problem_ack_log")
-        conn.executemany(
+        if log: conn.executemany(
             "INSERT INTO core.hub_problem_ack_log VALUES (?,?,?,?,?,?,?,?, now())",
             [[r.get("ts"), r.get("gkey"), r.get("problem"), r.get("workspace"),
               int(r.get("cnt") or 0), r.get("action"), r.get("note"), r.get("who")] for r in log])
         conn.execute("DELETE FROM core.hub_problem_ack_member")
-        conn.executemany(
+        if members: conn.executemany(
             "INSERT INTO core.hub_problem_ack_member VALUES (?,?,?, now())",
             [[r.get("gkey"), r.get("email"), r.get("snap_at")] for r in members])
         conn.execute("COMMIT")
