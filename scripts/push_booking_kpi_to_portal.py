@@ -23,8 +23,13 @@ Writes:
   PORTAL_SUPABASE_URL (default https://pxrdmjjaxtqycuxhxmgi.supabase.co) +
   RENAISSANCE_PORTAL_SUPABASE_SERVICE_ROLE_KEY | IM_BOOKINGS_SUPABASE_SERVICE_ROLE_KEY
 
-Cron (droplet now, rides to sync-runner-1 with the warehouse at droplet-exit):
-  17,47 * * * * cd /root/renaissance-warehouse && .venv/bin/python scripts/push_booking_kpi_to_portal.py >> /root/renaissance-warehouse/logs/push_booking_kpi.log 2>&1
+Emits per (date,ws): sent, opps, replies (HUMAN reply_count; drives sealed-day
+Human/Positive RR on the KPI tab). The intraday feed owns the live [today-K..today]
+window with the same three fields; this push owns the disjoint sealed tail.
+
+Cron (LIVE on sync-runner-1 since 2026-07-22 droplet migration; /etc/cron.d/renaissance,
+offset :17/:47 to avoid colliding with the intraday feed's :06/:36 single-writer tick):
+  17,47 * * * * root cd /root/renaissance-warehouse && python3 scripts/push_booking_kpi_to_portal.py >> /root/renaissance-warehouse/logs/push_booking_kpi_to_portal.log 2>&1
 """
 from __future__ import annotations
 
@@ -93,7 +98,13 @@ SQL_WORKSPACE_DAILY = _CTES + """
 SELECT CAST(mt.date AS VARCHAR) AS d,
        COALESCE(r.real, d.workspace_name) AS ws,
        CAST(sum(mt.sent) AS BIGINT) AS sent,
-       CAST(sum(mt.opportunities) AS BIGINT) AS opps
+       CAST(sum(mt.opportunities) AS BIGINT) AS opps,
+       -- HUMAN reply count (Instantly-native `replies`; `replies_automatic` is a
+       -- SEPARATE mirror column and is NOT summed here — matches the intraday feed
+       -- and the standing ruling that reply_count is human, auto tracked separately).
+       -- Sealed-day Human RR = replies/sent and Positive RR = opps/replies derive
+       -- from this tab-side, so older ranges stop showing blank RR.
+       CAST(sum(mt.replies) AS BIGINT) AS replies
 FROM raw_pipeline_campaign_daily_metrics mt
 JOIN dims d ON d.campaign_id = mt.campaign_id
 LEFT JOIN ws_rename r ON r.old = d.workspace_name
@@ -216,22 +227,24 @@ def main() -> int:
     cw = wh_query(SQL_CAMPAIGN_WS)
     snapshot = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
-        "workspace_daily": [{"d": d, "ws": ws, "sent": sent, "opps": opps}
-                            for d, ws, sent, opps in wd],
+        "workspace_daily": [{"d": d, "ws": ws, "sent": sent, "opps": opps,
+                             "replies": replies}
+                            for d, ws, sent, opps, replies in wd],
         "campaign_ws": [{"ncamp": ncamp, "ws": ws} for ncamp, ws in cw],
         "workspaces": [{"name": n, "sort_order": so} for n, so in KPI_WORKSPACES],
         "ws_alias": [{"label": lbl, "ws": ws} for lbl, ws in KPI_WS_ALIAS],
     }
     if dry:
-        # Per-ws sent for a fixed historical date + today, to eyeball parity.
-        for probe in ("2026-07-17", "2026-07-18"):
+        # Per-ws sent/replies for a couple of sealed historical dates, to eyeball parity.
+        for probe in ("2026-07-14", "2026-07-15", "2026-07-16"):
             agg = {}
             for row in snapshot["workspace_daily"]:
                 if row["d"] == probe:
-                    agg[row["ws"]] = agg.get(row["ws"], 0) + row["sent"]
-            print(f"[dry] sent by ws for {probe}:")
+                    s, rp = agg.get(row["ws"], (0, 0))
+                    agg[row["ws"]] = (s + row["sent"], rp + row.get("replies", 0))
+            print(f"[dry] sent / replies by ws for {probe}:")
             for ws in sorted(agg):
-                print(f"        {ws:28s} {agg[ws]:>9}")
+                print(f"        {ws:28s} sent={agg[ws][0]:>9} replies={agg[ws][1]:>6}")
         print(f"[dry] workspace_daily rows={len(snapshot['workspace_daily'])} "
               f"campaign_ws={len(snapshot['campaign_ws'])} (NOT written)")
         return 0
