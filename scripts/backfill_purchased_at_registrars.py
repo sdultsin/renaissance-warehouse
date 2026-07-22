@@ -41,6 +41,7 @@ import os
 import re
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -174,6 +175,29 @@ def dynadot_accounts(env: dict) -> list[tuple[str, str]]:
     return out
 
 
+def namecheap_accounts(env: dict) -> list[tuple[str, str, str]]:
+    """[2026-07-22] Namecheap, finally. David asked twice; until now the only registrars we synced
+    were porkbun/spaceship/dynadot, so every Namecheap domain landed with a blank registrar and the
+    Hub rendered it as "(not ours)".
+
+    Verified live from the box before writing this: three of the four accounts answer
+    (namecheap1 = 113 domains, namecheap2 = 61, namecheap3 = 0) and namecheap4 returns
+    "API Key is invalid or API access has not been enabled" — that account needs API access turning
+    on in its dashboard, it is not a code problem.
+
+    NOTE Namecheap authorises by CALLING IP, not just the key. The box (159.89.55.18) is already
+    whitelisted; a laptop is not, which is why a local run returns 1011150 Invalid request IP.
+    """
+    out = []
+    for n in sorted({int(m.group(1)) for k in env
+                     for m in [re.match(r"^NAMECHEAP_(\d+)_API_KEY$", k)] if m}):
+        ak = env.get(f"NAMECHEAP_{n}_API_KEY", "")
+        us = env.get(f"NAMECHEAP_{n}_API_USER", "") or env.get(f"NAMECHEAP_{n}_USER", "")
+        if ak and us:
+            out.append((f"namecheap.{n}", us, ak))
+    return out
+
+
 # ---- fetchers (return list[(domain, create_iso_or_none, expire_iso_or_none)]) ----
 
 def fetch_porkbun(label, ak, sk) -> list[tuple]:
@@ -243,6 +267,47 @@ def fetch_dynadot(label, ak) -> list[tuple]:
     return out
 
 
+def fetch_namecheap(label, user, key) -> list[tuple]:
+    """One page of 100 at a time until TotalItems is covered.
+
+    getList gives Name / Created / Expires / AutoRenew. It does NOT give nameservers — those need a
+    per-domain getInfo call, which for a renewal/expiry view is not worth 174 extra requests, so
+    nameservers come back None and the DNS-derived provider columns simply stay unset.
+    """
+    import xml.etree.ElementTree as ET
+    client_ip = os.environ.get("NAMECHEAP_CLIENT_IP", "159.89.55.18")
+    out, page, total = [], 1, None
+    while page <= 100:                      # runaway guard, not a data cap: 100 pages = 10k domains
+        q = urllib.parse.urlencode({"ApiUser": user, "ApiKey": key, "UserName": user,
+                                    "ClientIp": client_ip, "Command": "namecheap.domains.getList",
+                                    "PageSize": "100", "Page": str(page)})
+        req = urllib.request.Request("https://api.namecheap.com/xml.response?" + q,
+                                     headers={"User-Agent": UA})
+        body = urllib.request.urlopen(req, timeout=120).read()
+        root = ET.fromstring(body)
+        ns = {"n": "http://api.namecheap.com/xml.response"}
+        if (root.get("Status") or "").upper() != "OK":
+            errs = [e.text for e in root.findall(".//n:Errors/n:Error", ns)] or ["unknown"]
+            raise RuntimeError(f"{label} error: {errs[:2]}")
+        got = root.findall(".//n:DomainGetListResult/n:Domain", ns)
+        for d in got:
+            dom = (d.get("Name") or "").lower()
+            if not dom:
+                continue
+            out.append((dom, d.get("Created") or None, d.get("Expires") or None,
+                        "yes" if (d.get("AutoRenew") or "").lower() == "true" else "no",
+                        None, "expired" if (d.get("IsExpired") or "").lower() == "true" else None))
+        if total is None:
+            tot_el = root.find(".//n:Paging/n:TotalItems", ns)
+            total = int(tot_el.text) if tot_el is not None and tot_el.text else len(got)
+        if not got or len(out) >= total:
+            break
+        page += 1
+        time.sleep(0.6)                     # Namecheap throttles hard; this is pacing, not a cap
+    logger.info("%s: %d domains", label, len(out))
+    return out
+
+
 # ---- cache + load ------------------------------------------------------------
 
 def fetch_registrar(reg: str, env: dict) -> list[tuple]:
@@ -256,6 +321,9 @@ def fetch_registrar(reg: str, env: dict) -> list[tuple]:
     elif reg == "dynadot":
         accts = dynadot_accounts(env)
         fn = lambda a: fetch_dynadot(*a)
+    elif reg == "namecheap":
+        accts = namecheap_accounts(env)
+        fn = lambda a: fetch_namecheap(*a)
     else:
         raise ValueError(reg)
     if not accts:
