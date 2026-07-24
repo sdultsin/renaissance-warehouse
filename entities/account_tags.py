@@ -385,9 +385,17 @@ def run_account_tags_ingest(ctx: RunContext) -> PhaseResult:
                _loaded_at, _run_id)
             SELECT ?::DATE, t.email, t.workspace_uuid, t.workspace_slug, t.tags_arr, t.n_tags,
                    CASE WHEN list_contains(t.tags_arr, 'Rehab')  THEN 'Rehab'
+                        -- [2026-07-24] Rehab-feed stages (Activation Pipeline x domain-rehab integration).
+                        -- Exact-match tags; no inbox carries them until the system is ARMED, so adding
+                        -- them is a no-op for every existing row. Same earlier-stage doctrine: Rehab
+                        -- (its source stage) outranks Rehab Rampup, which outranks Rehab Active.
+                        -- 'Cancelled' sits LAST so a half-applied cancel keeps its earlier stage.
+                        WHEN list_contains(t.tags_arr, 'Rehab Rampup') THEN 'Rehab Rampup'
+                        WHEN list_contains(t.tags_arr, 'Rehab Active') THEN 'Rehab Active'
                         WHEN list_contains(t.tags_arr, 'Warmup') THEN 'Warmup'
                         WHEN list_contains(t.tags_arr, 'Rampup') THEN 'Rampup'
                         WHEN list_contains(t.tags_arr, 'Active') THEN 'Active'
+                        WHEN list_contains(t.tags_arr, 'Cancelled') THEN 'Cancelled'
                         ELSE NULL END,
                    ?, ?
             FROM core.account_tags t
